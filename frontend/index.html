@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MOF M1 Model Generator — AI辅助建模工具</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Toolbar -->
+    <header id="toolbar">
+      <div class="toolbar-left">
+        <h1 class="logo">MOF <span class="accent">M1</span> Generator</h1>
+      </div>
+      <div class="toolbar-center">
+        <div class="model-picker-group" title="平行的M1模型可以共存，每次提取创建一个新模型">
+          <label class="model-picker-label">M1:</label>
+          <select id="model-picker" class="model-picker">
+            <option value="">(无模型)</option>
+          </select>
+          <span id="model-count-badge" class="model-count-badge hidden">0</span>
+        </div>
+        <button id="btn-extract-m1" class="btn btn-primary" disabled>
+          <span class="icon">&#9881;</span> AI提取M1
+        </button>
+        <button id="btn-derive-m2" class="btn btn-accent2" disabled>
+          <span class="icon">&#8679;</span> 反推M2
+        </button>
+        <span class="toolbar-sep"></span>
+        <button id="btn-validate" class="btn" disabled>&#10003; 验证</button>
+        <button id="btn-export" class="btn" disabled>&#8615; 导出</button>
+        <button id="btn-version" class="btn" disabled>&#128196; 版本</button>
+      </div>
+      <div class="toolbar-right">
+        <span id="model-status" class="badge hidden"></span>
+        <span id="model-name-display" class="model-name"></span>
+        <button id="btn-llm-settings" class="btn" title="LLM大模型配置">&#9881; LLM</button>
+      </div>
+    </header>
+
+    <!-- Main workspace -->
+    <main id="workspace">
+      <!-- Left: Document Panel -->
+      <aside id="document-panel">
+        <div class="panel-header">
+          <h2>文档</h2>
+          <button id="btn-clear-docs" class="btn-icon" title="清空">&#128465;</button>
+        </div>
+        <div id="upload-zone" class="upload-zone">
+          <input type="file" id="file-input" multiple accept=".txt,.md,.pdf,.docx,.xlsx,.xls,.csv" hidden>
+          <p>拖放文件到此处<br>或 <a href="#" id="upload-link">点击上传</a></p>
+          <p class="hint">TXT / MD / PDF / DOCX / Excel / CSV</p>
+        </div>
+        <ul id="document-list" class="doc-list"></ul>
+      </aside>
+
+      <!-- Center: Dual model display with tabs -->
+      <section id="model-editor">
+        <div class="panel-header">
+          <div class="tab-bar">
+            <button class="tab" data-tab="diagram">关系图</button>
+            <button class="tab active" data-tab="m1">M1 领域层</button>
+            <button class="tab" data-tab="m2">M2 抽象层</button>
+            <button class="tab" data-tab="m3">M3 元元模型</button>
+          </div>
+          <div class="editor-actions">
+            <div class="view-toggle" id="view-toggle-bar">
+              <button id="btn-view-hierarchy" class="view-btn active" data-mode="hierarchy" title="层级视图 (按继承+组合嵌套)">层级</button>
+              <button id="btn-view-flat" class="view-btn" data-mode="flat" title="平铺视图">平铺</button>
+            </div>
+            <span class="toolbar-sep"></span>
+            <button id="btn-add-class" class="btn-sm" disabled>+ 类</button>
+            <button id="btn-add-enum" class="btn-sm" disabled>+ 枚举</button>
+            <button id="btn-add-assoc" class="btn-sm" disabled>+ 关联</button>
+          </div>
+        </div>
+        <!-- Relationship Diagram -->
+        <div id="diagram-view" class="tab-content" data-tab="diagram">
+          <div id="diagram-canvas" class="diagram-canvas">
+            <!-- Rendered by JS: SVG lines + HTML boxes for M3/M2/M1 -->
+          </div>
+        </div>
+        <!-- M1 tree -->
+        <div id="model-tree-m1" class="model-tree tab-content active" data-tab="m1">
+          <div class="empty-state">
+            <p>尚无M1模型</p>
+            <p class="hint">上传业务文档后，点击 "AI提取M1" 从文档中自动生成领域模型</p>
+          </div>
+        </div>
+        <!-- M2 tree -->
+        <div id="model-tree-m2" class="model-tree tab-content" data-tab="m2">
+          <div class="empty-state">
+            <p>尚无M2元模型</p>
+            <p class="hint">M1模型生成后，点击 "反推M2" 从M1自动抽象出通用元模型</p>
+          </div>
+        </div>
+        <!-- M3 (fixed, read-only) -->
+        <div id="model-tree-m3" class="model-tree tab-content" data-tab="m3">
+          <div id="m3-content" class="m3-content">
+            <!-- Rendered by JS -->
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: Property Inspector -->
+      <aside id="property-inspector">
+        <div class="panel-header">
+          <h2>属性</h2>
+        </div>
+        <div id="inspector-content" class="inspector-content">
+          <div class="empty-state">
+            <p>选择模型元素<br>查看/编辑属性</p>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- Progress overlay -->
+    <div id="progress-overlay" class="overlay hidden">
+      <div class="progress-panel">
+        <!-- Header -->
+        <div class="prog-header">
+          <div class="prog-icon-pulse"></div>
+          <div>
+            <h3 id="progress-title">AI正在分析文档...</h3>
+            <p class="prog-subtitle" id="progress-subtitle">基于MOF元模型体系提取领域模型</p>
+          </div>
+          <span class="prog-timer" id="progress-timer">00:00</span>
+          <button id="btn-progress-cancel" class="btn-icon prog-cancel" title="中止提取">&#9632;</button>
+          <button id="btn-progress-minimize" class="btn-icon prog-minimize" title="最小化到后台">&#9660;</button>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <div class="prog-pct-row">
+          <span id="progress-pct">0%</span>
+          <span id="progress-message" class="prog-current-step">准备中...</span>
+        </div>
+
+        <!-- Document checklist -->
+        <div class="prog-docs" id="progress-docs">
+          <!-- Document status items injected by JS -->
+        </div>
+
+        <!-- Pipeline steps -->
+        <div class="prog-steps" id="progress-steps"></div>
+
+        <!-- Parallel subtasks -->
+        <div class="prog-parallel" id="progress-parallel"></div>
+
+        <!-- Activity log -->
+        <div class="prog-log-header">
+          <span>处理日志</span>
+          <span class="prog-log-dots"><span>.</span><span>.</span><span>.</span></span>
+        </div>
+        <div class="prog-log" id="progress-log">
+          <!-- Log lines injected by JS -->
+        </div>
+
+        <!-- LLM Conversation Stream -->
+        <details class="prog-conv-panel" id="progress-conv-panel">
+          <summary class="prog-conv-title">
+            &#128172; LLM对话流
+            <span class="prog-conv-count" id="conv-count">0</span>
+          </summary>
+          <div class="prog-conv-stream" id="conv-stream">
+            <div class="prog-conv-empty">等待LLM调用...</div>
+          </div>
+        </details>
+
+        <!-- Tips -->
+        <div class="prog-tip" id="progress-tip">
+          <span class="prog-tip-icon">&#128161;</span>
+          <span id="progress-tip-text">MOF体系将数据模型分为M3→M2→M1→M0四层，每层各有明确职责。</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Floating progress badge (visible when progress minimized) -->
+    <div id="progress-badge" class="progress-badge hidden">
+      <span class="badge-spinner"></span>
+      <span id="badge-pct">0%</span>
+      <span id="badge-step" title="点击恢复进度面板">处理中</span>
+      <button id="btn-badge-cancel" class="badge-cancel" title="中止提取">&#9632;</button>
+    </div>
+
+    <!-- Export modal -->
+    <div id="export-modal" class="overlay hidden">
+      <div class="modal-card">
+        <h3>导出模型</h3>
+        <div class="export-layer-select">
+          <label><input type="radio" name="export-layer" value="m1" checked> M1 模型</label>
+          <label><input type="radio" name="export-layer" value="m2"> M2 元模型</label>
+        </div>
+        <div class="export-options">
+          <label><input type="radio" name="export-fmt" value="json" checked> JSON</label>
+          <label><input type="radio" name="export-fmt" value="yaml"> YAML</label>
+          <label><input type="radio" name="export-fmt" value="mof_text"> MOF Text</label>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-export-confirm" class="btn btn-primary">导出</button>
+          <button id="btn-export-cancel" class="btn">取消</button>
+        </div>
+        <pre id="export-preview" class="export-preview hidden"></pre>
+      </div>
+    </div>
+
+    <!-- Validation modal -->
+    <div id="validation-modal" class="overlay hidden">
+      <div class="modal-card">
+        <h3 id="validation-title">验证结果</h3>
+        <div id="validation-content"></div>
+        <div class="modal-actions">
+          <button id="btn-validation-close" class="btn">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+    <!-- LLM Settings Modal -->
+    <div id="llm-modal" class="overlay hidden">
+      <div class="modal-card modal-wide">
+        <div class="modal-header">
+          <h3>&#9881; LLM 大模型配置</h3>
+          <div class="llm-tabs">
+            <button class="llm-tab active" data-llmtab="config">配置</button>
+            <button class="llm-tab" data-llmtab="stats">统计</button>
+          </div>
+          <button id="btn-llm-close" class="btn-icon">&times;</button>
+        </div>
+
+        <!-- Stats tab content -->
+        <div class="llm-tab-content" data-llmtab="stats" id="llm-stats-panel" style="display:none">
+          <div id="llm-stats-content" class="llm-stats-content">
+            <p style="color:var(--text-dim);text-align:center;padding:40px">加载中...</p>
+          </div>
+        </div>
+
+        <!-- Provider list (config tab) -->
+        <div class="llm-layout llm-tab-content" data-llmtab="config">
+          <div class="llm-list-panel">
+            <div class="llm-list-header">
+              <span>已保存的模型</span>
+              <button id="btn-llm-add" class="btn-sm">+ 新增</button>
+            </div>
+            <ul id="llm-provider-list" class="llm-list"></ul>
+          </div>
+
+          <!-- Edit form -->
+          <div class="llm-form-panel" id="llm-form-panel">
+            <div class="empty-state" id="llm-form-empty">
+              <p>选择或新增一个大模型配置</p>
+            </div>
+            <form id="llm-form" class="hidden">
+              <div class="insp-field">
+                <label>配置名称</label>
+                <input type="text" id="llm-name" placeholder="My GPT-4o">
+              </div>
+              <div class="insp-field">
+                <label>服务商 Provider</label>
+                <select id="llm-provider">
+                  <option value="">-- 选择 --</option>
+                </select>
+              </div>
+              <div class="insp-field">
+                <label>API Key</label>
+                <input type="password" id="llm-apikey" placeholder="sk-...">
+              </div>
+              <div class="insp-field">
+                <label>Base URL</label>
+                <input type="text" id="llm-baseurl" placeholder="https://api.openai.com/v1">
+              </div>
+              <div class="insp-field">
+                <label>模型 Model</label>
+                <div class="input-with-hint">
+                  <input type="text" id="llm-model" placeholder="gpt-4o" list="llm-model-suggestions">
+                  <datalist id="llm-model-suggestions"></datalist>
+                </div>
+              </div>
+              <div class="insp-row">
+                <div class="insp-field">
+                  <label>Temperature</label>
+                  <input type="number" id="llm-temp" value="0" min="0" max="2" step="0.1">
+                </div>
+                <div class="insp-field">
+                  <label>Max Tokens</label>
+                  <input type="number" id="llm-maxtokens" value="4096" min="1">
+                </div>
+              </div>
+              <div class="insp-row">
+                <div class="insp-field">
+                  <label>Top P</label>
+                  <input type="number" id="llm-topp" value="1" min="0" max="1" step="0.1">
+                </div>
+                <div class="insp-field">
+                  <label>超时(秒)</label>
+                  <input type="number" id="llm-timeout" value="120" min="10">
+                </div>
+              </div>
+              <div class="insp-field">
+                <label>备注</label>
+                <input type="text" id="llm-notes" placeholder="可选备注...">
+              </div>
+              <div class="llm-form-actions">
+                <button type="button" id="btn-llm-test" class="btn">&#9889; 测试连接</button>
+                <button type="button" id="btn-llm-save" class="btn btn-primary">保存</button>
+                <button type="button" id="btn-llm-delete" class="btn btn-danger-outline">删除</button>
+              </div>
+              <div id="llm-test-result" class="llm-test-result hidden"></div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Extraction Review Panel -->
+    <div id="review-overlay" class="overlay hidden">
+      <div class="review-panel">
+        <!-- Header -->
+        <div class="review-header">
+          <h3><span class="review-icon">&#10004;</span> M1模型提取完成</h3>
+          <button id="btn-review-close" class="btn-icon">&times;</button>
+        </div>
+
+        <!-- Model name input (prominent) -->
+        <div class="review-naming">
+          <label>新M1模型名称 (将创建为独立M1，与已有M1平行存在)</label>
+          <input type="text" id="review-model-label" placeholder="例如: 抽水蓄能机组台账 v1.0" />
+        </div>
+
+        <!-- Stats cards -->
+        <div class="review-stats" id="review-stats"></div>
+
+        <!-- Process summary -->
+        <details class="review-process" open>
+          <summary>&#128203; 推导过程</summary>
+          <ul id="review-process-list"></ul>
+        </details>
+
+        <!-- Confidence notes -->
+        <div id="review-notes" class="review-notes hidden"></div>
+
+        <!-- Selectable entity list -->
+        <div class="review-select-header">
+          <span>&#9745; 选择要导入的实体</span>
+          <div class="review-select-actions">
+            <button id="btn-review-all" class="btn-sm">全选</button>
+            <button id="btn-review-none" class="btn-sm">全不选</button>
+          </div>
+        </div>
+        <div class="review-entities" id="review-entities">
+          <!-- Rendered by JS: classes, enumerations, associations with checkboxes -->
+        </div>
+
+        <!-- Action bar -->
+        <div class="review-actions">
+          <button id="btn-review-cancel" class="btn">取消丢弃</button>
+          <button id="btn-review-confirm" class="btn btn-primary">确认导入选中项</button>
+        </div>
+      </div>
+    </div>
+
+  <script type="module" src="/js/api.js"></script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

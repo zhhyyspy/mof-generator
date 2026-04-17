@@ -1,0 +1,142 @@
+{
+  "id": "equipment_ledger",
+  "name": "EquipmentLedger",
+  "label": "设备台账",
+  "description": "通用设备台账元模型，定义设备的基本属性和层级关系。适用于各类设备资产管理场景。",
+  "version": "1.0",
+  "domain": "equipment",
+  "package": {
+    "id": "pkg_equipment_ledger",
+    "name": "EquipmentLedgerPackage",
+    "label": "设备台账包",
+    "classes": [
+      {
+        "id": "cls_equipment",
+        "name": "Equipment",
+        "label": "设备",
+        "description": "设备台账基础元类，所有具体设备类型的M1模型都应继承此类",
+        "is_abstract": false,
+        "attributes": [
+          {
+            "id": "attr_eq_code",
+            "name": "equipmentCode",
+            "label": "设备编码",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_eq_name",
+            "name": "equipmentName",
+            "label": "设备名称",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_eq_type",
+            "name": "equipmentType",
+            "label": "设备类型",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_eq_manufacturer",
+            "name": "manufacturer",
+            "label": "制造商",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_eq_mfg_date",
+            "name": "manufacturingDate",
+            "label": "出厂日期",
+            "data_type": "Date",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_eq_install_date",
+            "name": "installationDate",
+            "label": "安装日期",
+            "data_type": "Date",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_eq_commission_date",
+            "name": "commissionDate",
+            "label": "投运日期",
+            "data_type": "Date",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_eq_status",
+            "name": "operatingStatus",
+            "label": "运行状态",
+            "data_type": "Enum",
+            "enum_ref": "enum_eq_status",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_eq_location",
+            "name": "location",
+            "label": "安装位置",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_eq_owner",
+            "name": "ownerUnit",
+            "label": "所属单位",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          }
+        ],
+        "constraints": [
+          {
+            "id": "con_eq_code_notnull",
+            "name": "equipmentCodeNotNull",
+            "expression": "equipmentCode is not null and not empty",
+            "target_attribute": "attr_eq_code"
+          }
+        ]
+      }
+    ],
+    "enumerations": [
+      {
+        "id": "enum_eq_status",
+        "name": "EquipmentStatus",
+        "label": "设备运行状态",
+        "literals": [
+          {"id": "lit_running", "name": "running", "label": "运行"},
+          {"id": "lit_maintenance", "name": "maintenance", "label": "检修"},
+          {"id": "lit_standby", "name": "standby", "label": "备用"},
+          {"id": "lit_decommissioned", "name": "decommissioned", "label": "退役"},
+          {"id": "lit_suspended", "name": "suspended", "label": "停用"}
+        ]
+      }
+    ],
+    "associations": [
+      {
+        "id": "assoc_contains_sub",
+        "name": "containsSubEquipment",
+        "label": "包含子设备",
+        "description": "设备可以包含0到多个子设备，形成树形层级结构",
+        "source": {
+          "class_ref": "cls_equipment",
+          "class_name": "Equipment",
+          "role_name": "parent",
+          "multiplicity": {"lower": 0, "upper": 1},
+          "navigable": true
+        },
+        "target": {
+          "class_ref": "cls_equipment",
+          "class_name": "Equipment",
+          "role_name": "children",
+          "multiplicity": {"lower": 0, "upper": -1},
+          "navigable": true
+        },
+        "association_type": "composition"
+      }
+    ],
+    "complex_types": [],
+    "sub_packages": []
+  }
+}

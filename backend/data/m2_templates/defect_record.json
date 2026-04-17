@@ -1,0 +1,129 @@
+{
+  "id": "defect_record",
+  "name": "DefectRecord",
+  "label": "缺陷记录",
+  "description": "通用缺陷记录元模型，定义缺陷的基本属性。适用于设备缺陷管理、巡检发现等场景。",
+  "version": "1.0",
+  "domain": "defect",
+  "package": {
+    "id": "pkg_defect_record",
+    "name": "DefectRecordPackage",
+    "label": "缺陷记录包",
+    "classes": [
+      {
+        "id": "cls_defect",
+        "name": "Defect",
+        "label": "缺陷",
+        "description": "缺陷记录基础元类",
+        "is_abstract": false,
+        "attributes": [
+          {
+            "id": "attr_def_code",
+            "name": "defectCode",
+            "label": "缺陷编号",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_def_title",
+            "name": "title",
+            "label": "缺陷标题",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_def_desc",
+            "name": "description",
+            "label": "缺陷描述",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_def_discovery_date",
+            "name": "discoveryDate",
+            "label": "发现日期",
+            "data_type": "Date",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_def_severity",
+            "name": "severity",
+            "label": "严重程度",
+            "data_type": "Enum",
+            "enum_ref": "enum_def_severity",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_def_status",
+            "name": "status",
+            "label": "缺陷状态",
+            "data_type": "Enum",
+            "enum_ref": "enum_def_status",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_def_equipment_ref",
+            "name": "equipmentRef",
+            "label": "关联设备",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_def_reporter",
+            "name": "reporter",
+            "label": "上报人",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_def_discovery_method",
+            "name": "discoveryMethod",
+            "label": "发现方式",
+            "data_type": "Enum",
+            "enum_ref": "enum_def_discovery",
+            "multiplicity": {"lower": 0, "upper": 1}
+          }
+        ],
+        "constraints": []
+      }
+    ],
+    "enumerations": [
+      {
+        "id": "enum_def_severity",
+        "name": "DefectSeverity",
+        "label": "缺陷严重程度",
+        "literals": [
+          {"id": "lit_critical", "name": "critical", "label": "紧急"},
+          {"id": "lit_major", "name": "major", "label": "重大"},
+          {"id": "lit_minor", "name": "minor", "label": "一般"},
+          {"id": "lit_trivial", "name": "trivial", "label": "轻微"}
+        ]
+      },
+      {
+        "id": "enum_def_status",
+        "name": "DefectStatus",
+        "label": "缺陷状态",
+        "literals": [
+          {"id": "lit_open", "name": "open", "label": "待处理"},
+          {"id": "lit_in_progress", "name": "inProgress", "label": "处理中"},
+          {"id": "lit_resolved", "name": "resolved", "label": "已消除"},
+          {"id": "lit_closed", "name": "closed", "label": "已关闭"}
+        ]
+      },
+      {
+        "id": "enum_def_discovery",
+        "name": "DiscoveryMethod",
+        "label": "发现方式",
+        "literals": [
+          {"id": "lit_patrol", "name": "patrol", "label": "巡检"},
+          {"id": "lit_monitor", "name": "monitoring", "label": "在线监测"},
+          {"id": "lit_scheduled", "name": "scheduledTest", "label": "定期试验"},
+          {"id": "lit_overhaul", "name": "overhaul", "label": "检修发现"}
+        ]
+      }
+    ],
+    "associations": [],
+    "complex_types": [],
+    "sub_packages": []
+  }
+}

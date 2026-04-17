@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables (API keys!)
+.env
+.env.local
+.env.*.local
+
+# Runtime data — contains user uploads, saved models, LLM stats
+backend/data/documents/
+backend/data/models/
+backend/data/exports/
+backend/data/llm_providers.json
+backend/data/llm_stats.json
+
+# Keep pre-seeded templates and M3 fixed definition
+!backend/data/m2_templates/
+!backend/data/m3_fixed.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

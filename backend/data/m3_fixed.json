@@ -1,0 +1,98 @@
+{
+  "id": "m3_fixed",
+  "name": "MOF M3 Meta-Meta Model",
+  "label": "M3 元元模型",
+  "description": "定义建模语言本身的语法——有哪些概念可以用来建模。M3是固定的，不可修改。",
+  "concepts": [
+    {
+      "id": "m3_class",
+      "name": "Class",
+      "label": "类",
+      "description": "可以创建类。M2中的设备台账就是一个Class",
+      "category": "core",
+      "color": "#5b8af5"
+    },
+    {
+      "id": "m3_attribute",
+      "name": "Attribute",
+      "label": "属性",
+      "description": "类可以拥有属性，每个属性必须有name和type",
+      "category": "core",
+      "color": "#4ade80"
+    },
+    {
+      "id": "m3_association",
+      "name": "Association",
+      "label": "关联",
+      "description": "类与类之间可以建立关联关系",
+      "category": "core",
+      "color": "#a78bfa"
+    },
+    {
+      "id": "m3_datatype",
+      "name": "DataType",
+      "label": "数据类型",
+      "description": "属性可以使用的基本数据类型",
+      "category": "type",
+      "color": "#fb923c",
+      "subtypes": ["String", "Float", "Integer", "Date", "Boolean"]
+    },
+    {
+      "id": "m3_enumeration",
+      "name": "Enumeration",
+      "label": "枚举",
+      "description": "一组有限可选值构成的类型 (is-a DataType)",
+      "category": "type",
+      "color": "#fbbf24"
+    },
+    {
+      "id": "m3_enumliteral",
+      "name": "EnumLiteral",
+      "label": "枚举值",
+      "description": "枚举中的单个可选值",
+      "category": "type",
+      "color": "#fbbf24"
+    },
+    {
+      "id": "m3_complextype",
+      "name": "ComplexType",
+      "label": "复合类型",
+      "description": "可嵌套子属性的复合数据类型 (is-a DataType)",
+      "category": "type",
+      "color": "#fb923c"
+    },
+    {
+      "id": "m3_multiplicity",
+      "name": "Multiplicity",
+      "label": "多重性",
+      "description": "约束关联或属性的数量关系: [0..1], [1], [0..*], [1..*]",
+      "category": "constraint",
+      "color": "#f87171"
+    },
+    {
+      "id": "m3_constraint",
+      "name": "Constraint",
+      "label": "约束",
+      "description": "可以对类、属性、关联施加约束规则",
+      "category": "constraint",
+      "color": "#f87171"
+    },
+    {
+      "id": "m3_package",
+      "name": "Package",
+      "label": "包",
+      "description": "用于组织和分组多个Class的容器",
+      "category": "structure",
+      "color": "#8b90a5"
+    }
+  ],
+  "relationships": [
+    { "from": "m3_class", "to": "m3_attribute", "label": "拥有", "type": "composition" },
+    { "from": "m3_class", "to": "m3_association", "label": "参与", "type": "association" },
+    { "from": "m3_attribute", "to": "m3_datatype", "label": "类型为", "type": "association" },
+    { "from": "m3_attribute", "to": "m3_multiplicity", "label": "约束", "type": "association" },
+    { "from": "m3_enumeration", "to": "m3_enumliteral", "label": "包含", "type": "composition" },
+    { "from": "m3_class", "to": "m3_constraint", "label": "约束", "type": "association" },
+    { "from": "m3_package", "to": "m3_class", "label": "包含", "type": "composition" }
+  ]
+}

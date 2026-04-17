@@ -1,0 +1,162 @@
+{
+  "id": "maintenance_procedure",
+  "name": "MaintenanceProcedure",
+  "label": "检修规程",
+  "description": "通用检修规程元模型，定义检修项目的基本属性。适用于检修策略管理、维修项目库构建。",
+  "version": "1.0",
+  "domain": "maintenance",
+  "package": {
+    "id": "pkg_maintenance",
+    "name": "MaintenanceProcedurePackage",
+    "label": "检修规程包",
+    "classes": [
+      {
+        "id": "cls_procedure",
+        "name": "MaintenanceProcedure",
+        "label": "检修规程",
+        "description": "检修规程基础元类",
+        "is_abstract": false,
+        "attributes": [
+          {
+            "id": "attr_mp_code",
+            "name": "procedureCode",
+            "label": "规程编号",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_mp_name",
+            "name": "procedureName",
+            "label": "规程名称",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_mp_eq_type",
+            "name": "applicableEquipmentType",
+            "label": "适用设备类型",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_mp_level",
+            "name": "maintenanceLevel",
+            "label": "检修级别",
+            "data_type": "Enum",
+            "enum_ref": "enum_mp_level",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_mp_frequency",
+            "name": "frequency",
+            "label": "检修周期",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_mp_duration",
+            "name": "estimatedDuration",
+            "label": "预计工期",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_mp_safety",
+            "name": "safetyRequirements",
+            "label": "安全要求",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_mp_tools",
+            "name": "requiredTools",
+            "label": "所需工器具",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": -1}
+          },
+          {
+            "id": "attr_mp_personnel",
+            "name": "requiredPersonnel",
+            "label": "所需人员资质",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": -1}
+          }
+        ],
+        "constraints": []
+      },
+      {
+        "id": "cls_step",
+        "name": "MaintenanceStep",
+        "label": "检修步骤",
+        "description": "检修规程中的单个操作步骤",
+        "is_abstract": false,
+        "attributes": [
+          {
+            "id": "attr_ms_seq",
+            "name": "stepSequence",
+            "label": "步骤序号",
+            "data_type": "Integer",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_ms_desc",
+            "name": "stepDescription",
+            "label": "步骤描述",
+            "data_type": "String",
+            "multiplicity": {"lower": 1, "upper": 1}
+          },
+          {
+            "id": "attr_ms_criteria",
+            "name": "acceptanceCriteria",
+            "label": "验收标准",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          },
+          {
+            "id": "attr_ms_caution",
+            "name": "cautionNotes",
+            "label": "注意事项",
+            "data_type": "String",
+            "multiplicity": {"lower": 0, "upper": 1}
+          }
+        ],
+        "constraints": []
+      }
+    ],
+    "enumerations": [
+      {
+        "id": "enum_mp_level",
+        "name": "MaintenanceLevel",
+        "label": "检修级别",
+        "literals": [
+          {"id": "lit_a", "name": "overhaul", "label": "A级检修(大修)"},
+          {"id": "lit_b", "name": "intermediate", "label": "B级检修(中修)"},
+          {"id": "lit_c", "name": "minor", "label": "C级检修(小修)"},
+          {"id": "lit_d", "name": "routine", "label": "D级检修(日常维护)"}
+        ]
+      }
+    ],
+    "associations": [
+      {
+        "id": "assoc_proc_step",
+        "name": "procedureContainsSteps",
+        "label": "规程包含步骤",
+        "source": {
+          "class_ref": "cls_procedure",
+          "class_name": "MaintenanceProcedure",
+          "role_name": "procedure",
+          "multiplicity": {"lower": 1, "upper": 1}
+        },
+        "target": {
+          "class_ref": "cls_step",
+          "class_name": "MaintenanceStep",
+          "role_name": "steps",
+          "multiplicity": {"lower": 1, "upper": -1}
+        },
+        "association_type": "composition"
+      }
+    ],
+    "complex_types": [],
+    "sub_packages": []
+  }
+}
