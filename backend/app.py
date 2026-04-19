@@ -6,8 +6,27 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.routers import documents, m2_templates, models, extraction, export, llm_config
+
+
+class NoCacheStaticsMiddleware(BaseHTTPMiddleware):
+    """Prevent browser from caching HTML/JS/CSS so fresh code always loads.
+    Browsers cache static assets aggressively when no Cache-Control header is sent
+    (StaticFiles default). This makes dev-time changes hard to see without manual
+    cache purges. We set no-cache on text assets; images/fonts still cache normally.
+    """
+    _NO_CACHE_SUFFIXES = (".js", ".css", ".html", ".htm", ".mjs")
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        path = request.url.path.lower()
+        if path == "/" or path.endswith(self._NO_CACHE_SUFFIXES):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
 
 
 def create_app() -> FastAPI:
@@ -24,6 +43,9 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # No-cache on HTML/JS/CSS so dev-time edits always take effect
+    app.add_middleware(NoCacheStaticsMiddleware)
 
     # Global exception handler — prevents server crash on unhandled errors
     @app.exception_handler(Exception)

@@ -10,3 +10,5 @@ pyyaml>=6.0.2
 aiofiles>=24.1.0
 openpyxl>=3.1.0
 openai>=1.0.0
+reportlab>=4.0.0
+svglib>=1.5.0

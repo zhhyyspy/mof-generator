@@ -40,8 +40,20 @@ class PrimitiveDataType(str, PyEnum):
 # ---------------------------------------------------------------------------
 
 class Multiplicity(BaseModel):
-    lower: int = Field(default=1, ge=0)
-    upper: int = Field(default=1, ge=-1, description="-1 means unlimited (*)")
+    # AI often returns -1 for lower meaning "unspecified" — we clamp to 0
+    lower: int = 1
+    upper: int = 1
+
+    def model_post_init(self, __context):
+        # Clamp negative lower to 0 (AI confusion: thinks -1 means "unlimited")
+        if self.lower < 0:
+            self.lower = 0
+        # upper=-1 means unlimited; anything else negative = unlimited
+        if self.upper < -1:
+            self.upper = -1
+        # Ensure lower <= upper (unless upper is -1 meaning unlimited)
+        if self.upper != -1 and self.lower > self.upper:
+            self.lower = self.upper
 
     @classmethod
     def one(cls) -> Multiplicity:
@@ -163,6 +175,10 @@ class MOFClass(BaseModel):
     is_abstract: bool = False
     attributes: list[Attribute] = Field(default_factory=list)
     constraints: list[Constraint] = Field(default_factory=list)
+    # Optional hint captured during M1 extraction — feeds later M2 hierarchy detection.
+    # Not user-editable; purely a side-channel between extract_m1 and derive_m2.
+    # Schema: {"theme_hint": str, "level_hint": str, "parent_name_hint": str}
+    hierarchy_hint: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

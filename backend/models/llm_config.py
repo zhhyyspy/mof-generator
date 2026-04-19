@@ -20,6 +20,12 @@ class LLMProviderConfig(BaseModel):
     is_active: bool = False                    # Currently selected provider
     extra_headers: Optional[dict] = None       # Additional headers (e.g. Azure api-version)
     notes: Optional[str] = None                # User notes
+    # Extraction batch size: max characters of document content per AI call.
+    # Smaller values work around models with inefficient tokenization (e.g. some local models
+    # that produce 10+ tokens per Chinese char). Cross-batch context is still preserved
+    # via context-hint passing — chunking only affects how docs are split, not context association.
+    # Recommended: 8000 (local LLMs / small context), 20000 (cloud LLMs / large context).
+    batch_max_chars: int = 8000
 
 
 class LLMProviderList(BaseModel):

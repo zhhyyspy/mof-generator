@@ -36,20 +36,34 @@ RULES:
 2. Data types MUST be one of: String, Float, Integer, Date, Boolean, Enum
 3. Use English PascalCase for class names, camelCase for attribute names
 4. Use Chinese for labels (display names)
-5. Return ONLY valid JSON, no markdown code fences, no extra text
+
+CRITICAL OUTPUT FORMAT:
+- Your response MUST start with `{` and end with `}`
+- NO markdown code fences (no ```json or ```)
+- NO explanation text before or after the JSON
+- NO chain-of-thought reasoning in the output
+- NO comments in the JSON
+- The FIRST CHARACTER of your response must be `{`
+- If you cannot produce valid JSON, output `{"classes": [], "enumerations": [], "confidence_notes": ["无法分析"]}`
 """
 
 
 def _clean_json_text(text: str) -> str:
     """Clean common LLM JSON issues before parsing."""
     text = text.strip()
-    # Remove markdown code fences
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-    text = re.sub(r"\n?```\s*$", "", text)
+    # Remove markdown code fences (including those with language tags)
+    text = re.sub(r"```(?:json|JSON)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*", "", text)
+    # Remove <think>...</think> tags (Qwen/DeepSeek reasoning models)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<thinking>[\s\S]*?</thinking>", "", text, flags=re.IGNORECASE)
+    # Remove common prefixes like "Here is the JSON:" or "好的，分析如下:"
     text = text.strip()
 
-    # Extract the outermost { ... }
+    # Extract the outermost { ... } — aggressive scan
     first = text.find("{")
+    if first < 0:
+        return ""  # No JSON object at all
     if first > 0:
         text = text[first:]
     last = text.rfind("}")
@@ -106,7 +120,21 @@ def _fix_json_at_position(text: str, error_pos: int) -> str:
 
 def _extract_json(text: str) -> dict:
     """Extract JSON from LLM response with robust multi-strategy error recovery."""
+    # Defensive: handle None/empty
+    if not text or not text.strip():
+        raise ValueError(f"AI返回了空响应 (原始: {repr(text)[:200]})")
+
     cleaned = _clean_json_text(text)
+
+    # If cleaning stripped everything (no { found), the AI didn't return JSON at all
+    if not cleaned or "{" not in cleaned:
+        # Show what the AI actually said (helpful for debugging local LLMs)
+        preview = text.strip()[:500]
+        raise ValueError(
+            f"AI返回的内容不包含JSON对象。\n"
+            f"实际返回 (前500字符): {preview}\n"
+            f"可能原因: 本地LLM未遵守JSON输出格式，建议换用更强的模型(如Claude/GPT-4/Qwen-Max)"
+        )
 
     # Attempt 1: direct parse
     try:
@@ -164,29 +192,42 @@ class AIExtractor:
 
     def __init__(self):
         self.llm = get_active_client()
+        # Per-instance batch size, driven by the active LLM provider's config.
+        # Lowering this reduces per-call prompt size WITHOUT breaking cross-batch context:
+        # context is preserved via the known_context / known_attrs_context / known_assocs
+        # hints passed between batches (see _discover_entities_from_docs,
+        # _extract_attrs_from_docs, _extract_assocs_from_docs).
+        configured = getattr(self.llm.config, "batch_max_chars", None) or 8000
+        # Clamp to a usable range: at least 2000 chars (otherwise context hint itself
+        # dominates the prompt), at most 40000 chars (reasoning models choke above this
+        # regardless of tokenization).
+        self.BATCH_MAX_CHARS = max(2000, min(int(configured), 40000))
 
     # Extraction calls get 5 minutes timeout (large prompts take time)
     EXTRACTION_TIMEOUT = 300
+    # Reasoning models (Qwen3+, DeepSeek-R1) need a LOT more tokens for thinking
+    DEFAULT_MAX_TOKENS = 16384
 
-    async def _ask(self, prompt: str, max_tokens: int = 4096) -> dict:
+    async def _ask(self, prompt: str, max_tokens: int = None) -> dict:
         """Send prompt to the active LLM and parse JSON response."""
+        effective_max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
         text = await self.llm.chat(
             system=SYSTEM_PROMPT,
             user=prompt,
             temperature=0,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             timeout_override=self.EXTRACTION_TIMEOUT,
         )
-        # _extract_json already has robust local fixing (quotes, commas, braces)
-        # No need for expensive LLM retry — local fix handles 95%+ of cases
         return _extract_json(text)
 
     # ==================================================================
     # Pipeline A: Documents → M1
     # ==================================================================
-
-    # Max chars per batch (~12K tokens for Chinese, targets 15-30s per call)
-    BATCH_MAX_CHARS = 25000
+    # Note: BATCH_MAX_CHARS is now set per-instance in __init__ from the
+    # active LLM config's batch_max_chars field. Cross-batch context
+    # association is preserved by explicit context-hint injection between
+    # batches — see known_context / known_attrs_context / known_assocs in
+    # the per-batch prompt builders.
 
     async def extract_m1(
         self,
@@ -194,7 +235,10 @@ class AIExtractor:
         progress_callback: Optional[Callable] = None,
         parallel_callback: Optional[Callable] = None,
         check_cancelled: Optional[Callable] = None,
-        conversation_callback: Optional[Callable] = None,  # (role, content, meta)
+        conversation_callback: Optional[Callable] = None,
+        failed_batch_callback: Optional[Callable] = None,
+        partial_result_callback: Optional[Callable] = None,
+        pause_waiter: Optional[Callable] = None,  # async () — blocks while paused
     ) -> dict:
         """
         Extract M1 model from full-text documents using batch processing.
@@ -214,7 +258,10 @@ class AIExtractor:
         _call_count = [0]
         _cb = conversation_callback
 
-        async def _ask_with_conv(prompt: str, max_tokens: int = 4096) -> dict:
+        async def _ask_with_conv(prompt: str, max_tokens: int = None) -> dict:
+            # Default to DEFAULT_MAX_TOKENS (16384) for reasoning models
+            if max_tokens is None:
+                max_tokens = self.DEFAULT_MAX_TOKENS
             _call_count[0] += 1
             n = _call_count[0]
             prompt_len = len(prompt)
@@ -245,7 +292,13 @@ class AIExtractor:
             # Parse JSON (with robust local fixing)
             return _extract_json(raw_text)
 
-        self._ask = _ask_with_conv
+        # Wrap _ask to also honor pause
+        _ask_with_conv_orig = _ask_with_conv
+        async def _ask_with_pause(p: str, max_tokens: int = None) -> dict:
+            if pause_waiter:
+                await pause_waiter()
+            return await _ask_with_conv_orig(p, max_tokens)
+        self._ask = _ask_with_pause
 
         def _check():
             if check_cancelled and check_cancelled():
@@ -253,19 +306,45 @@ class AIExtractor:
 
         try:
             return await self._run_extract_m1_pipeline(
-                document_texts, progress_callback, parallel_callback, _check
+                document_texts, progress_callback, parallel_callback, _check,
+                failed_batch_callback, partial_result_callback,
             )
         finally:
             self._ask = _orig_ask
 
-    async def _run_extract_m1_pipeline(self, document_texts, progress_callback, parallel_callback, _check):
+    async def _run_extract_m1_pipeline(self, document_texts, progress_callback, parallel_callback, _check,
+                                         failed_batch_callback=None, partial_result_callback=None):
         """The actual extraction pipeline (called with monkey-patched self._ask)."""
+        _fbc = failed_batch_callback
+        _prc = partial_result_callback
 
-        # ---- Split documents into batches by size ----
+        # ---- Step 1: Split any oversized file into chunks ----
+        # If a single file exceeds BATCH_MAX_CHARS, chunk it with filename annotations
+        # (user's requirement: every file complete — but impossible if > batch limit, so chunk)
+        preprocessed: list[tuple[str, str]] = []
+        for filename, text in document_texts:
+            if len(text) <= self.BATCH_MAX_CHARS:
+                preprocessed.append((filename, text))
+                continue
+            # Split large file into chunks with 500-char overlap for context preservation
+            chunk_size = self.BATCH_MAX_CHARS - 500  # leave room for filename header
+            overlap = 500
+            chunks = []
+            i = 0
+            while i < len(text):
+                chunk = text[i:i + chunk_size]
+                chunks.append(chunk)
+                i += chunk_size - overlap
+            total_chunks = len(chunks)
+            for idx, chunk in enumerate(chunks):
+                chunk_filename = f"{filename} [第{idx+1}/{total_chunks}部分]"
+                preprocessed.append((chunk_filename, chunk))
+
+        # ---- Step 2: Pack chunks into batches by size ----
         batches = []
         current_batch = []
         current_size = 0
-        for filename, text in document_texts:
+        for filename, text in preprocessed:
             if current_size + len(text) > self.BATCH_MAX_CHARS and current_batch:
                 batches.append(current_batch)
                 current_batch = []
@@ -279,135 +358,280 @@ class AIExtractor:
 
         if progress_callback:
             if total_batches > 1:
-                await progress_callback("discovering_entities", 0.10,
-                    f"文档已分为 {total_batches} 批处理（全量数据）...")
+                await progress_callback("extracting_entities", 0.10,
+                    f"文档已分为 {total_batches} 批处理，单趟提取实体+属性...")
             else:
-                await progress_callback("discovering_entities", 0.10,
-                    "正在从文档中识别实体类型和枚举...")
+                await progress_callback("extracting_entities", 0.10,
+                    "单趟提取实体类型、属性和枚举...")
 
-        # ---- Process batches: first batch serial (gets initial context), rest parallel ----
         MAX_CONCURRENT = 3  # Max parallel AI calls to avoid rate limiting
         sem = asyncio.Semaphore(MAX_CONCURRENT)
 
-        all_classes_raw = []
-        all_enums_raw = []
-        all_confidence_notes = []
-        known_entity_names = []
+        # Doc batch texts (used by both combined extraction and association extraction)
+        doc_batch_texts = [
+            "\n\n---\n\n".join(f"[文档: {fn}]\n{txt}" for fn, txt in batch)
+            for batch in batches
+        ]
+
+        # Helper to emit partial results to UI after each milestone
+        async def _emit_partial(mof_cls_list=None, assocs_list=None, enum_list=None):
+            if not _prc:
+                return
+            try:
+                partial_pkg = Package(
+                    id=str(uuid.uuid4()),
+                    name="M1Package_Partial", label="M1模型(提取中)",
+                    classes=mof_cls_list or [],
+                    enumerations=enum_list or [],
+                    associations=assocs_list or [],
+                )
+                await _prc(partial_pkg.model_dump())
+            except Exception as e:
+                # Never let partial emit kill the extraction
+                pass
+
+        # ================================================================
+        # COMBINED EXTRACTION (replaces the old two-phase discover + attrs)
+        # ================================================================
+        # Previously: Phase A = discover classes (N batches), Phase B = for
+        # each class × each doc batch, ask "find attributes" (N_classes × N_docs
+        # LLM calls — up to ~15,000 for large inputs).
+        # Now: one LLM call per doc batch yields classes WITH their attributes.
+        # Cross-batch context hint prevents redefinition and keeps names consistent.
+        # Complexity: O(N_doc_batches) instead of O(N_classes × N_doc_batches).
+
+        # Shared merged state across all batches (mutated under lock)
+        merged_classes: dict = {}    # name -> dict with "attributes" list and "_attr_names" set
+        merged_enums: dict = {}      # name -> dict with "literals" list and "_lit_names" set
+        all_confidence_notes: list = []
+        merge_lock = asyncio.Lock()
         completed_batches = 0
 
-        async def process_entity_batch(batch_idx, batch, context):
-            _check()  # Check cancellation before each batch
+        def _build_context_snapshot() -> dict:
+            """Snapshot merged_classes for passing as known_context to later batches."""
+            ctx = {}
+            for cname, cls in merged_classes.items():
+                ctx[cname] = {
+                    "label": cls.get("label", ""),
+                    "attrs": list(cls.get("_attr_names", [])),
+                }
+            return ctx
+
+        def _merge_batch_result(result: dict):
+            """Merge a batch's result into the shared accumulated state."""
+            for cls in result.get("classes", []):
+                cname = cls.get("name", "").strip()
+                if not cname:
+                    continue
+                if cname not in merged_classes:
+                    merged_classes[cname] = {
+                        "name": cname,
+                        "label": cls.get("label", ""),
+                        "description": cls.get("description", "") or "",
+                        "attributes": [],
+                        "_attr_names": set(),
+                        "hierarchy_hint": None,
+                    }
+                existing = merged_classes[cname]
+                # Fill in better label/description if the new one is richer
+                if cls.get("label") and not existing["label"]:
+                    existing["label"] = cls["label"]
+                new_desc = cls.get("description") or ""
+                if new_desc and len(new_desc) > len(existing["description"]):
+                    existing["description"] = new_desc
+                # Union attributes by name (first occurrence wins — honors known_context)
+                for a in cls.get("attributes", []):
+                    aname = (a.get("name") or "").strip()
+                    if not aname or aname in existing["_attr_names"]:
+                        continue
+                    existing["attributes"].append(a)
+                    existing["_attr_names"].add(aname)
+                # Preserve hierarchy_hint: keep first non-empty one found across batches
+                hint = cls.get("hierarchy_hint")
+                if hint and isinstance(hint, dict) and not existing.get("hierarchy_hint"):
+                    # Only keep hints with at least one useful field
+                    if hint.get("theme_hint") or hint.get("level_hint") or hint.get("parent_name_hint"):
+                        existing["hierarchy_hint"] = {
+                            "theme_hint": hint.get("theme_hint", ""),
+                            "level_hint": hint.get("level_hint", ""),
+                            "parent_name_hint": hint.get("parent_name_hint", ""),
+                        }
+
+            for en in result.get("enumerations", []):
+                ename = en.get("name", "").strip()
+                if not ename:
+                    continue
+                if ename not in merged_enums:
+                    merged_enums[ename] = {
+                        "name": ename,
+                        "label": en.get("label", ""),
+                        "description": en.get("description", ""),
+                        "literals": [],
+                        "_lit_names": set(),
+                    }
+                existing = merged_enums[ename]
+                if en.get("label") and not existing["label"]:
+                    existing["label"] = en["label"]
+                for lit in en.get("literals", []):
+                    lname = (lit.get("name") or "").strip()
+                    if not lname or lname in existing["_lit_names"]:
+                        continue
+                    existing["literals"].append(lit)
+                    existing["_lit_names"].add(lname)
+
+            all_confidence_notes.extend(result.get("confidence_notes", []))
+
+        async def process_combined_batch(batch_idx, batch, initial_seed=None):
+            """Extract classes (with attributes) + enumerations from one doc batch."""
+            _check()
             nonlocal completed_batches
-            subtask_id = f"entity_batch_{batch_idx}"
+            subtask_id = f"extract_batch_{batch_idx}"
             batch_filenames = [fn for fn, _ in batch]
-            subtask_name = f"实体批{batch_idx+1}: {', '.join(batch_filenames[:2])}{'...' if len(batch_filenames) > 2 else ''}"
+            subtask_name = (
+                f"批{batch_idx+1}: {', '.join(batch_filenames[:2])}"
+                + ('...' if len(batch_filenames) > 2 else '')
+            )
 
             if parallel_callback:
                 await parallel_callback(subtask_id, subtask_name, "queued")
 
             async with sem:
+                if parallel_callback:
+                    await parallel_callback(subtask_id, subtask_name, "running")
+                if progress_callback:
+                    await progress_callback("extracting_entities",
+                        0.10 + 0.55 * (completed_batches / max(total_batches, 1)),
+                        f"提取 [{completed_batches}/{total_batches}]: {subtask_name}")
+
                 batch_text = "\n\n---\n\n".join(
                     f"[文档: {fn}]\n{txt}" for fn, txt in batch
                 )
 
-                if parallel_callback:
-                    await parallel_callback(subtask_id, subtask_name, "running")
-                if progress_callback:
-                    await progress_callback("discovering_entities",
-                        0.10 + 0.25 * (batch_idx / total_batches),
-                        f"第 {batch_idx+1}/{total_batches} 批{'(并行)' if batch_idx > 0 else ''}: 识别实体")
+                # Build context snapshot (union of current merged state + first-batch seed)
+                async with merge_lock:
+                    ctx = _build_context_snapshot()
+                if initial_seed:
+                    for k, v in initial_seed.items():
+                        ctx.setdefault(k, v)
 
                 try:
-                    entities = await self._discover_entities_from_docs(batch_text, known_context=context)
-                    completed_batches += 1
-
-                    if parallel_callback:
-                        await parallel_callback(subtask_id, subtask_name, "done")
-                    if progress_callback:
-                        await progress_callback("discovering_entities",
-                            0.10 + 0.25 * (completed_batches / total_batches),
-                            f"实体发现: {completed_batches}/{total_batches} 批完成")
-                    return entities
+                    result = await self._extract_entities_with_attrs_from_docs(
+                        batch_text, known_context=ctx,
+                    )
                 except Exception as e:
                     if parallel_callback:
                         await parallel_callback(subtask_id, subtask_name, "error")
-                    raise
+                    all_confidence_notes.append(f"批{batch_idx+1}失败: {str(e)[:200]}")
+                    if _fbc:
+                        await _fbc({
+                            "type": "combined_extraction",
+                            "label": f"提取 批{batch_idx+1}",
+                            "batch_idx": batch_idx,
+                            "filenames": batch_filenames,
+                            "error": str(e)[:500],
+                        })
+                    return
 
-        if total_batches == 1:
-            # Single batch — just run it
-            entities = await process_entity_batch(0, batches[0], [])
-            all_classes_raw.extend(entities.get("classes", []))
-            all_enums_raw.extend(entities.get("enumerations", []))
-            all_confidence_notes.extend(entities.get("confidence_notes", []))
-        else:
-            # First batch serial to get initial entity context
-            first_entities = await process_entity_batch(0, batches[0], [])
-            first_classes = first_entities.get("classes", [])
-            first_enums = first_entities.get("enumerations", [])
-            all_classes_raw.extend(first_classes)
-            all_enums_raw.extend(first_enums)
-            all_confidence_notes.extend(first_entities.get("confidence_notes", []))
+                # Merge under lock so parallel batches don't race
+                async with merge_lock:
+                    _merge_batch_result(result)
+                    completed_batches += 1
+                    cls_cnt = len(merged_classes)
+                    enum_cnt = len(merged_enums)
+                    attr_cnt = sum(len(c["attributes"]) for c in merged_classes.values())
 
-            # Build context from first batch for remaining batches
-            known_entity_names = [c.get("name", "") for c in first_classes]
-            known_entity_names += [e.get("name", "") for e in first_enums]
-
-            # Remaining batches run in parallel (all share the same initial context)
-            if len(batches) > 1:
+                if parallel_callback:
+                    await parallel_callback(subtask_id, subtask_name, "done")
                 if progress_callback:
-                    await progress_callback("discovering_entities", 0.15,
-                        f"剩余 {len(batches)-1} 批并行处理中...")
+                    await progress_callback("extracting_entities",
+                        0.10 + 0.55 * (completed_batches / max(total_batches, 1)),
+                        f"提取 [{completed_batches}/{total_batches}]: "
+                        f"累计 {cls_cnt} 类 / {attr_cnt} 属性 / {enum_cnt} 枚举")
 
-                tasks = [
-                    process_entity_batch(i, batches[i], list(known_entity_names))
-                    for i in range(1, len(batches))
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Live partial emission so UI updates progressively
+                try:
+                    partial_cls, partial_enums = _materialize_partial()
+                    await _emit_partial(mof_cls_list=partial_cls, enum_list=partial_enums)
+                except Exception:
+                    pass
 
-                for r in results:
-                    if isinstance(r, Exception):
-                        all_confidence_notes.append(f"一个批次处理失败: {str(r)}")
-                        continue
-                    all_classes_raw.extend(r.get("classes", []))
-                    all_enums_raw.extend(r.get("enumerations", []))
-                    all_confidence_notes.extend(r.get("confidence_notes", []))
+        def _materialize_partial():
+            """Build MOFClass / Enumeration objects from current merged state for partial emit."""
+            # Build enumerations first for name->id lookup
+            enum_map_tmp = {}
+            enum_objs_tmp = []
+            for ename, en in merged_enums.items():
+                eid = str(uuid.uuid4())
+                enum_map_tmp[ename] = eid
+                enum_objs_tmp.append(Enumeration(
+                    id=eid, name=ename, label=en.get("label", ""),
+                    description=en.get("description") or None,
+                    literals=[
+                        EnumLiteral(id=str(uuid.uuid4()),
+                                    name=lit.get("name", ""),
+                                    label=lit.get("label", ""),
+                                    value=lit.get("value"))
+                        for lit in en.get("literals", [])
+                    ],
+                ))
+            cls_objs = []
+            for cname, cls in merged_classes.items():
+                attrs = []
+                for ad in cls.get("attributes", []):
+                    dt = ad.get("data_type", "String")
+                    try:
+                        PrimitiveDataType(dt)
+                    except ValueError:
+                        dt = "String"
+                    eref = None
+                    if dt == "Enum":
+                        eref = enum_map_tmp.get(ad.get("enum_name", ""))
+                    m = ad.get("multiplicity", {}) or {}
+                    attrs.append(Attribute(
+                        id=str(uuid.uuid4()), name=ad.get("name", ""),
+                        label=ad.get("label", ""),
+                        description=ad.get("description"),
+                        data_type=dt, enum_ref=eref, unit=ad.get("unit"),
+                        multiplicity=Multiplicity(
+                            lower=m.get("lower", 1), upper=m.get("upper", 1),
+                        ),
+                    ))
+                cls_objs.append(MOFClass(
+                    id=str(uuid.uuid4()), name=cname,
+                    label=cls.get("label", ""),
+                    description=cls.get("description") or None,
+                    attributes=attrs,
+                ))
+            return cls_objs, enum_objs_tmp
 
-        # Deduplicate by name
-        seen_cls = set()
-        deduped_classes = []
-        for c in all_classes_raw:
-            if c.get("name") not in seen_cls:
-                seen_cls.add(c.get("name"))
-                deduped_classes.append(c)
-        seen_enum = set()
-        deduped_enums = []
-        for e in all_enums_raw:
-            if e.get("name") not in seen_enum:
-                seen_enum.add(e.get("name"))
-                deduped_enums.append(e)
+        # --- Execute: first batch serial (seeds context), rest in parallel ---
+        if total_batches == 1:
+            await process_combined_batch(0, batches[0])
+        else:
+            await process_combined_batch(0, batches[0])
+            # Build seed context from first-batch merged state
+            async with merge_lock:
+                seed_ctx = _build_context_snapshot()
+            if progress_callback:
+                await progress_callback("extracting_entities", 0.15,
+                    f"首批完成，剩余 {total_batches-1} 批并行处理中...")
+            tasks = [
+                process_combined_batch(i, batches[i], initial_seed=seed_ctx)
+                for i in range(1, total_batches)
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        classes_raw = deduped_classes
-        enums_raw = deduped_enums
+        _check()
 
-        _check()  # Check cancellation before attribute extraction
+        # Clear parallel subtasks (phase changing)
+        # (routers/extraction.py handles this via phase-change detection)
 
-        # ---- Prepare document BATCHES for attribute/association extraction ----
-        # Each doc batch contains COMPLETE documents (no truncation).
-        # We'll iterate doc batches per class, carrying forward discovered attributes as context.
-        # Reuse the same doc-batching logic as entity discovery (the `batches` list).
-        doc_batch_texts = [
-            "\n\n---\n\n".join(f"[文档: {fn}]\n{txt}" for fn, txt in batch)
-            for batch in batches
-        ]
-        # For association extraction later, use the first/largest batch as context sample
-        combined = doc_batch_texts[0] if doc_batch_texts else ""
-
-        confidence_notes = all_confidence_notes
-
-        # Build Enumeration objects
+        # ---- Finalize: build Enumeration and MOFClass objects from merged state ----
         enumerations = []
-        for e in enums_raw:
+        enum_name_to_id = {}
+        for ename, en in merged_enums.items():
             enum_id = str(uuid.uuid4())
+            enum_name_to_id[ename] = enum_id
             literals = [
                 EnumLiteral(
                     id=str(uuid.uuid4()),
@@ -415,35 +639,80 @@ class AIExtractor:
                     label=lit.get("label", ""),
                     value=lit.get("value"),
                 )
-                for lit in e.get("literals", [])
+                for lit in en.get("literals", [])
             ]
             enumerations.append(Enumeration(
-                id=enum_id, name=e.get("name", ""), label=e.get("label", ""),
-                description=e.get("description"), literals=literals,
+                id=enum_id, name=ename, label=en.get("label", ""),
+                description=en.get("description") or None,
+                literals=literals,
             ))
 
-        enum_name_to_id = {e.name: e.id for e in enumerations}
+        classes_raw = [  # shape expected by downstream code (retry etc.)
+            {
+                "name": cls["name"],
+                "label": cls["label"],
+                "description": cls["description"],
+                "attributes": cls["attributes"],
+                "hierarchy_hint": cls.get("hierarchy_hint"),
+            }
+            for cls in merged_classes.values()
+        ]
+        confidence_notes = list(all_confidence_notes)
 
-        # Step 2: Attribute Extraction (parallel, 3 classes per call, max 3 concurrent)
-        class_batches = [classes_raw[i:i+3] for i in range(0, len(classes_raw), 3)]
-        total_class_batches = len(class_batches)
+        mof_classes = []
+        total_attrs = 0
+        for cls_data in classes_raw:
+            cls_id = str(uuid.uuid4())
+            attrs = []
+            for ad in cls_data.get("attributes", []):
+                dt = ad.get("data_type", "String")
+                try:
+                    PrimitiveDataType(dt)
+                except ValueError:
+                    dt = "String"
+                enum_ref = None
+                if dt == "Enum":
+                    enum_ref = enum_name_to_id.get(ad.get("enum_name", ""))
+                mult = ad.get("multiplicity", {}) or {}
+                attrs.append(Attribute(
+                    id=str(uuid.uuid4()), name=ad.get("name", ""),
+                    label=ad.get("label", ""), description=ad.get("description"),
+                    data_type=dt, enum_ref=enum_ref, unit=ad.get("unit"),
+                    multiplicity=Multiplicity(
+                        lower=mult.get("lower", 1), upper=mult.get("upper", 1),
+                    ),
+                ))
+                total_attrs += 1
+            mof_classes.append(MOFClass(
+                id=cls_id, name=cls_data.get("name", ""),
+                label=cls_data.get("label", ""),
+                description=cls_data.get("description") or None,
+                attributes=attrs,
+                hierarchy_hint=cls_data.get("hierarchy_hint"),
+            ))
 
         if progress_callback:
-            await progress_callback("extracting_attributes", 0.35,
-                f"开始并行提取属性: {len(classes_raw)} 个类, 分 {total_class_batches} 批, 最多 {MAX_CONCURRENT} 路并发...")
+            await progress_callback("extracting_entities", 0.65,
+                f"实体+属性提取完成: {len(mof_classes)} 类, {total_attrs} 属性, {len(enumerations)} 枚举")
 
-        completed_attr_batches = 0
-        total_work_units = len(class_batches) * len(doc_batch_texts)
+        # Emit partial: classes with attributes + enumerations (no associations yet)
+        await _emit_partial(mof_cls_list=mof_classes, enum_list=enumerations)
 
-        async def extract_attr_batch(cls_batch_idx, cls_batch):
-            """For one class batch: iterate ALL doc batches serially, accumulating attributes.
-            Each doc batch sees complete docs + attributes already found for these classes,
-            so new docs can add/refine attributes while knowing what's already known.
-            """
+        _check()
+
+        # Step 3: Association Extraction — parallelized, first batch serial for context seed
+        class_id_map = {c.name: c.id for c in mof_classes}
+        all_associations_raw = []
+        known_assoc_names: list = []
+        assoc_lock = asyncio.Lock()
+        assoc_completed = 0
+        n_assoc_batches = len(doc_batch_texts)
+
+        async def process_assoc_batch(doc_idx, doc_text, initial_seed=None):
+            nonlocal assoc_completed
             _check()
-            subtask_id = f"attr_batch_{cls_batch_idx}"
-            batch_names = ", ".join(c.get("label", c.get("name", "")) for c in cls_batch)
-            subtask_name = f"属性批{cls_batch_idx+1}: {batch_names}"
+            subtask_id = f"assoc_batch_{doc_idx}"
+            subtask_name = f"关联批{doc_idx+1}"
 
             if parallel_callback:
                 await parallel_callback(subtask_id, subtask_name, "queued")
@@ -452,119 +721,63 @@ class AIExtractor:
                 if parallel_callback:
                     await parallel_callback(subtask_id, subtask_name, "running")
 
-                # Accumulate attributes per class across doc batches
-                accumulated = {c["name"]: {"name": c["name"], "label": c.get("label", ""),
-                                             "description": c.get("description", ""),
-                                             "attributes": []} for c in cls_batch}
+                # Snapshot known assoc names for context hint
+                async with assoc_lock:
+                    known_snapshot = list(known_assoc_names)
+                if initial_seed:
+                    for n in initial_seed:
+                        if n not in known_snapshot:
+                            known_snapshot.append(n)
 
-                for doc_idx, doc_text in enumerate(doc_batch_texts):
-                    _check()
-                    nonlocal completed_attr_batches
-                    completed_attr_batches += 1
+                try:
+                    assoc_data = await self._extract_assocs_from_docs(
+                        doc_text, mof_classes, known_assocs=known_snapshot,
+                    )
+                except Exception as e:
+                    if parallel_callback:
+                        await parallel_callback(subtask_id, subtask_name, "error")
+                    async with assoc_lock:
+                        confidence_notes.append(f"关联批{doc_idx+1} 失败: {str(e)[:100]}")
+                        assoc_completed += 1
+                    if _fbc:
+                        await _fbc({
+                            "type": "association_extraction",
+                            "label": f"关联提取 文档批{doc_idx+1}",
+                            "doc_batch_idx": doc_idx,
+                            "error": str(e)[:500],
+                        })
+                    return
 
-                    if progress_callback:
-                        await progress_callback("extracting_attributes",
-                            0.35 + 0.30 * (completed_attr_batches / max(total_work_units, 1)),
-                            f"属性提取 [类批{cls_batch_idx+1}/{len(class_batches)} × 文档批{doc_idx+1}/{len(doc_batch_texts)}]: {batch_names}")
-
-                    # Build context: attributes already found for this class batch
-                    attr_context = {}
-                    for name, info in accumulated.items():
-                        if info["attributes"]:
-                            attr_context[name] = [a.get("name", "") for a in info["attributes"]]
-
-                    try:
-                        result = await self._extract_attrs_from_docs(
-                            doc_text, cls_batch, enum_name_to_id,
-                            known_attrs_context=attr_context,
-                        )
-                        # Merge new attributes (dedupe by name within class)
-                        for cls_data in result:
-                            cname = cls_data.get("name", "")
-                            if cname not in accumulated:
-                                continue
-                            existing_names = {a.get("name") for a in accumulated[cname]["attributes"]}
-                            for attr in cls_data.get("attributes", []):
-                                if attr.get("name") and attr.get("name") not in existing_names:
-                                    accumulated[cname]["attributes"].append(attr)
-                                    existing_names.add(attr.get("name"))
-                    except Exception as e:
-                        confidence_notes.append(f"类批{cls_batch_idx+1} × 文档批{doc_idx+1} 失败: {str(e)[:100]}")
+                # Merge under lock to avoid duplicate appends
+                async with assoc_lock:
+                    for ad in assoc_data.get("associations", []):
+                        aname = ad.get("name", "")
+                        if aname and aname not in known_assoc_names:
+                            all_associations_raw.append(ad)
+                            known_assoc_names.append(aname)
+                    confidence_notes.extend(assoc_data.get("confidence_notes", []))
+                    assoc_completed += 1
+                    progress_pct = assoc_completed / max(n_assoc_batches, 1)
 
                 if parallel_callback:
                     await parallel_callback(subtask_id, subtask_name, "done")
+                if progress_callback:
+                    await progress_callback("extracting_associations",
+                        0.65 + 0.25 * progress_pct,
+                        f"关联提取 [{assoc_completed}/{n_assoc_batches}]: 累计 {len(all_associations_raw)} 条")
 
-                return list(accumulated.values())
-
-        attr_tasks = [extract_attr_batch(i, b) for i, b in enumerate(class_batches)]
-        attr_results = await asyncio.gather(*attr_tasks, return_exceptions=True)
-
-        mof_classes = []
-        total_attrs = 0
-        for batch_result in attr_results:
-            if isinstance(batch_result, Exception):
-                confidence_notes.append(f"一个属性批次失败: {str(batch_result)}")
-                continue
-            for cls_data in batch_result:
-                cls_id = str(uuid.uuid4())
-                attrs = []
-                for ad in cls_data.get("attributes", []):
-                    dt = ad.get("data_type", "String")
-                    try:
-                        PrimitiveDataType(dt)
-                    except ValueError:
-                        dt = "String"
-                    enum_ref = None
-                    if dt == "Enum":
-                        enum_ref = enum_name_to_id.get(ad.get("enum_name", ""))
-                    mult = ad.get("multiplicity", {})
-                    attrs.append(Attribute(
-                        id=str(uuid.uuid4()), name=ad.get("name", ""),
-                        label=ad.get("label", ""), description=ad.get("description"),
-                        data_type=dt, enum_ref=enum_ref, unit=ad.get("unit"),
-                        multiplicity=Multiplicity(
-                            lower=mult.get("lower", 1), upper=mult.get("upper", 1),
-                        ),
-                    ))
-                    total_attrs += 1
-
-                mof_classes.append(MOFClass(
-                    id=cls_id, name=cls_data.get("name", ""),
-                    label=cls_data.get("label", ""),
-                    description=cls_data.get("description"),
-                    attributes=attrs,
-                ))
-
-        if progress_callback:
-            await progress_callback("extracting_attributes", 0.65,
-                f"全部属性提取完成: {len(mof_classes)} 个类, {total_attrs} 个属性")
-
-        _check()  # Check cancellation before association extraction
-
-        # Step 3: Association Extraction — iterate all doc batches with context
-        class_id_map = {c.name: c.id for c in mof_classes}
-        all_associations_raw = []
-        known_assoc_names = []
-
-        for doc_idx, doc_text in enumerate(doc_batch_texts):
-            _check()
-            if progress_callback:
-                await progress_callback("extracting_associations",
-                    0.65 + 0.30 * (doc_idx / max(len(doc_batch_texts), 1)),
-                    f"关联提取 [文档批{doc_idx+1}/{len(doc_batch_texts)}]")
-
-            try:
-                assoc_data = await self._extract_assocs_from_docs(
-                    doc_text, mof_classes, known_assocs=known_assoc_names
-                )
-                for ad in assoc_data.get("associations", []):
-                    aname = ad.get("name", "")
-                    if aname and aname not in known_assoc_names:
-                        all_associations_raw.append(ad)
-                        known_assoc_names.append(aname)
-                confidence_notes.extend(assoc_data.get("confidence_notes", []))
-            except Exception as e:
-                confidence_notes.append(f"关联批{doc_idx+1} 失败: {str(e)[:100]}")
+        # Execute: first batch serial (seeds context), rest in parallel
+        if n_assoc_batches == 1:
+            await process_assoc_batch(0, doc_batch_texts[0])
+        elif n_assoc_batches > 1:
+            await process_assoc_batch(0, doc_batch_texts[0])
+            async with assoc_lock:
+                seed = list(known_assoc_names)
+            tasks = [
+                process_assoc_batch(i, doc_batch_texts[i], initial_seed=seed)
+                for i in range(1, n_assoc_batches)
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         associations = []
         for ad in all_associations_raw:
@@ -587,6 +800,9 @@ class AIExtractor:
                 ),
                 association_type=ad.get("association_type", "composition"),
             ))
+
+        # Emit partial: complete classes + enumerations + associations
+        await _emit_partial(mof_cls_list=mof_classes, enum_list=enumerations, assocs_list=associations)
 
         package = Package(
             id=str(uuid.uuid4()), name="M1Package", label="M1模型",
@@ -613,136 +829,1236 @@ class AIExtractor:
         self,
         m1_package: dict,
         progress_callback: Optional[Callable] = None,
+        conversation_callback: Optional[Callable] = None,
+        check_cancelled: Optional[Callable] = None,
+        partial_result_callback: Optional[Callable] = None,
+        pause_waiter: Optional[Callable] = None,
+        parallel_callback: Optional[Callable] = None,
     ) -> dict:
         """
-        Given an M1 model, derive a generalized M2 meta-model by:
-        - Identifying common/shared attributes across M1 classes → M2 base class attributes
-        - Abstracting domain-specific classes into generic types
-        - Extracting universal enumerations
-        - Defining generic association patterns
+        Derive a generalized M2 meta-model from an M1 model using a 3-phase approach:
+          Phase 1 — Business-observation clustering: group M1 classes by what a business
+                   analyst would query together (NOT by name/attribute similarity).
+          Phase 2 — Per-group synthesis: for each group, produce EXACTLY ONE M2 class
+                   (flat, single-layer). Shared attributes bubble up; differences stay in M1.
+          Phase 3 — Cross-group consolidation: merge semantically-duplicate M2 classes
+                   (still flat, no hierarchy).
+
+        The old single-call approach collapsed to Entity/Object because a single LLM call
+        cannot simultaneously cluster + name + structure 365 classes. This decomposes the
+        problem so each LLM call sees a bounded, coherent context.
         """
-        if progress_callback:
-            await progress_callback("deriving_m2", 0.2, "正在从M1模型抽象出M2元模型...")
+        # ---- Monkey-patch _ask to capture conversations + honor pause ----
+        _orig_ask = self._ask
+        _call_count = [0]
 
-        m1_json = json.dumps(m1_package, ensure_ascii=False, indent=2)
+        async def _ask_with_conv(p: str, max_tokens: int = None) -> dict:
+            if pause_waiter:
+                await pause_waiter()
+            if max_tokens is None:
+                max_tokens = self.DEFAULT_MAX_TOKENS
+            _call_count[0] += 1
+            n = _call_count[0]
+            if conversation_callback:
+                first_line = p.strip().split('\n')[0][:120]
+                full_prompt = f"[SYSTEM]\n{SYSTEM_PROMPT}\n\n[USER]\n{p}"
+                await conversation_callback("prompt", f"[#{n}] {first_line}...",
+                                              f"发送 {len(p):,} 字符", full_prompt)
+                await conversation_callback("waiting", f"[#{n}] 等待AI响应中...", "")
+            raw_text = await self.llm.chat(
+                system=SYSTEM_PROMPT, user=p,
+                temperature=0, max_tokens=max_tokens,
+                timeout_override=self.EXTRACTION_TIMEOUT,
+            )
+            if conversation_callback:
+                preview = raw_text[:150].replace('\n', ' ')
+                await conversation_callback("response", f"[#{n}] {preview}...",
+                                              f"收到 {len(raw_text):,} 字符", raw_text)
+            return _extract_json(raw_text)
 
-        prompt = f"""Given the following M1 (domain-specific) model, derive an M2 (meta-model) by generalizing it.
+        self._ask = _ask_with_conv
 
-The M2 meta-model should:
-1. Extract COMMON attributes shared by multiple M1 classes into abstract M2 base classes
-   (e.g., if multiple M1 classes all have "code", "name", "status" → create an M2 "Equipment" base class)
-2. Define generic/abstract types that the M1 classes specialize
-3. Keep only universal attributes in M2; domain-specific attributes belong in M1
-4. Identify common enumeration types that are shared across classes
-5. Define abstract association patterns (e.g., "containsSubEquipment" self-association)
+        def _check():
+            if check_cancelled and check_cancelled():
+                raise RuntimeError("用户中止推导")
 
-For each M2 class:
-- "name": English PascalCase (generic name, e.g. "Equipment" not "PumpedStorageUnit")
-- "label": Chinese generic label
-- "description": what this abstract type represents
-- "attributes": only COMMON/UNIVERSAL attributes (shared by multiple M1 classes)
+        try:
+            m1_classes = m1_package.get("classes", []) or []
+            if not m1_classes:
+                raise RuntimeError("M1 模型没有类, 无法推导 M2")
 
-For each M1 class, indicate which M2 class it specializes via "parent_class_name".
+            # ================================================================
+            # Phase 1 — Business-observation clustering
+            # ================================================================
+            _check()
+            if progress_callback:
+                await progress_callback("clustering_m1", 0.05,
+                    f"Phase 1/3: 按业务观测维度对 {len(m1_classes)} 个 M1 类分组...")
 
-Return valid JSON:
-{{
-  "m2_package": {{
-    "name": "M2MetaModelPackage",
-    "label": "M2元模型",
-    "classes": [
-      {{
-        "name": "Equipment",
-        "label": "设备",
-        "description": "所有设备类型的通用基类",
-        "attributes": [
-          {{"name": "equipmentCode", "label": "设备编码", "data_type": "String", "multiplicity": {{"lower": 1, "upper": 1}}}},
-          ...
-        ]
-      }}
-    ],
-    "enumerations": [...],
-    "associations": [...]
-  }},
-  "m1_class_mappings": [
-    {{"m1_class_name": "PumpedStorageUnit", "m2_parent_name": "Equipment"}}
-  ],
-  "confidence_notes": []
-}}
+            groups = await self._cluster_m1_for_m2(m1_package, parallel_callback)
 
-M1 Model:
-{m1_json}"""
+            if not groups:
+                raise RuntimeError("Phase 1 未能生成任何分组")
 
-        result = await self._ask(prompt, max_tokens=8192)
+            if progress_callback:
+                await progress_callback("clustering_m1", 0.18,
+                    f"Phase 1 完成: {len(groups)} 个业务组")
 
-        # Build M2 Package
-        m2_raw = result.get("m2_package", {})
+            # ================================================================
+            # Phase 2 — Per-group synthesis (parallel, 3 concurrent)
+            # ================================================================
+            _check()
+            if progress_callback:
+                await progress_callback("synthesizing_m2", 0.20,
+                    f"Phase 2/3: 为 {len(groups)} 个业务组抽象 M2 基类 (并行)...")
+
+            m2_classes_raw, m1_mappings_raw, group_notes = await self._synthesize_m2_groups(
+                groups, m1_package,
+                progress_callback, parallel_callback, pause_waiter, _check,
+                partial_result_callback,
+            )
+
+            if not m2_classes_raw:
+                raise RuntimeError("Phase 2 未能生成任何 M2 基类")
+
+            if progress_callback:
+                await progress_callback("synthesizing_m2", 0.68,
+                    f"Phase 2 完成: 初步合成 {len(m2_classes_raw)} 个 M2 基类")
+
+            # ================================================================
+            # Phase 2.5 — Hierarchy detection per M2 base class (parallel)
+            # ================================================================
+            _check()
+            if progress_callback:
+                await progress_callback("detecting_hierarchy", 0.70,
+                    f"Phase 2.5/4: 探测 {len(m2_classes_raw)} 个 M2 基类的层级结构...")
+
+            m2_classes_raw, hierarchy_notes = await self._detect_hierarchy_for_m2_classes(
+                m2_classes_raw, m1_mappings_raw, m1_package,
+                progress_callback, parallel_callback, pause_waiter, _check,
+            )
+
+            _hierarchy_count = sum(
+                1 for c in m2_classes_raw
+                if c.get("_hierarchy", {}).get("has_hierarchy")
+            )
+            if progress_callback:
+                await progress_callback("detecting_hierarchy", 0.82,
+                    f"Phase 2.5 完成: {_hierarchy_count} 个 M2 基类具有层级结构")
+
+            # ================================================================
+            # Phase 3 — Cross-group consolidation (merge duplicates)
+            # ================================================================
+            _check()
+            if progress_callback:
+                await progress_callback("consolidating_m2", 0.84,
+                    "Phase 3/4: 检查 M2 基类是否有语义重复...")
+
+            m2_classes_raw, m1_mappings_raw, consolidation_notes = await self._consolidate_m2(
+                m2_classes_raw, m1_mappings_raw,
+            )
+
+            if progress_callback:
+                await progress_callback("consolidating_m2", 0.92,
+                    f"Phase 3 完成: 最终 {len(m2_classes_raw)} 个 M2 基类")
+
+        finally:
+            self._ask = _orig_ask
+
+        # ================================================================
+        # Build final M2 Package (Pydantic objects)
+        # ================================================================
+        # For classes with detected hierarchy (_hierarchy.has_hierarchy==True):
+        #   1. Generate a dedicated Enumeration (<ClassName>Level) with the level names
+        #   2. Add a `level` Attribute (Enum, 1..1, required) to the class
+        #   3. Ensure parent + children self-associations exist
+        # Level info is also exported in m1_class_mappings so save-m2 can backfill M1.
+
+        m2_enumerations: list[Enumeration] = []
+        # Build per-class level enum first so we can attach enum_ref in the attribute
+        class_level_enum_id: dict[str, str] = {}  # class_name -> enum id
+        for c_raw in m2_classes_raw:
+            h = c_raw.get("_hierarchy") or {}
+            if not h.get("has_hierarchy"):
+                continue
+            levels = h.get("levels") or []
+            if not levels:
+                continue
+            cname = c_raw.get("name", "")
+            clabel = c_raw.get("label", cname)
+            enum = Enumeration(
+                id=str(uuid.uuid4()),
+                name=f"{cname}Level",
+                label=f"{clabel}层级",
+                description=f"{clabel} 的层级角色 (动态发现)",
+                literals=[
+                    EnumLiteral(
+                        id=str(uuid.uuid4()),
+                        name=L,              # use the Chinese/English level name directly
+                        label=L,
+                        value=str(i + 1),    # ordered; top=1
+                    )
+                    for i, L in enumerate(levels)
+                ],
+            )
+            m2_enumerations.append(enum)
+            class_level_enum_id[cname] = enum.id
+
         m2_classes = []
-        for c in m2_raw.get("classes", []):
+        for c_raw in m2_classes_raw:
             attrs = []
-            for a in c.get("attributes", []):
+            for a in c_raw.get("attributes", []) or []:
                 dt = a.get("data_type", "String")
-                mult = a.get("multiplicity", {})
+                try:
+                    PrimitiveDataType(dt)
+                except ValueError:
+                    dt = "String"
+                mult = a.get("multiplicity", {}) or {}
                 attrs.append(Attribute(
                     id=str(uuid.uuid4()), name=a.get("name", ""),
                     label=a.get("label", ""), description=a.get("description"),
                     data_type=dt, unit=a.get("unit"),
-                    multiplicity=Multiplicity(lower=mult.get("lower", 1), upper=mult.get("upper", 1)),
-                ))
-            m2_classes.append(MOFClass(
-                id=str(uuid.uuid4()), name=c.get("name", ""),
-                label=c.get("label", ""), description=c.get("description"),
-                is_abstract=True, attributes=attrs,
-            ))
-
-        m2_enums = []
-        for e in m2_raw.get("enumerations", []):
-            lits = [EnumLiteral(id=str(uuid.uuid4()), name=l.get("name", ""), label=l.get("label", ""))
-                    for l in e.get("literals", [])]
-            m2_enums.append(Enumeration(
-                id=str(uuid.uuid4()), name=e.get("name", ""),
-                label=e.get("label", ""), literals=lits,
-            ))
-
-        m2_assocs = []
-        for a in m2_raw.get("associations", []):
-            src = a.get("source", {})
-            tgt = a.get("target", {})
-            m2_class_id_map = {c.name: c.id for c in m2_classes}
-            m2_assocs.append(Association(
-                id=str(uuid.uuid4()), name=a.get("name", ""),
-                label=a.get("label", ""), description=a.get("description"),
-                source=AssociationEnd(
-                    class_ref=m2_class_id_map.get(src.get("class_name", ""), ""),
-                    class_name=src.get("class_name", ""),
                     multiplicity=Multiplicity(
-                        lower=src.get("multiplicity", {}).get("lower", 0),
-                        upper=src.get("multiplicity", {}).get("upper", 1)),
+                        lower=mult.get("lower", 1), upper=mult.get("upper", 1),
+                    ),
+                ))
+
+            # If this class has a hierarchy, add the `level` enum attribute
+            cname = c_raw.get("name", "")
+            level_enum_id = class_level_enum_id.get(cname)
+            if level_enum_id:
+                attrs.append(Attribute(
+                    id=str(uuid.uuid4()),
+                    name="level",
+                    label="层级",
+                    description="在业务包含结构中的层级角色 (动态发现, 实例必填)",
+                    data_type=PrimitiveDataType.ENUM,
+                    enum_ref=level_enum_id,
+                    multiplicity=Multiplicity(lower=1, upper=1),
+                ))
+
+            m2_classes.append(MOFClass(
+                id=str(uuid.uuid4()),
+                name=cname,
+                label=c_raw.get("label", ""),
+                description=c_raw.get("description"),
+                is_abstract=True,
+                attributes=attrs,
+            ))
+
+        class_id_map = {c.name: c.id for c in m2_classes}
+
+        # Build M2 self-associations
+        m2_assocs = []
+
+        def _add_assoc(cls_id, cls_name, name, label, src_mult, tgt_mult, assoc_type, desc=None):
+            m2_assocs.append(Association(
+                id=str(uuid.uuid4()),
+                name=name, label=label, description=desc,
+                source=AssociationEnd(
+                    class_ref=cls_id, class_name=cls_name,
+                    multiplicity=Multiplicity(
+                        lower=src_mult.get("lower", 0),
+                        upper=src_mult.get("upper", 1),
+                    ),
                 ),
                 target=AssociationEnd(
-                    class_ref=m2_class_id_map.get(tgt.get("class_name", ""), ""),
-                    class_name=tgt.get("class_name", ""),
+                    class_ref=cls_id, class_name=cls_name,
                     multiplicity=Multiplicity(
-                        lower=tgt.get("multiplicity", {}).get("lower", 0),
-                        upper=tgt.get("multiplicity", {}).get("upper", -1)),
+                        lower=tgt_mult.get("lower", 0),
+                        upper=tgt_mult.get("upper", -1),
+                    ),
                 ),
-                association_type=a.get("association_type", "association"),
+                association_type=assoc_type,
             ))
+
+        for c_raw in m2_classes_raw:
+            cls_name = c_raw.get("name", "")
+            cls_id = class_id_map.get(cls_name, "")
+            if not cls_id:
+                continue
+
+            # Original LLM-suggested self associations (Phase 2 output)
+            for sa in (c_raw.get("self_associations") or []):
+                src_mult = sa.get("source_multiplicity") or {"lower": 1, "upper": 1}
+                tgt_mult = sa.get("target_multiplicity") or {"lower": 0, "upper": -1}
+                assoc_type = sa.get("association_type", "composition")
+                if assoc_type not in ("association", "aggregation", "composition"):
+                    assoc_type = "composition"
+                _add_assoc(
+                    cls_id, cls_name,
+                    sa.get("name", ""), sa.get("label", ""),
+                    src_mult, tgt_mult, assoc_type, sa.get("description"),
+                )
+
+            # Hierarchy self-associations — parent/children using aggregation (loose),
+            # per user decision ("允许灵活挂载"). Skip if user's suggested self-assocs
+            # already cover parent/children semantics.
+            h = c_raw.get("_hierarchy") or {}
+            if h.get("has_hierarchy"):
+                existing_names = {a.name for a in m2_assocs if a.source.class_ref == cls_id}
+                role = h.get("self_association_role", "contains")
+                parent_name = f"{role}Parent"
+                children_name = f"{role}Children"
+                if parent_name not in existing_names:
+                    _add_assoc(
+                        cls_id, cls_name, parent_name, "上级节点",
+                        {"lower": 0, "upper": 1},  # one or zero parents
+                        {"lower": 0, "upper": 1},
+                        "aggregation",
+                        "层级结构中的直接上级节点 (根节点可为空)",
+                    )
+                if children_name not in existing_names:
+                    _add_assoc(
+                        cls_id, cls_name, children_name, "下级节点",
+                        {"lower": 0, "upper": 1},
+                        {"lower": 0, "upper": -1},
+                        "aggregation",
+                        "层级结构中的直接下级节点 (可跨层挂载)",
+                    )
 
         m2_package = Package(
             id=str(uuid.uuid4()),
-            name=m2_raw.get("name", "M2MetaModelPackage"),
-            label=m2_raw.get("label", "M2元模型"),
-            classes=m2_classes, enumerations=m2_enums, associations=m2_assocs,
+            name="M2MetaModelPackage",
+            label="M2元模型",
+            classes=m2_classes,
+            enumerations=m2_enumerations,
+            associations=m2_assocs,
         )
 
+        # ------- Extend m1_class_mappings with level info for save-m2 backfill -------
+        # Mapping schema (existing): {m1_class_name, m2_parent_name}
+        # Extended:                  + level (str) + m2_level_enum_id (str)
+        m1_mappings_final: list[dict] = []
+        # Lookup: m2_class_name → its level info (from _hierarchy if present)
+        level_info_by_m2: dict[str, dict] = {}
+        for c_raw in m2_classes_raw:
+            h = c_raw.get("_hierarchy") or {}
+            if not h.get("has_hierarchy"):
+                continue
+            cname = c_raw.get("name", "")
+            enum_id = class_level_enum_id.get(cname)
+            if not enum_id:
+                continue
+            # map m1 class → level for this M2
+            per_assign = {
+                a.get("m1_class_name"): a.get("level", "whole_tree")
+                for a in (h.get("m1_level_assignments") or [])
+                if a.get("m1_class_name")
+            }
+            level_info_by_m2[cname] = {
+                "enum_id": enum_id,
+                "levels": h.get("levels", []),
+                "assignments": per_assign,
+            }
+
+        for m in m1_mappings_raw:
+            m1_name = m.get("m1_class_name", "")
+            m2_name = m.get("m2_parent_name", "")
+            out = {"m1_class_name": m1_name, "m2_parent_name": m2_name}
+            info = level_info_by_m2.get(m2_name)
+            if info:
+                lvl = info["assignments"].get(m1_name)
+                if lvl and lvl != "whole_tree":
+                    out["level"] = lvl
+                    out["m2_level_enum_id"] = info["enum_id"]
+                elif lvl == "whole_tree":
+                    out["level"] = "whole_tree"
+            m1_mappings_final.append(out)
+
+        # Emit partial for UI
+        if partial_result_callback:
+            try:
+                await partial_result_callback(m2_package.model_dump())
+            except Exception:
+                pass
+
         if progress_callback:
-            await progress_callback("completed", 1.0, "M2元模型推导完成！")
+            hierarchy_n = sum(
+                1 for c in m2_classes_raw if c.get("_hierarchy", {}).get("has_hierarchy")
+            )
+            await progress_callback("completed", 1.0,
+                f"M2推导完成: {len(m2_classes)} 个基类 ({hierarchy_n} 个带层级), "
+                f"{len(m1_mappings_final)} 条继承映射")
 
         return {
             "m2_package": m2_package.model_dump(),
-            "m1_class_mappings": result.get("m1_class_mappings", []),
-            "confidence_notes": result.get("confidence_notes", []),
+            "m1_class_mappings": m1_mappings_final,
+            "confidence_notes": group_notes + hierarchy_notes + consolidation_notes,
         }
+
+    # ==================================================================
+    # M2 derivation — Phase 1: Business-observation clustering
+    # ==================================================================
+
+    async def _cluster_m1_for_m2(
+        self,
+        m1_package: dict,
+        parallel_callback: Optional[Callable] = None,
+    ) -> list[dict]:
+        """Group M1 classes by business observation dimension.
+
+        The anchor is "what business question would make an analyst look at these
+        together for aggregation/analysis" — NOT name similarity or attribute overlap.
+        Each M1 class ends up in exactly one group. Isolated classes get their own group.
+        """
+        if parallel_callback:
+            await parallel_callback("m2_phase1", "Phase 1: 业务聚类", "running")
+
+        # Build SKELETON context (no attribute details) so 365 classes fit in one call
+        skeleton = []
+        for c in m1_package.get("classes", []) or []:
+            desc = (c.get("description") or "").strip()
+            if len(desc) > 120:
+                desc = desc[:117] + "..."
+            skeleton.append({
+                "name": c.get("name", ""),
+                "label": c.get("label", ""),
+                "description": desc,
+                "attrs": [a.get("name", "") for a in (c.get("attributes") or [])],
+            })
+        skeleton_json = json.dumps(skeleton, ensure_ascii=False)
+
+        prompt = f"""你是 MOF 元建模专家。把下面的 M1 领域类按【业务观测维度】分组, 为后续 M2 元模型抽象做准备。
+
+⚠️ 分组锚点 (核心!):
+不是按"命名相似"或"属性重叠"分组, 而是锚在「业务分析会不会把这些对象放一起查看/汇总/决策」这个问题上。
+
+正面例子:
+- PumpedStorageEquipmentLedger (抽水蓄能设备台账) +
+  ElectrochemicalStorageEquipmentLedger (电化学储能设备台账) +
+  ConventionalHydroEquipmentLedger (常规水电设备台账)
+  → 组 "设备台账"
+  理由: 电站资产分析需要跨类型汇总全部设备台账
+
+- ReviewMeetingMaterial (审查会会务资料) +
+  ReportMeetingMaterial (专题报告会议资料) +
+  ApprovalMeetingMaterial (核准会会务资料)
+  → 组 "会务资料"
+  理由: 会务管理需要跨类型查全部会议产出
+
+反例 (不要这样做):
+❌ 把 "设备台账" 和 "项目计划" 合在一起 (都有编号/名称/状态), 业务上不会把它们一起查
+❌ 把 "水轮机台账" 和 "大坝台账" 分到不同组 (两者都是设备, 跨类型设备分析是同一个业务需求)
+
+硬约束:
+1. 每个 M1 类必须且仅能进一个组
+2. 孤立类独立成组 (1 个成员也合法)
+3. 禁用 Entity/Object/Item/Thing/Element/Data 做组主题名
+4. 组主题名必须反映业务场景 (台账/资料/报告/计划/意见/审批...)
+5. 为了降低组数而强行合并无关业务类, 是不允许的
+6. 不要在本阶段做任何属性抽象, 只负责分组
+
+返回严格的 JSON (不要有其他文字/markdown):
+{{
+  "groups": [
+    {{
+      "theme": "设备台账",
+      "rationale": "跨电站类型汇总设备资产参数",
+      "m1_classes": ["PumpedStorageEquipmentLedger", "ElectrochemicalStorageEquipmentLedger"]
+    }},
+    {{
+      "theme": "会务资料",
+      "rationale": "跨会议类型统一查询和归档",
+      "m1_classes": ["ReviewMeetingMaterial", "ReportMeetingMaterial"]
+    }}
+  ]
+}}
+
+M1 类列表 (共 {len(skeleton)} 个, 仅骨架信息):
+{skeleton_json}"""
+
+        result = await self._ask(prompt, max_tokens=self.DEFAULT_MAX_TOKENS)
+        groups = result.get("groups") or []
+
+        # --- Validate / repair groups ---
+        all_m1_names = {c.get("name", "") for c in m1_package.get("classes", []) or []}
+        assigned: set[str] = set()
+        valid_groups: list[dict] = []
+
+        for g in groups:
+            theme = (g.get("theme") or "").strip()
+            members = [n for n in (g.get("m1_classes") or []) if n in all_m1_names]
+            # Reject groups with forbidden theme names or empty members
+            if not members or not theme:
+                continue
+            if theme.lower() in ("entity", "object", "item", "thing", "element", "data"):
+                # Still accept but append a marker; we'll let orphan handling clean up
+                theme = f"{theme} (原组)"
+            # Dedupe members, skip duplicates across groups (first assignment wins)
+            unique_members = []
+            for n in members:
+                if n in assigned:
+                    continue
+                unique_members.append(n)
+                assigned.add(n)
+            if unique_members:
+                valid_groups.append({
+                    "theme": theme,
+                    "rationale": (g.get("rationale") or "").strip(),
+                    "m1_classes": unique_members,
+                })
+
+        # --- Orphan M1 classes → each becomes its own group ---
+        cls_by_name = {c.get("name", ""): c for c in m1_package.get("classes", []) or []}
+        unassigned = all_m1_names - assigned
+        for cn in sorted(unassigned):
+            c = cls_by_name.get(cn)
+            theme = (c.get("label") if c else "") or cn
+            valid_groups.append({
+                "theme": theme,
+                "rationale": "孤立类, 独立成 M2 基类",
+                "m1_classes": [cn],
+                "_is_orphan": True,
+            })
+
+        if parallel_callback:
+            await parallel_callback("m2_phase1", f"Phase 1: 业务聚类 ({len(valid_groups)} 组)", "done")
+
+        return valid_groups
+
+    # ==================================================================
+    # M2 derivation — Phase 2: Per-group synthesis (parallel)
+    # ==================================================================
+
+    async def _synthesize_m2_groups(
+        self,
+        groups: list[dict],
+        m1_package: dict,
+        progress_callback: Optional[Callable],
+        parallel_callback: Optional[Callable],
+        pause_waiter: Optional[Callable],
+        _check,
+        partial_result_callback: Optional[Callable] = None,
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        """For each group, synthesize exactly 1 M2 class. Run up to 3 groups in parallel.
+
+        Returns: (m2_classes_raw, m1_mappings, notes)
+        """
+        # Index M1 by name for fast lookup
+        m1_by_name = {c.get("name", ""): c for c in m1_package.get("classes", []) or []}
+        m1_assocs = m1_package.get("associations", []) or []
+
+        sem = asyncio.Semaphore(3)
+        lock = asyncio.Lock()
+        all_m2_classes: list[dict] = []
+        all_mappings: list[dict] = []
+        all_notes: list[str] = []
+        completed = 0
+        total = len(groups)
+
+        async def run_one(idx, g):
+            nonlocal completed
+            _check()
+            subtask_id = f"m2_group_{idx}"
+            theme = g.get("theme", f"组{idx+1}")
+            subtask_name = f"组{idx+1}: {theme}"
+
+            if parallel_callback:
+                await parallel_callback(subtask_id, subtask_name, "queued")
+
+            async with sem:
+                if pause_waiter:
+                    await pause_waiter()
+                if parallel_callback:
+                    await parallel_callback(subtask_id, subtask_name, "running")
+
+                try:
+                    m2_cls, mappings, notes = await self._synthesize_one_m2_group(
+                        g, m1_by_name, m1_assocs,
+                    )
+                except Exception as e:
+                    if parallel_callback:
+                        await parallel_callback(subtask_id, subtask_name, "error")
+                    async with lock:
+                        all_notes.append(f"组 '{theme}' 抽象失败: {str(e)[:200]}")
+                        completed += 1
+                        local_done = completed
+                    if progress_callback:
+                        await progress_callback("synthesizing_m2",
+                            0.20 + 0.60 * (local_done / max(total, 1)),
+                            f"Phase 2: {local_done}/{total} 组完成 (部分失败)")
+                    return
+
+                async with lock:
+                    if m2_cls:
+                        all_m2_classes.append(m2_cls)
+                    all_mappings.extend(mappings or [])
+                    all_notes.extend(notes or [])
+                    completed += 1
+                    local_done = completed
+                    local_m2_count = len(all_m2_classes)
+
+                if parallel_callback:
+                    await parallel_callback(subtask_id, subtask_name, "done")
+                if progress_callback:
+                    await progress_callback("synthesizing_m2",
+                        0.20 + 0.60 * (local_done / max(total, 1)),
+                        f"Phase 2: {local_done}/{total} 组完成, 累计 {local_m2_count} 个 M2 基类")
+
+                # Live partial emission — build lightweight package for UI stream
+                if partial_result_callback:
+                    try:
+                        partial_cls = []
+                        for c_raw in all_m2_classes:
+                            attrs = []
+                            for a in (c_raw.get("attributes") or []):
+                                dt = a.get("data_type", "String")
+                                try:
+                                    PrimitiveDataType(dt)
+                                except ValueError:
+                                    dt = "String"
+                                mult = a.get("multiplicity", {}) or {}
+                                attrs.append(Attribute(
+                                    id=str(uuid.uuid4()),
+                                    name=a.get("name", ""),
+                                    label=a.get("label", ""),
+                                    data_type=dt,
+                                    unit=a.get("unit"),
+                                    multiplicity=Multiplicity(
+                                        lower=mult.get("lower", 1),
+                                        upper=mult.get("upper", 1),
+                                    ),
+                                ))
+                            partial_cls.append(MOFClass(
+                                id=str(uuid.uuid4()),
+                                name=c_raw.get("name", ""),
+                                label=c_raw.get("label", ""),
+                                description=c_raw.get("description"),
+                                is_abstract=True,
+                                attributes=attrs,
+                            ))
+                        partial_pkg = Package(
+                            id=str(uuid.uuid4()),
+                            name="M2MetaModelPackage_Partial",
+                            label="M2元模型(合成中)",
+                            classes=partial_cls,
+                            enumerations=[],
+                            associations=[],
+                        )
+                        await partial_result_callback(partial_pkg.model_dump())
+                    except Exception:
+                        pass
+
+        await asyncio.gather(
+            *[run_one(i, g) for i, g in enumerate(groups)],
+            return_exceptions=True,
+        )
+
+        return all_m2_classes, all_mappings, all_notes
+
+    async def _synthesize_one_m2_group(
+        self,
+        group: dict,
+        m1_by_name: dict,
+        m1_assocs: list,
+    ) -> tuple[Optional[dict], list[dict], list[str]]:
+        """Call LLM for ONE business group → 1 M2 class + mappings."""
+        theme = group.get("theme", "")
+        rationale = group.get("rationale", "")
+        member_names = group.get("m1_classes", []) or []
+        is_orphan = bool(group.get("_is_orphan"))
+
+        # Gather full details of group members
+        group_classes = [m1_by_name[n] for n in member_names if n in m1_by_name]
+        if not group_classes:
+            return None, [], [f"组 '{theme}' 无有效成员"]
+
+        # Gather M1 associations touching any member (helps AI infer M2 self-associations)
+        member_set = set(member_names)
+        related_assocs = []
+        for a in m1_assocs:
+            src = (a.get("source") or {}).get("class_name", "")
+            tgt = (a.get("target") or {}).get("class_name", "")
+            if src in member_set and tgt in member_set:
+                related_assocs.append({
+                    "name": a.get("name", ""),
+                    "label": a.get("label", ""),
+                    "source": src,
+                    "target": tgt,
+                    "association_type": a.get("association_type", "association"),
+                    "target_multiplicity": (a.get("target") or {}).get("multiplicity"),
+                })
+
+        # For single-member (orphan) groups, the M2 is basically a copy with bubble-up attributes
+        # but we still let AI name/describe it properly.
+        group_detail = {
+            "classes": [
+                {
+                    "name": c.get("name", ""),
+                    "label": c.get("label", ""),
+                    "description": c.get("description", "") or "",
+                    "attributes": [
+                        {
+                            "name": a.get("name", ""),
+                            "label": a.get("label", ""),
+                            "data_type": a.get("data_type", "String"),
+                            "unit": a.get("unit"),
+                        }
+                        for a in (c.get("attributes") or []) if not a.get("is_inherited")
+                    ],
+                }
+                for c in group_classes
+            ],
+            "intra_group_associations": related_assocs,
+        }
+        group_detail_json = json.dumps(group_detail, ensure_ascii=False)
+
+        orphan_hint = ""
+        if is_orphan:
+            orphan_hint = (
+                "\n注意: 本组只有 1 个 M1 成员 (孤立类)。直接将其核心属性提升为 M2 基类属性; "
+                "M2 的名字应该体现其业务语义, 不是简单照抄 M1 类名。\n"
+            )
+
+        prompt = f"""你是 MOF 元建模专家。为下面这组"{theme}"业务组抽象出恰好 1 个 M2 元类。
+
+⚠️ 硬性规则:
+1. 恰好产出 1 个 M2 元类 (不多不少, 不允许为本组生成多个基类或分层结构)
+2. 只保留业务分析关心的共性 (见下面"抽象思路" 第 1-2 点)
+3. 差异属性必须留在 M1 中, 不要强行提升到 M2
+4. M2 的自关联必须指向自身 (M2 元类), 不能指向 M1 子类 — 这样才能保持混合子类的业务树 (如"引水系统"下可同时挂机电设备和建筑设备)
+5. 元类名必须反映业务主题, 禁用 Entity/Object/Item/Thing/Element/Data 等空泛词
+6. 所有 {len(member_names)} 个组内 M1 类都必须映射为这个 M2 的子类 (parent_class_name = M2.name)
+7. 一个 M2 元类至少应该有 3 个属性 (id + name + 至少 1 个业务属性); 实在找不到共性时, 至少保留 id/name/code/description/status 这类通用骨架
+{orphan_hint}
+抽象思路:
+1. **按语义共性而非字面同名**: M1 类的属性命名可能分歧 (如 ratedVoltage / nominalVoltage / rated_u 其实都是"额定电压"), 识别出语义相同的一簇, 用最清晰的名字放入 M2 (label 用中文标签以保语义)
+2. **阈值放宽**: 通常需要 ≥ 50% 组内 M1 类语义上拥有 (不是字面同名); 对于基础字段 (id/code/name/description/status/createTime/updateTime 等), 只要 ≥ 30% 就可上升
+3. **数据类型泛化**: 同一属性在不同 M1 里如果类型不同 (Float/Integer/String), M2 向更宽类型靠 (Float 覆盖 Integer; String 最宽)
+4. **单位处理**: 同一属性单位不一致 (MW/kW) 选最常用的, 允许 M1 覆盖
+5. **识别 M1 之间的自关联**: 如 "包含子设备/引用/组合" 等模式, 提升为 M2 自关联 (source 和 target 都是 M2 自身, 不是子类)
+6. M2 的 description 必须说明【这组 M1 共同服务的业务观测场景】(如"跨类型汇总设备资产")
+
+⚠️ 如果组内 M1 类属性完全不相交, 说明 Phase 1 聚类有误 —— 这种情况下仍然产出 1 个 M2,
+   description 里注明"属性共性弱, 主要作为业务观测维度的分类契约", attributes 至少给出
+   通用骨架 (id / name / code / description / status)。不要返回空属性列表。
+
+返回严格的 JSON (不要 markdown 或其他文字):
+{{
+  "m2_class": {{
+    "name": "EquipmentLedger",
+    "label": "设备台账",
+    "description": "所有类型电站设备的静态参数台账, 支持跨类型资产分析",
+    "is_abstract": true,
+    "attributes": [
+      {{"name": "ledgerId", "label": "台账编号", "data_type": "String", "multiplicity": {{"lower": 1, "upper": 1}}}}
+    ],
+    "self_associations": [
+      {{"name": "containsSubEquipment", "label": "包含子设备",
+        "source_multiplicity": {{"lower": 1, "upper": 1}},
+        "target_multiplicity": {{"lower": 0, "upper": -1}},
+        "association_type": "composition"}}
+    ]
+  }},
+  "m1_mappings": [
+    {{"m1_class_name": "PumpedStorageEquipmentLedger", "m2_parent_name": "EquipmentLedger"}}
+  ],
+  "notes": []
+}}
+
+本组信息:
+- 主题 (theme): {theme}
+- 分组理由 (rationale): {rationale}
+- M1 成员数量: {len(member_names)}
+
+本组 M1 类详情 (含属性名/类型/单位、组内关联):
+{group_detail_json}"""
+
+        try:
+            result = await self._ask(prompt, max_tokens=self.DEFAULT_MAX_TOKENS)
+        except Exception as e:
+            return None, [], [f"组 '{theme}' LLM 调用失败: {str(e)[:200]}"]
+
+        m2_cls = result.get("m2_class")
+        mappings = result.get("m1_mappings") or []
+        notes = result.get("notes") or []
+
+        # --- Validate / normalize the returned M2 class ---
+        if not m2_cls or not m2_cls.get("name"):
+            return None, [], [f"组 '{theme}' 未返回有效的 M2 类"]
+
+        name = m2_cls["name"].strip()
+        # Reject forbidden names; fall back to theme-based name
+        if name.lower() in ("entity", "object", "item", "thing", "element", "data"):
+            # Convert theme to PascalCase
+            fallback = "".join(w.capitalize() for w in theme.replace("_", " ").split() if w)
+            if not fallback:
+                fallback = f"Group{hash(theme) & 0xFFFF:04X}"
+            m2_cls["name"] = fallback + "MetaClass"
+            notes.append(f"组 '{theme}' 名称被改为 '{m2_cls['name']}' (原名为禁用词)")
+
+        m2_cls.setdefault("label", theme)
+        m2_cls.setdefault("description", rationale or f"{theme}的 M2 元类")
+        m2_cls["is_abstract"] = True
+
+        # Safety net: if AI returned empty/missing attributes list, inject a universal
+        # skeleton so the M2 class isn't completely hollow. The prompt asks for this,
+        # but some models still return [] for heterogeneous clusters.
+        attrs = m2_cls.get("attributes") or []
+        if not attrs:
+            attrs = [
+                {"name": "id", "label": "编号",
+                 "data_type": "String", "multiplicity": {"lower": 1, "upper": 1},
+                 "description": "唯一标识 (自动兜底属性 — 原聚类共性较弱)"},
+                {"name": "name", "label": "名称",
+                 "data_type": "String", "multiplicity": {"lower": 1, "upper": 1},
+                 "description": "业务名称"},
+                {"name": "description", "label": "描述",
+                 "data_type": "String", "multiplicity": {"lower": 0, "upper": 1}},
+            ]
+            m2_cls["attributes"] = attrs
+            notes.append(
+                f"组 '{theme}': AI 返回空属性列表, 已注入通用骨架 (id/name/description)"
+                " — 建议人工审查该聚类是否过于松散"
+            )
+
+        # Ensure all group members are mapped (AI sometimes forgets)
+        mapped_names = {m.get("m1_class_name") for m in mappings if m.get("m1_class_name")}
+        for n in member_names:
+            if n not in mapped_names:
+                mappings.append({
+                    "m1_class_name": n,
+                    "m2_parent_name": m2_cls["name"],
+                })
+
+        # Normalize mapping parent names: any mapping whose parent is missing, empty,
+        # or points to a name *different* from the single M2 class we produced → force
+        # it back to this class's name (AI sometimes hallucinates parent names).
+        for m in mappings:
+            p = m.get("m2_parent_name")
+            if not p or p != m2_cls["name"]:
+                m["m2_parent_name"] = m2_cls["name"]
+
+        return m2_cls, mappings, notes
+
+    # ==================================================================
+    # M2 derivation — Phase 2.5: Hierarchy detection per base class
+    # ==================================================================
+    # For each M2 base class, determine if its business theme has a natural
+    # multi-level containment hierarchy (like 设施→功能分组→设备→部件).
+    # If yes: produces ordered level names + per-M1-class level assignment.
+    # Outputs are consumed by the final materialization (Part 3 of derive_m2)
+    # to auto-generate a level Enum, a level attribute on the M2 base, and
+    # a self-referential parent/children association.
+
+    async def _detect_hierarchy_for_m2_classes(
+        self,
+        m2_classes_raw: list[dict],
+        m1_mappings: list[dict],
+        m1_package: dict,
+        progress_callback: Optional[Callable],
+        parallel_callback: Optional[Callable],
+        pause_waiter: Optional[Callable],
+        _check,
+    ) -> tuple[list[dict], list[str]]:
+        """Run hierarchy detection for each M2 base class in parallel.
+        Mutates m2_classes_raw in place, adding a `_hierarchy` dict to classes
+        whose theme has a hierarchy. Returns (classes, notes).
+        """
+        notes: list[str] = []
+        if not m2_classes_raw:
+            return m2_classes_raw, notes
+
+        # Index: m2_class_name -> list of member M1 class dicts
+        m1_by_name = {c.get("name", ""): c for c in m1_package.get("classes", []) or []}
+        members_by_m2: dict[str, list[dict]] = {}
+        for m in m1_mappings:
+            parent = m.get("m2_parent_name", "")
+            child_name = m.get("m1_class_name", "")
+            if not parent or not child_name:
+                continue
+            members_by_m2.setdefault(parent, []).append(
+                m1_by_name.get(child_name, {"name": child_name})
+            )
+
+        sem = asyncio.Semaphore(3)
+        lock = asyncio.Lock()
+        completed = 0
+        total = len(m2_classes_raw)
+
+        async def run_one(idx, m2_cls):
+            nonlocal completed
+            _check()
+            cls_name = m2_cls.get("name", "")
+            cls_label = m2_cls.get("label", cls_name)
+            subtask_id = f"m2_hierarchy_{idx}"
+            subtask_name = f"层级探测 {idx+1}/{total}: {cls_label}"
+
+            if parallel_callback:
+                await parallel_callback(subtask_id, subtask_name, "queued")
+
+            async with sem:
+                if pause_waiter:
+                    await pause_waiter()
+                if parallel_callback:
+                    await parallel_callback(subtask_id, subtask_name, "running")
+
+                members = members_by_m2.get(cls_name, [])
+                try:
+                    hierarchy = await self._detect_hierarchy_for_one(m2_cls, members)
+                except Exception as e:
+                    if parallel_callback:
+                        await parallel_callback(subtask_id, subtask_name, "error")
+                    async with lock:
+                        notes.append(f"'{cls_label}' 层级探测失败: {str(e)[:200]}")
+                        completed += 1
+                        local_done = completed
+                    if progress_callback:
+                        await progress_callback("detecting_hierarchy",
+                            0.70 + 0.10 * (local_done / max(total, 1)),
+                            f"Phase 2.5: {local_done}/{total} (部分失败)")
+                    return
+
+                async with lock:
+                    if hierarchy and hierarchy.get("has_hierarchy"):
+                        m2_cls["_hierarchy"] = hierarchy
+                    completed += 1
+                    local_done = completed
+                    discovered = sum(
+                        1 for c in m2_classes_raw
+                        if c.get("_hierarchy", {}).get("has_hierarchy")
+                    )
+
+                if parallel_callback:
+                    msg = (
+                        f"层级 [{len(hierarchy.get('levels', []))} 层]"
+                        if hierarchy and hierarchy.get("has_hierarchy")
+                        else "无层级"
+                    )
+                    await parallel_callback(subtask_id, f"{subtask_name} — {msg}", "done")
+                if progress_callback:
+                    await progress_callback("detecting_hierarchy",
+                        0.70 + 0.10 * (local_done / max(total, 1)),
+                        f"Phase 2.5: {local_done}/{total}, 发现 {discovered} 个带层级主题")
+
+        await asyncio.gather(
+            *[run_one(i, c) for i, c in enumerate(m2_classes_raw)],
+            return_exceptions=True,
+        )
+
+        return m2_classes_raw, notes
+
+    async def _detect_hierarchy_for_one(
+        self,
+        m2_cls: dict,
+        member_m1_classes: list[dict],
+    ) -> dict:
+        """Single LLM call: does this M2 base class have a containment hierarchy?
+        Returns {has_hierarchy, levels, m1_level_assignments, self_association_role}.
+        """
+        cls_name = m2_cls.get("name", "")
+        cls_label = m2_cls.get("label", cls_name)
+        cls_desc = m2_cls.get("description", "") or ""
+
+        # Build compact member info (including hierarchy_hints from M1 extraction)
+        member_info = []
+        hint_samples = []
+        for c in member_m1_classes:
+            cname = c.get("name", "")
+            info = {
+                "name": cname,
+                "label": c.get("label", "") or "",
+                "description": (c.get("description") or "")[:80],
+                "attrs": [a.get("name", "") for a in (c.get("attributes") or [])][:12],
+            }
+            h = c.get("hierarchy_hint")
+            if h and isinstance(h, dict):
+                if h.get("level_hint") or h.get("theme_hint"):
+                    hint_samples.append({
+                        "m1_class": cname,
+                        "theme": h.get("theme_hint", ""),
+                        "level": h.get("level_hint", ""),
+                        "parent": h.get("parent_name_hint", ""),
+                    })
+            member_info.append(info)
+
+        members_json = json.dumps(member_info, ensure_ascii=False)
+        hints_json = json.dumps(hint_samples, ensure_ascii=False) if hint_samples else "[]"
+
+        prompt = f"""你是 MOF 元建模专家。为 M2 基类 "{cls_label}" ({cls_name}) 探测是否存在多层容器结构。
+
+业务背景:
+- 类名: {cls_name}
+- 标签: {cls_label}
+- 描述: {cls_desc[:200]}
+- 成员数: {len(member_m1_classes)} 个 M1 类
+
+⚠️ 判定规则 (核心):
+1. 层级必须是【纵向结构角色 / 包含关系】, 不是【横向专业类型】
+   ✅ 好: [设施, 功能分组, 设备, 部件]  ← 上层包含下层
+   ✅ 好: [工程项目, 任务, 子任务]      ← 上层分解出下层
+   ✅ 好: [单位, 部门, 岗位]            ← 上层管理下层
+   ❌ 差: [机电, 水工, 闸门]           ← 这是专业分类, 不是层级
+   ❌ 差: [抽水蓄能, 电化学]           ← 这是电站类型, 不是层级
+
+2. 判定是否有层级, 需要看:
+   - M1 成员名字里是否出现典型的层级语义 (电站/机组/部件 这类)
+   - M1 属性里是否有 "上级系统""父节点""所属..." 等容器线索
+   - 文档领域常识 (设备资产管理确有 设施→设备→部件 的分层)
+
+3. 层级数量: 一般 2-5 层合理, 超过 6 层往往是过度细分
+
+4. 如果这个主题没有明显层级嵌套 (如 会务资料、专家意见), 直接返回 has_hierarchy=false
+
+5. 每个 M1 类指定一个 level, 或标记 "whole_tree" (该类模板本身覆盖多层)
+6. 同一个 level 可以分配多个 M1 成员 (如"设备"层有机电设备+建筑设备+闸门设备)
+
+返回严格 JSON (无 markdown):
+{{
+  "has_hierarchy": true,
+  "levels": ["设施", "功能分组", "设备", "部件"],
+  "m1_level_assignments": [
+    {{"m1_class_name": "PumpedStorageStation", "level": "设施"}},
+    {{"m1_class_name": "GeneratorUnitSystem", "level": "功能分组"}},
+    {{"m1_class_name": "HydroTurbine", "level": "设备"}},
+    {{"m1_class_name": "TurbineBlade", "level": "部件"}},
+    {{"m1_class_name": "PumpedStorageElectricalLedger", "level": "whole_tree"}}
+  ],
+  "self_association_role": "contains",
+  "rationale": "该主题在业务上有 电站→系统→设备→部件 的标准分层"
+}}
+
+若无层级, 返回:
+{{"has_hierarchy": false, "rationale": "仅为业务资料, 无容器层级"}}
+
+该 M2 基类的 M1 成员 ({len(member_info)} 个):
+{members_json}
+
+M1 提取时的层级线索 (仅供参考, 可能不准):
+{hints_json}"""
+
+        result = await self._ask(prompt, max_tokens=self.DEFAULT_MAX_TOKENS)
+
+        # ----- Validate / sanitize -----
+        if not isinstance(result, dict):
+            return {"has_hierarchy": False}
+
+        has_h = bool(result.get("has_hierarchy"))
+        if not has_h:
+            return {"has_hierarchy": False, "rationale": result.get("rationale", "")}
+
+        levels = result.get("levels") or []
+        if not isinstance(levels, list):
+            levels = []
+        # Clean level names: strings, stripped, unique preserving order
+        cleaned_levels: list[str] = []
+        seen = set()
+        for L in levels:
+            if not isinstance(L, str):
+                continue
+            Lc = L.strip()
+            if not Lc or Lc in seen:
+                continue
+            # Reject forbidden generic names
+            if Lc.lower() in ("entity", "object", "item", "thing", "element", "data"):
+                continue
+            cleaned_levels.append(Lc)
+            seen.add(Lc)
+
+        # Bound: 2-8 levels is sane
+        if len(cleaned_levels) < 2:
+            return {
+                "has_hierarchy": False,
+                "rationale": f"探测到的层级不足 ({len(cleaned_levels)}), 忽略",
+            }
+        if len(cleaned_levels) > 8:
+            cleaned_levels = cleaned_levels[:8]
+
+        # Clean mappings
+        member_names = {c.get("name", "") for c in member_m1_classes}
+        raw_assignments = result.get("m1_level_assignments") or []
+        clean_assignments: list[dict] = []
+        whole_tree_names: set[str] = set()
+        level_assigned: dict[str, str] = {}
+        for a in raw_assignments:
+            if not isinstance(a, dict):
+                continue
+            n = (a.get("m1_class_name") or "").strip()
+            L = (a.get("level") or "").strip()
+            if n not in member_names or not L:
+                continue
+            if L == "whole_tree":
+                whole_tree_names.add(n)
+                clean_assignments.append({"m1_class_name": n, "level": "whole_tree"})
+            elif L in seen:
+                level_assigned[n] = L
+                clean_assignments.append({"m1_class_name": n, "level": L})
+
+        # Any M1 member not assigned falls back to "whole_tree" (safe default)
+        for n in member_names:
+            if n not in level_assigned and n not in whole_tree_names:
+                clean_assignments.append({"m1_class_name": n, "level": "whole_tree"})
+
+        role = (result.get("self_association_role") or "").strip() or "contains"
+        # Sanitize role to identifier-safe
+        role = "".join(ch for ch in role if ch.isalnum()) or "contains"
+
+        return {
+            "has_hierarchy": True,
+            "levels": cleaned_levels,
+            "m1_level_assignments": clean_assignments,
+            "self_association_role": role,
+            "rationale": result.get("rationale", ""),
+        }
+
+    # ==================================================================
+    # M2 derivation — Phase 3: Cross-group consolidation
+    # ==================================================================
+
+    async def _consolidate_m2(
+        self,
+        m2_classes: list[dict],
+        m1_mappings: list[dict],
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        """Check if any M2 classes are semantic duplicates and merge them. Flat output only."""
+        notes: list[str] = []
+
+        if len(m2_classes) < 2:
+            return m2_classes, m1_mappings, notes
+
+        skeleton = []
+        for c in m2_classes:
+            desc = (c.get("description") or "").strip()
+            if len(desc) > 180:
+                desc = desc[:177] + "..."
+            skeleton.append({
+                "name": c.get("name", ""),
+                "label": c.get("label", ""),
+                "description": desc,
+                "attrs": [a.get("name", "") for a in (c.get("attributes") or [])],
+            })
+        skeleton_json = json.dumps(skeleton, ensure_ascii=False)
+
+        prompt = f"""你是 MOF 元建模专家。下面是 {len(m2_classes)} 个已初步合成的 M2 元类。检查是否有【业务含义实质相同、只是命名略异】的, 应该合并。
+
+⚠️ 合并原则:
+1. 仅合并业务含义实质相同的 (如 "会议材料" ≈ "会务资料", "设计意见" ≈ "专家意见")
+2. 绝对不做多级抽象 — 合并后仍是扁平单层
+3. 业务场景不同的元类必须保持分离 (如 "会务资料" ≠ "审批文档" ≠ "设备台账")
+4. 每个合并建议必须有具体业务理由
+5. 如果所有 M2 元类都没有明显重复, 返回空 merges 列表 — 这是合法结果
+6. 不允许跨大类合并 (例如"设备台账"和"专题报告"不能合并成"资产相关文档")
+
+返回严格的 JSON (不要 markdown):
+{{
+  "merges": [
+    {{
+      "target_name": "MeetingMaterial",
+      "target_label": "会务资料",
+      "sources": ["ConferenceDoc", "MeetingDocument"],
+      "rationale": "两者都指会议产生的材料, 业务上应统一查询"
+    }}
+  ]
+}}
+
+若无可合并, 返回: {{"merges": []}}
+
+现有 M2 元类 (共 {len(m2_classes)} 个):
+{skeleton_json}"""
+
+        try:
+            result = await self._ask(prompt, max_tokens=self.DEFAULT_MAX_TOKENS)
+        except Exception as e:
+            notes.append(f"Phase 3 合并检查失败 (保持原状): {str(e)[:200]}")
+            return m2_classes, m1_mappings, notes
+
+        merges = result.get("merges") or []
+        if not merges:
+            return m2_classes, m1_mappings, notes
+
+        # ---- Build COMPLETE rename map (every source → target, including cases where
+        # the target name is brand-new / not already one of the M2 classes).
+        # IMPORTANT: do NOT pop any entries — m1_mappings remap needs all renames visible.
+        rename_map: dict[str, str] = {}                # source_name → final target_name
+        target_meta: dict[str, dict] = {}              # target_name → {label, rationale}
+        existing_names = {c.get("name", "") for c in m2_classes}
+
+        for m in merges:
+            target_name = (m.get("target_name") or "").strip()
+            sources = [s for s in (m.get("sources") or []) if s]
+            if not target_name or not sources:
+                continue
+            target_meta[target_name] = {
+                "label": m.get("target_label") or target_name,
+                "rationale": m.get("rationale") or "",
+            }
+            for src in sources:
+                if src != target_name:
+                    rename_map[src] = target_name
+
+        # ---- Group original classes by their FINAL target name ----
+        final_groups: dict[str, list[dict]] = {}
+        for c in m2_classes:
+            orig_name = c.get("name", "")
+            final_name = rename_map.get(orig_name, orig_name)
+            final_groups.setdefault(final_name, []).append(c)
+
+        # ---- Build consolidated class list, preserving input order via first appearance ----
+        new_classes: list[dict] = []
+        seen_final: set[str] = set()
+
+        for c in m2_classes:
+            orig_name = c.get("name", "")
+            final_name = rename_map.get(orig_name, orig_name)
+            if final_name in seen_final:
+                continue
+            seen_final.add(final_name)
+
+            group = final_groups[final_name]
+
+            # Case 1: single untouched class (no rename, no merge) — pass through
+            if len(group) == 1 and orig_name == final_name and final_name not in target_meta:
+                new_classes.append(c)
+                continue
+
+            # Case 2: merge/rename — use group[0] as base, union attrs+self_associations from rest
+            base = dict(group[0])  # shallow copy; we'll replace lists with fresh copies
+            base["name"] = final_name
+            if final_name in target_meta:
+                base["label"] = target_meta[final_name]["label"]
+            base["attributes"] = list(group[0].get("attributes") or [])
+            base["self_associations"] = list(group[0].get("self_associations") or [])
+
+            existing_attr_names = {a.get("name") for a in base["attributes"]}
+            existing_assoc_names = {sa.get("name") for sa in base["self_associations"]}
+
+            for other in group[1:]:
+                for a in (other.get("attributes") or []):
+                    if a.get("name") not in existing_attr_names:
+                        base["attributes"].append(a)
+                        existing_attr_names.add(a.get("name"))
+                for sa in (other.get("self_associations") or []):
+                    if sa.get("name") not in existing_assoc_names:
+                        base["self_associations"].append(sa)
+                        existing_assoc_names.add(sa.get("name"))
+
+            if len(group) > 1:
+                src_list = [x.get("name", "") for x in group]
+                rationale = target_meta.get(final_name, {}).get("rationale", "")
+                notes.append(
+                    f"合并 {src_list} → {final_name}"
+                    + (f" ({rationale[:80]})" if rationale else "")
+                )
+            elif orig_name != final_name:
+                notes.append(f"重命名 {orig_name} → {final_name}")
+
+            new_classes.append(base)
+
+        # ---- Remap m1_mappings using the COMPLETE rename_map ----
+        # (This is the critical fix: previously `rename_map.pop(base_src, None)`
+        # removed the renamed base's entry, orphaning any m1_mapping still pointing
+        # to its original name.)
+        remapped_count = 0
+        for m in m1_mappings:
+            parent = m.get("m2_parent_name", "")
+            if parent in rename_map:
+                m["m2_parent_name"] = rename_map[parent]
+                remapped_count += 1
+        if remapped_count:
+            notes.append(f"修正了 {remapped_count} 条 M1→M2 映射的父类引用")
+
+        return new_classes, m1_mappings, notes
 
     # ==================================================================
     # Refinement
@@ -758,11 +2074,122 @@ User's request: "{user_message}"
 Apply the user's requested changes. Return the complete updated model as valid JSON with the same structure.
 Only modify what the user asked for. Keep everything else unchanged."""
 
-        return await self._ask(prompt, max_tokens=8192)
+        return await self._ask(prompt, max_tokens=16384)
 
     # ==================================================================
     # Internal prompt methods — Pipeline A
     # ==================================================================
+
+    async def _extract_entities_with_attrs_from_docs(
+        self,
+        doc_text: str,
+        known_context: dict = None,
+    ) -> dict:
+        """Combined single-pass extraction: classes (with attributes) + enumerations.
+
+        Replaces the old two-phase (discover classes → then attributes) approach,
+        which required N_classes × N_doc_batches LLM calls. This does it in one
+        call per doc batch — reducing total calls by ~100×.
+
+        `known_context` schema (from previously-processed batches):
+            {
+              class_name: {
+                "label": "中文名",
+                "attrs": ["already", "known", "attribute", "names"]
+              }, ...
+            }
+        Returns the same shape as the LLM response:
+            {
+              "classes": [{"name", "label", "description",
+                           "attributes": [{"name","label","data_type","unit","enum_name","multiplicity"}]}],
+              "enumerations": [{"name","label","literals":[{"name","label"}]}],
+              "confidence_notes": [...]
+            }
+        """
+        context_hint = ""
+        if known_context:
+            lines = []
+            for cname, info in list(known_context.items())[:80]:  # cap context size
+                attrs = info.get("attrs", []) if isinstance(info, dict) else []
+                label = info.get("label", "") if isinstance(info, dict) else ""
+                attr_summary = ", ".join(attrs[:12]) + ("..." if len(attrs) > 12 else "")
+                lines.append(f"  - {cname}" + (f" ({label})" if label else "") +
+                             (f": has attrs [{attr_summary}]" if attr_summary else ""))
+            more = "" if len(known_context) <= 80 else f"\n  (+{len(known_context)-80} more classes not shown)"
+            context_hint = f"""
+IMPORTANT: The following classes (and some of their attributes) were ALREADY identified
+from previous document batches. For THIS document batch:
+- If you find one of these EXISTING classes here, include it in your response but ONLY
+  with attributes NOT already listed below. We'll merge automatically.
+- If you find a NEW class not in this list, include it FULLY with all its attributes.
+- Use EXACTLY the same class names as shown — don't create synonyms.
+
+Already found:
+{chr(10).join(lines)}{more}
+"""
+
+        prompt = f"""Analyze these business documents and extract:
+1. CLASSES (entity types) WITH their attributes — in ONE pass.
+2. ENUMERATIONS (closed value sets such as status, type, mode).
+
+This is M1-level extraction — identify CONCRETE, DOMAIN-SPECIFIC types exactly as
+the documents describe. Do NOT generalize.
+{context_hint}
+For each Class:
+- "name": English PascalCase, e.g. "PumpedStorageUnit"
+- "label": Chinese display name
+- "description": one-sentence Chinese description
+- "attributes": list of this class's attributes found in this doc:
+  - "name": English camelCase
+  - "label": Chinese display name
+  - "data_type": one of String | Integer | Float | Boolean | Date | Enum
+  - "unit": measurement unit if applicable (MW, m, rpm, kV, A, mm, MPa, etc.)
+  - "enum_name": if data_type=Enum, the name of the enumeration it refers to
+  - "multiplicity": {{"lower": N, "upper": M}}, use -1 for unlimited (default {{1, 1}})
+  - "description": brief Chinese description (optional)
+- "hierarchy_hint" (OPTIONAL, only include if the document CLEARLY suggests this):
+  - "theme_hint": the broader business family this class belongs to (e.g. 设备台账, 项目计划, 组织机构, 文档资料)
+  - "level_hint": this class's role in a containment hierarchy
+    (e.g. 设施, 功能分组, 设备, 部件  /  工程项目, 任务, 子任务  /  单位, 部门, 岗位)
+  - "parent_name_hint": if the document explicitly says this class belongs under another class
+  If uncertain, OMIT this field entirely — don't guess.
+
+For each Enumeration:
+- "name": English PascalCase
+- "label": Chinese name
+- "literals": array of {{"name": "english", "label": "中文"}}
+
+Return valid JSON ONLY (no markdown, no commentary):
+{{
+  "classes": [
+    {{
+      "name": "PumpedStorageUnit",
+      "label": "抽水蓄能机组",
+      "description": "可发电也可抽水蓄能的水电机组",
+      "attributes": [
+        {{"name": "ratedCapacity", "label": "额定容量", "data_type": "Float", "unit": "MW", "multiplicity": {{"lower": 1, "upper": 1}}}},
+        {{"name": "operatingMode", "label": "运行模式", "data_type": "Enum", "enum_name": "OperatingMode", "multiplicity": {{"lower": 1, "upper": 1}}}}
+      ],
+      "hierarchy_hint": {{"theme_hint": "设备台账", "level_hint": "设备"}}
+    }}
+  ],
+  "enumerations": [
+    {{"name": "OperatingMode", "label": "运行模式", "literals": [
+      {{"name": "generation", "label": "发电"}},
+      {{"name": "pumping", "label": "抽水"}}
+    ]}}
+  ],
+  "confidence_notes": ["list any uncertain extractions"]
+}}
+
+DOCUMENTS:
+---
+{doc_text}
+---"""
+
+        # Combined output can be larger than pure discovery output. Use a generous
+        # cap; the model will stop early when done.
+        return await self._ask(prompt, max_tokens=self.DEFAULT_MAX_TOKENS)
 
     async def _discover_entities_from_docs(self, doc_text: str, known_context: list[str] = None) -> dict:
         context_hint = ""
@@ -808,7 +2235,7 @@ DOCUMENTS:
 {doc_text}
 ---"""
 
-        return await self._ask(prompt, max_tokens=4096)
+        return await self._ask(prompt, max_tokens=16384)
 
     async def _extract_attrs_from_docs(
         self, doc_text: str, classes_batch: list[dict], enum_name_to_id: dict,
@@ -868,7 +2295,7 @@ DOCUMENTS:
 {doc_text}
 ---"""
 
-        result = await self._ask(prompt, max_tokens=8192)
+        result = await self._ask(prompt, max_tokens=16384)
         return result.get("classes", [])
 
     async def _extract_assocs_from_docs(self, doc_text: str, classes: list[MOFClass],
@@ -912,4 +2339,4 @@ DOCUMENTS:
 {doc_text}
 ---"""
 
-        return await self._ask(prompt, max_tokens=4096)
+        return await self._ask(prompt, max_tokens=16384)

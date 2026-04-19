@@ -17,6 +17,7 @@ class ExtractionRequest(BaseModel):
     m2_template_id: Optional[str] = None  # Not required for docs→M1 flow
     model_name: Optional[str] = None
     model_label: Optional[str] = None
+    auto_start: bool = False  # If False, task waits until /start/{task_id} is called
 
 
 class ExtractionProgress(BaseModel):

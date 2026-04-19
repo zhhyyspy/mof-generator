@@ -5,6 +5,110 @@
 import { API } from './api.js';
 
 // ============================================================
+// Unified Dialog System (replaces native alert/confirm/prompt)
+// ============================================================
+
+/**
+ * Show a themed dialog. Returns a Promise.
+ *   opts = {
+ *     type: 'confirm' | 'alert' | 'prompt' | 'warning' | 'danger' | 'info' | 'success' | 'error',
+ *     title: '...',
+ *     message: '...',
+ *     okText: '确定', cancelText: '取消',
+ *     defaultValue: '' (for prompt),
+ *     danger: false (style OK button as danger)
+ *   }
+ *   Resolves to:
+ *     - confirm: true/false
+ *     - alert: undefined
+ *     - prompt: string (OK) or null (cancel)
+ */
+function showDialog(opts) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('app-dialog');
+    const card = overlay.querySelector('.app-dialog-card');
+    const icon = document.getElementById('app-dialog-icon');
+    const title = document.getElementById('app-dialog-title');
+    const msg = document.getElementById('app-dialog-message');
+    const inputWrap = document.getElementById('app-dialog-input-wrap');
+    const input = document.getElementById('app-dialog-input');
+    const okBtn = document.getElementById('app-dialog-ok');
+    const cancelBtn = document.getElementById('app-dialog-cancel');
+
+    const type = opts.type || 'confirm';
+    const iconMap = {
+      confirm: '❓', alert: '💡', info: '💡',
+      warning: '⚠️', danger: '⚠️', error: '❌',
+      success: '✓', prompt: '✏️',
+    };
+    icon.textContent = iconMap[type] || '💡';
+    icon.className = `app-dialog-icon ${type}`;
+    title.textContent = opts.title || (type === 'alert' ? '提示' : type === 'prompt' ? '请输入' : '确认');
+    msg.textContent = opts.message || '';
+
+    // Reset classes
+    card.classList.toggle('alert-only', type === 'alert' || type === 'error' || type === 'success');
+    okBtn.classList.toggle('danger', !!opts.danger);
+
+    // Prompt input
+    if (type === 'prompt') {
+      inputWrap.style.display = '';
+      input.value = opts.defaultValue || '';
+      input.placeholder = opts.placeholder || '';
+      setTimeout(() => input.focus(), 50);
+    } else {
+      inputWrap.style.display = 'none';
+    }
+
+    okBtn.textContent = opts.okText || '确定';
+    cancelBtn.textContent = opts.cancelText || '取消';
+
+    // Event handlers
+    const cleanup = () => {
+      overlay.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      document.removeEventListener('keydown', onKey);
+    };
+    const onOk = () => {
+      const result = type === 'prompt' ? input.value : (type === 'alert' || type === 'error' || type === 'success' ? undefined : true);
+      cleanup();
+      resolve(result);
+    };
+    const onCancel = () => {
+      cleanup();
+      resolve(type === 'prompt' ? null : false);
+    };
+    const onKey = e => {
+      if (e.key === 'Enter' && (type === 'prompt' || document.activeElement !== input)) {
+        e.preventDefault();
+        onOk();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    document.addEventListener('keydown', onKey);
+
+    overlay.classList.remove('hidden');
+  });
+}
+
+// Shorthand wrappers matching native signatures
+async function appAlert(message, title) {
+  return showDialog({ type: 'alert', message, title: title || '提示' });
+}
+async function appConfirm(message, title) {
+  return showDialog({ type: 'confirm', message, title: title || '确认' });
+}
+async function appPrompt(message, defaultValue, title) {
+  return showDialog({ type: 'prompt', message, title: title || '请输入', defaultValue });
+}
+
+// ============================================================
 // State
 // ============================================================
 const state = {
@@ -27,7 +131,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupEditorActions();
   setupReviewPanel();
   setupProgressMinimize();
+  setupEntityDetailPage();
   setupLLMSettings();
+  setupM2ScopeModal();
+  EntityEdit.setup();
   await loadM3();
   await loadDocuments();
   await loadExistingModels();
@@ -128,7 +235,7 @@ async function uploadFiles(fileList) {
     state.documents.push(...res.documents);
     renderDocList();
     updateToolbarState();
-  } catch (e) { alert('上传失败: ' + e.message); }
+  } catch (e) { showDialog({ type: 'error', title: '上传失败', message: e.message }); }
 }
 
 async function loadDocuments() {
@@ -169,8 +276,35 @@ function renderDocList() {
 // ============================================================
 // Toolbar
 // ============================================================
+async function deleteCurrentModel() {
+  if (!state.m1ModelId) return;
+  const model = state.m1Model;
+  const label = model?.label || state.m1ModelId;
+  const hasM2 = state.m2ModelId && state.allModels?.some(m => m.id === state.m2ModelId);
+  const msg = hasM2
+    ? `确定删除 M1 模型 "${label}" 吗？\n\n关联的 M2 元模型 (${state.m2ModelId}) 也会一并删除，且无法恢复。`
+    : `确定删除 M1 模型 "${label}" 吗？\n\n此操作无法恢复。`;
+  const ok = await showDialog({
+    type: 'danger', title: '删除模型', message: msg,
+    okText: '确定删除', cancelText: '取消', danger: true,
+  });
+  if (!ok) return;
+  try {
+    await API.deleteModel(state.m1ModelId);
+    if (hasM2) { try { await API.deleteModel(state.m2ModelId); } catch {} }
+    showToast(`✓ 已删除: ${label}`);
+    state.m1ModelId = null; state.m1Model = null;
+    state.m2ModelId = null; state.m2Model = null;
+    await loadExistingModels();
+    renderTree('m1'); renderTree('m2');
+  } catch (e) {
+    showToast('删除失败: ' + e.message, 'error');
+  }
+}
+
 function setupToolbar() {
   document.getElementById('btn-extract-m1').addEventListener('click', extractM1);
+  document.getElementById('btn-model-delete').addEventListener('click', deleteCurrentModel);
   document.getElementById('btn-derive-m2').addEventListener('click', deriveM2);
   document.getElementById('model-picker').addEventListener('change', async e => {
     const id = e.target.value;
@@ -196,9 +330,32 @@ function setupToolbar() {
   document.getElementById('btn-export-cancel').addEventListener('click', () => {
     document.getElementById('export-modal').classList.add('hidden');
   });
+  // Export mode tab switching (raw vs review package)
+  document.querySelectorAll('.export-mode-tab').forEach(tab => {
+    tab.addEventListener('click', () => switchExportMode(tab.dataset.mode));
+  });
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
+  document.getElementById('btn-validation-x').addEventListener('click', () => {
+    document.getElementById('validation-modal').classList.add('hidden');
+  });
+  document.getElementById('validation-mode').addEventListener('change', e => {
+    const pickers = document.getElementById('validation-llm-pickers');
+    const content = document.getElementById('validation-content');
+    if (e.target.value === 'llm') {
+      pickers.classList.remove('hidden');
+      content.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim)">选择M1和M2后点击"开始AI校验"</div>';
+    } else {
+      pickers.classList.add('hidden');
+      runLocalValidate();
+    }
+  });
+  document.getElementById('btn-run-llm-validate').addEventListener('click', runLLMValidate);
+  document.getElementById('btn-version-close').addEventListener('click', () => {
+    document.getElementById('version-modal').classList.add('hidden');
+  });
+  document.getElementById('btn-version-create').addEventListener('click', doCreateVersionSnapshot);
 }
 
 function updateToolbarState() {
@@ -206,12 +363,16 @@ function updateToolbarState() {
   const hasM1 = state.m1ModelId !== null;
   const hasM2 = state.m2ModelId !== null;
   const hasActive = activeModelId() !== null;
+  const hasAnyModel = hasM1 || hasM2;
 
   document.getElementById('btn-extract-m1').disabled = !hasDocs;
   document.getElementById('btn-derive-m2').disabled = !hasM1;
   document.getElementById('btn-validate').disabled = !hasActive;
-  document.getElementById('btn-export').disabled = !hasActive;
+  // 导出按钮不再依赖当前激活 tab — 审查包是跨层导出, 原始数据也可以在 modal 里选择层
+  document.getElementById('btn-export').disabled = !hasAnyModel;
   document.getElementById('btn-version').disabled = !hasActive;
+  const delBtn = document.getElementById('btn-model-delete');
+  if (delBtn) delBtn.disabled = !hasM1;
   document.getElementById('btn-add-class').disabled = !hasActive;
   document.getElementById('btn-add-enum').disabled = !hasActive;
   document.getElementById('btn-add-assoc').disabled = !hasActive;
@@ -245,47 +406,56 @@ async function extractM1() {
 
   const docNames = state.documents.map(d => d.filename).join('、');
   showProgress(
-    'AI正在从文档提取M1模型',
-    `正在分析 ${state.documents.length} 份文档，基于MOF M3规范提取领域实体`,
+    'AI提取M1模型',
+    `准备分析 ${state.documents.length} 份文档 · 点击 [开始] 启动`,
     M1_STEPS
   );
   addLog('info', `输入文档: ${docNames}`);
   addLog('info', `共 ${state.documents.reduce((a, d) => a + d.char_count, 0).toLocaleString()} 字符`);
 
   try {
-    const { task_id } = await API.startM1Extraction(docIds);
+    // Create task in 'ready' state (auto_start=false) — wait for user click
+    const { task_id } = await API.startM1Extraction(docIds);  // auto_start=false by default in backend
     _currentTaskId = task_id;
-    await pollTask(task_id, result => {
+    _reviewTaskId = task_id;
+    updateProgressControlButtons('ready');
+    await pollTask(task_id, async result => {
       _currentTaskId = null;
       addLog('success', `提取完成: ${result.classes_found} 类, ${result.attributes_found} 属性, ${result.associations_found} 关联, ${result.enumerations_found} 枚举`);
-      // Wait a moment for user to see the final progress, then switch to review
-      setTimeout(() => {
-        hideProgress();
-        // Small delay to ensure progress overlay fully hides before review shows
-        setTimeout(() => showReviewPanel(result), 100);
-      }, 800);
+      // Results zone is already live-updated; just refresh with final state + failed batches
+      let taskState = null;
+      try { taskState = await API.pollTask(task_id); } catch {}
+      const failedBatches = taskState?.failed_batches || [];
+      updateWorkbenchResults(result, failedBatches, true);
+      showToast('✓ 提取完成，请在成果区勾选保存');
     }, {
       parsing_documents: [
         '正在加载全量文档内容...',
       ],
+      // NEW combined phase — replaces separate discover+attribute phases
+      extracting_entities: [
+        '单趟提取实体类型、属性与枚举 (已合并原来的实体发现+属性提取)',
+        '每份文档批只调用一次 AI，一次性拿到类、属性、数据类型、单位...',
+        '后续批次会带上已发现的类+属性作为上下文，保证命名一致并避免重复',
+        '跨文档的同名类会自动合并属性集',
+      ],
+      // Backward compat — retained for in-flight tasks from older server build
       discovering_entities: [
         '全量数据按批次发送给AI大模型...',
-        '后续批次会携带已发现实体作为上下文，保证关联一致性...',
       ],
       extracting_attributes: [
         '逐类提取领域专属属性...',
-        '匹配数据类型: String/Float/Integer/Date/Boolean/Enum',
-        '识别度量单位: MW, kV, rpm, mm, MPa...',
       ],
       extracting_associations: [
-        '分析设备层级包含关系...',
+        '并行分析类之间的包含与引用关系...',
         '识别组合(composition)与聚合(aggregation)模式...',
+        '按文档批次并行处理，后续批次带入已发现关联名称去重',
       ],
     });
   } catch (e) {
     addLog('info', '提取失败: ' + e.message);
     setTimeout(hideProgress, 2000);
-    alert('M1提取失败: ' + e.message);
+    showDialog({ type: 'error', title: 'M1提取失败', message: e.message });
   }
 }
 
@@ -294,45 +464,240 @@ async function extractM1() {
 // ============================================================
 async function deriveM2() {
   if (!state.m1ModelId) return;
+  // Open scope selector first; actual M2 derivation kicks off after user confirms.
+  openM2ScopeSelector();
+}
 
+// ============================================================
+// M2 Scope Selector (choose which M1 classes to abstract)
+// ============================================================
+
+let _m2SelectedClassIds = new Set();
+let _m2ScopeFilter = 'all';  // all | root | inherit | large
+let _m2ScopeSearch = '';
+
+function openM2ScopeSelector() {
+  const model = state.m1Model;
+  if (!model || !model.versions?.length) {
+    appAlert('没有可用的M1模型');
+    return;
+  }
+  const pkg = model.versions.slice(-1)[0].package;
+  const classes = pkg.classes || [];
+  if (classes.length < 2) {
+    appAlert('当前M1中类数量不足 (< 2)，无法反推M2。M2需要分析多个类的共性才能抽象。');
+    return;
+  }
+
+  // Default: pre-select all classes (user can deselect unwanted ones)
+  _m2SelectedClassIds = new Set(classes.map(c => c.id));
+  _m2ScopeFilter = 'all';
+  _m2ScopeSearch = '';
+
+  document.getElementById('m2-scope-source').textContent =
+    `${model.label || model.name} (共 ${classes.length} 个类)`;
+  document.getElementById('m2-scope-search').value = '';
+  document.querySelectorAll('.m2-scope-chip').forEach(c =>
+    c.classList.toggle('active', c.dataset.filter === 'all'));
+
+  renderM2ScopeList();
+  updateM2ScopeSummary();
+
+  document.getElementById('m2-scope-modal').classList.remove('hidden');
+}
+
+function getM2ScopeClasses() {
+  return state.m1Model?.versions?.slice(-1)[0]?.package?.classes || [];
+}
+
+function renderM2ScopeList() {
+  const container = document.getElementById('m2-scope-list');
+  const all = getM2ScopeClasses();
+  const q = _m2ScopeSearch.toLowerCase().trim();
+
+  const filtered = all.filter(c => {
+    // Text filter
+    if (q) {
+      const text = (c.name + ' ' + (c.description || '')).toLowerCase();
+      if (!text.includes(q)) return false;
+    }
+    // Chip filter
+    if (_m2ScopeFilter === 'root' && c.parent_class_name) return false;
+    if (_m2ScopeFilter === 'inherit' && !c.parent_class_name) return false;
+    if (_m2ScopeFilter === 'large' && (c.attributes?.length || 0) < 5) return false;
+    return true;
+  });
+
+  if (!filtered.length) {
+    container.innerHTML = '<div class="m2-scope-empty">没有匹配的类，请调整筛选条件</div>';
+    return;
+  }
+
+  container.innerHTML = filtered.map(c => {
+    const attrs = c.attributes?.length || 0;
+    const sel = _m2SelectedClassIds.has(c.id);
+    const parentHtml = c.parent_class_name
+      ? `<span class="meta-parent">↑ ${escapeHtml(c.parent_class_name)}</span>`
+      : `<span class="meta-root">根类</span>`;
+    const desc = c.description ? `<div class="m2-scope-item-desc">${escapeHtml(c.description)}</div>` : '';
+    return `<div class="m2-scope-item ${sel ? 'selected' : ''}" data-cls-id="${c.id}">
+      <input type="checkbox" class="m2-scope-item-chk" ${sel ? 'checked' : ''} data-cls-id="${c.id}">
+      <div class="m2-scope-item-body">
+        <div class="m2-scope-item-name">${escapeHtml(c.name)}</div>
+        <div class="m2-scope-item-meta">
+          <span class="meta-attrs">${attrs} 属性</span>
+          ${parentHtml}
+        </div>
+        ${desc}
+      </div>
+    </div>`;
+  }).join('');
+
+  // Click anywhere on card toggles; checkbox click doesn't double-trigger
+  container.querySelectorAll('.m2-scope-item').forEach(el => {
+    el.addEventListener('click', e => {
+      const id = el.dataset.clsId;
+      if (_m2SelectedClassIds.has(id)) _m2SelectedClassIds.delete(id);
+      else _m2SelectedClassIds.add(id);
+      el.classList.toggle('selected', _m2SelectedClassIds.has(id));
+      el.querySelector('.m2-scope-item-chk').checked = _m2SelectedClassIds.has(id);
+      updateM2ScopeSummary();
+      e.stopPropagation();
+    });
+  });
+}
+
+function updateM2ScopeSummary() {
+  const all = getM2ScopeClasses();
+  const total = all.length;
+  const sel = _m2SelectedClassIds.size;
+  document.getElementById('m2-scope-count').textContent = `已选 ${sel} / ${total}`;
+
+  // Breakdown of selected
+  const selected = all.filter(c => _m2SelectedClassIds.has(c.id));
+  const totalAttrs = selected.reduce((s, c) => s + (c.attributes?.length || 0), 0);
+  const rootCnt = selected.filter(c => !c.parent_class_name).length;
+  const inheritCnt = selected.length - rootCnt;
+  document.getElementById('m2-scope-breakdown').textContent =
+    sel === 0 ? '—' : `${totalAttrs} 属性 · ${rootCnt} 根类 · ${inheritCnt} 继承类`;
+
+  document.getElementById('btn-m2-scope-start').disabled = sel < 2;
+  document.getElementById('btn-m2-scope-start').textContent =
+    sel < 2 ? '至少选择 2 个类' : `▶ 开始推导 (${sel} 个类)`;
+}
+
+function setupM2ScopeModal() {
+  const modal = document.getElementById('m2-scope-modal');
+  const close = () => modal.classList.add('hidden');
+
+  document.getElementById('btn-m2-scope-close').addEventListener('click', close);
+  document.getElementById('btn-m2-scope-cancel').addEventListener('click', close);
+
+  document.getElementById('btn-m2-scope-all').addEventListener('click', () => {
+    getM2ScopeClasses().forEach(c => _m2SelectedClassIds.add(c.id));
+    renderM2ScopeList();
+    updateM2ScopeSummary();
+  });
+
+  document.getElementById('btn-m2-scope-none').addEventListener('click', () => {
+    _m2SelectedClassIds.clear();
+    renderM2ScopeList();
+    updateM2ScopeSummary();
+  });
+
+  document.getElementById('btn-m2-scope-invert').addEventListener('click', () => {
+    getM2ScopeClasses().forEach(c => {
+      if (_m2SelectedClassIds.has(c.id)) _m2SelectedClassIds.delete(c.id);
+      else _m2SelectedClassIds.add(c.id);
+    });
+    renderM2ScopeList();
+    updateM2ScopeSummary();
+  });
+
+  document.getElementById('m2-scope-search').addEventListener('input', e => {
+    _m2ScopeSearch = e.target.value;
+    renderM2ScopeList();
+  });
+
+  document.querySelectorAll('.m2-scope-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      document.querySelectorAll('.m2-scope-chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      _m2ScopeFilter = chip.dataset.filter;
+      renderM2ScopeList();
+    });
+  });
+
+  document.getElementById('btn-m2-scope-start').addEventListener('click', async () => {
+    if (_m2SelectedClassIds.size < 2) return;
+    close();
+    await startM2Derivation(Array.from(_m2SelectedClassIds));
+  });
+}
+
+async function startM2Derivation(selectedClassIds) {
   const m1Label = state.m1Model?.label || state.m1Model?.name || 'M1模型';
-  const classCount = state.m1Model?.versions?.slice(-1)[0]?.package?.classes?.length || 0;
+  const classCount = selectedClassIds.length;
+  const totalClasses = getM2ScopeClasses().length;
+  const scopeNote = classCount === totalClasses
+    ? `全部 ${classCount} 个类`
+    : `已选 ${classCount} / ${totalClasses} 个类`;
+
   showProgress(
-    'AI正在从M1反推M2元模型',
-    `分析 ${m1Label} 中 ${classCount} 个类的共性，抽象出通用基类`,
-    M2_STEPS
+    'AI推导M2元模型',
+    `准备分析 ${m1Label} 的 ${scopeNote} · 点击 [开始] 启动`,
+    M2_STEPS,
+    'm2'
   );
   addLog('info', `源M1模型: ${m1Label}`);
-  addLog('info', `包含 ${classCount} 个类待泛化`);
+  addLog('info', `参与抽象范围: ${scopeNote}`);
 
   try {
-    const { task_id } = await API.startM2Derivation(state.m1ModelId);
+    const { task_id } = await API.startM2Derivation(state.m1ModelId, selectedClassIds);
     _currentTaskId = task_id;
-    await pollTask(task_id, result => {
+    _reviewTaskId = task_id;
+    updateProgressControlButtons('ready');
+    await pollTask(task_id, async result => {
       _currentTaskId = null;
-      state.m2ModelId = result.m2_model_id;
-      loadModel(result.m2_model_id, 'm2');
-      loadModel(state.m1ModelId, 'm1');
-      addLog('success', 'M2元模型推导完成，已标记M1继承关系');
-      const mappings = result.m1_class_mappings || [];
-      if (mappings.length) {
-        addLog('info', `继承映射: ${mappings.map(m => `${m.m1_class_name}→${m.m2_parent_name}`).join(', ')}`);
-      }
-      setTimeout(() => {
-        hideProgress();
-        document.querySelector('.tab[data-tab="m2"]').click();
-      }, 1500);
+      addLog('success',
+        `M2推导完成: ${result.classes_found} 个抽象类, ${result.attributes_found} 个通用属性, ${result.m1_class_mappings?.length || 0} 条继承映射`);
+      let taskState = null;
+      try { taskState = await API.pollTask(task_id); } catch {}
+      const failedBatches = taskState?.failed_batches || [];
+      updateWorkbenchResults(result, failedBatches, true);
+      showToast('✓ M2推导完成，请在成果区确认并保存');
     }, {
+      // NEW 3-phase pipeline
+      clustering_m1: [
+        'Phase 1/3: 按业务观测维度对 M1 类分组 (单次 LLM 调用)',
+        '分组锚点是业务分析场景, 不是命名/属性相似度',
+        '例如: 抽水蓄能/电化学储能/常规水电 的设备台账 → 一组"设备台账"',
+      ],
+      synthesizing_m2: [
+        'Phase 2/4: 为每组并行抽象出 1 个 M2 基类 (最多 3 路并发)',
+        'M2 严格扁平单层, 差异属性下沉到 M1 子类',
+        '共享率 ≥ 50% 的属性才上升到 M2',
+        'M2 自关联指向自身, 保持混合子类树的完整性',
+      ],
+      detecting_hierarchy: [
+        'Phase 2.5/4: 为每个 M2 基类探测层级结构 (并行)',
+        '检测纵向包含关系 (如 设施→功能分组→设备→部件)',
+        '动态发现, 每个主题的层级取值独立生成',
+        '有层级的 M2 基类会自动生成 level 枚举 + parent/children 自关联',
+      ],
+      consolidating_m2: [
+        'Phase 3/4: 跨组去重, 合并业务含义实质相同的 M2 基类',
+        '合并后仍是扁平结构, 不做多级抽象',
+      ],
+      // Back-compat for in-flight tasks from old server
       deriving_m2: [
-        '提取各M1类的共享属性...',
-        '合并为抽象M2基类（如"设备"）...',
-        '构建M1→M2继承映射...',
+        '分析各M1类的共性属性...',
       ],
     });
   } catch (e) {
-    addLog('info', '推导失败: ' + e.message);
+    addLog('info', 'M2推导失败: ' + e.message);
     setTimeout(hideProgress, 2000);
-    alert('M2推导失败: ' + e.message);
+    showToast('M2推导失败: ' + e.message, 'error');
   }
 }
 
@@ -342,17 +707,20 @@ async function deriveM2() {
 
 const M1_STEPS = [
   { key: 'parsing_documents',      label: '加载全量文档' },
-  { key: 'discovering_entities',    label: '分批识别实体类型与枚举' },
-  { key: 'extracting_attributes',  label: '提取各类属性与数据类型' },
-  { key: 'extracting_associations', label: '分析类间关联关系' },
+  // Combined extraction — replaces old discovering_entities + extracting_attributes
+  { key: 'extracting_entities',    label: '提取实体/属性/枚举 (单趟扫描)' },
+  { key: 'extracting_associations', label: '分析类间关联关系 (并行)' },
   { key: 'saving',                 label: '保存M1模型' },
   { key: 'completed',              label: '完成' },
 ];
 
 const M2_STEPS = [
-  { key: 'starting',     label: '加载M1模型数据' },
-  { key: 'deriving_m2',  label: '抽象共性属性为M2基类' },
-  { key: 'completed',    label: '生成M2元模型并关联M1' },
+  { key: 'clustering_m1',      label: 'Phase 1: 业务观测维度聚类' },
+  { key: 'synthesizing_m2',    label: 'Phase 2: 组内抽象 M2 基类 (并行)' },
+  { key: 'detecting_hierarchy', label: 'Phase 2.5: 层级结构探测 (并行)' },
+  { key: 'consolidating_m2',   label: 'Phase 3: 跨组去重合并' },
+  { key: 'saving',             label: '保存M2模型' },
+  { key: 'completed',          label: '完成' },
 ];
 
 const TIPS = [
@@ -375,25 +743,94 @@ let _progTipInterval = null;
 let _progLogs = [];
 let _progStepTimes = {};
 
-function showProgress(title, subtitle, steps) {
-  _progStart = Date.now();
+let _progActuallyStarted = false;  // false until user clicks Start (or auto-start)
+let _progMode = 'm1';  // 'm1' | 'm2' — drives labels/visibility of context-specific UI
+
+function showProgress(title, subtitle, steps, mode = 'm1') {
+  _progStart = null;  // Will be set on actual start
+  _progActuallyStarted = false;
   _progLogs = [];
   _progStepTimes = {};
   _progTipIdx = Math.floor(Math.random() * TIPS.length);
+  _progMode = (mode === 'm2') ? 'm2' : 'm1';
+  const isM2 = (_progMode === 'm2');
 
   document.getElementById('progress-title').textContent = title;
   document.getElementById('progress-subtitle').textContent = subtitle || '';
   document.getElementById('progress-fill').style.width = '0%';
   document.getElementById('progress-pct').textContent = '0%';
-  document.getElementById('progress-message').textContent = '准备中...';
+  document.getElementById('progress-message').textContent = '就绪 · 等待用户点击 [开始]';
+  document.getElementById('progress-timer').textContent = '00:00';
   document.getElementById('progress-tip-text').textContent = TIPS[_progTipIdx];
 
-  // Render step pipeline
+  // ---- Context-specific UI (M1 vs M2) ----
+  // "文档状态" section: only M1 processes documents; M2 derives from existing M1 data
+  const docsWrap = document.getElementById('progress-docs-wrap');
+  if (docsWrap) docsWrap.classList.toggle('hidden', isM2);
+
+  // "枚举" stat card: M2 derivation (3-phase) does not auto-produce enumerations
+  const enumCard = document.querySelector('.wb-stat-card.stat-enums');
+  if (enumCard) enumCard.classList.toggle('hidden', isM2);
+
+  // "类" label becomes "抽象基类" for M2 to match the mental model
+  const classLabel = document.querySelector('.stat-classes .wb-stat-label');
+  if (classLabel) classLabel.textContent = isM2 ? '抽象基类' : '类';
+
+  // Attributes and associations still exist for both, but with different meanings
+  const attrLabel = document.querySelector('.stat-attrs .wb-stat-label');
+  if (attrLabel) attrLabel.textContent = isM2 ? '共性属性' : '属性';
+
+  // Model-name label + placeholder reflect the layer being saved
+  const modelNameLabel = document.querySelector('.wb-entities-section')?.previousElementSibling?.querySelector('.wb-section-title');
+  // Fallback: locate by known text structure
+  const modelNameInput = document.getElementById('wb-model-label');
+  const modelNameSection = modelNameInput?.closest('.wb-section');
+  const modelNameTitle = modelNameSection?.querySelector('.wb-section-title');
+  if (modelNameTitle) modelNameTitle.textContent = isM2 ? 'M2元模型名称' : 'M1模型名称';
+  if (modelNameInput) modelNameInput.placeholder = isM2
+    ? '推导到内容后再命名保存...'
+    : '提取到内容后再命名保存...';
+
+  // Work-zone title — "提取过程" for M1, "推导过程" for M2
+  const workTitle = document.querySelector('.wb-zone.wb-work .wb-zone-title');
+  if (workTitle) workTitle.textContent = isM2 ? '📋 工作区 · 推导过程' : '📋 工作区 · 提取过程';
+
+  // Reset right-zone stats to 0
+  document.getElementById('wb-stat-classes').textContent = '0';
+  document.getElementById('wb-stat-attrs').textContent = '0';
+  document.getElementById('wb-stat-assocs').textContent = '0';
+  document.getElementById('wb-stat-enums').textContent = '0';
+  document.getElementById('wb-model-label').value = '';
+  document.getElementById('review-entities').innerHTML =
+    `<div class="empty-state">${isM2 ? '等待推导结果...' : '等待提取结果...'}</div>`;
+  document.getElementById('wb-failed-section').classList.add('hidden');
+  document.getElementById('review-notes').classList.add('hidden');
+
+  // LIVE badge: show "就绪" (not blinking) until extraction actually begins
+  const liveBadge = document.getElementById('wb-live-badge');
+  if (liveBadge) {
+    liveBadge.textContent = '○ 就绪';
+    liveBadge.style.color = 'var(--text-dim)';
+    liveBadge.style.animation = 'none';
+  }
+
+  // Clear parallel tasks and conversation stream
+  document.getElementById('progress-parallel').innerHTML = '';
+  document.getElementById('conv-stream').innerHTML = '<div class="prog-conv-empty">等待LLM调用...</div>';
+  document.getElementById('conv-count').textContent = '0';
+
+  // Reset document statuses to pending
+  const docsEl = document.getElementById('progress-docs');
+  // Will be populated by polling with actual doc list
+
+  updateReviewConfirmBtn();
+
+  // Render step pipeline — ALL pending initially (no step active, no step done)
   const stepsEl = document.getElementById('progress-steps');
   stepsEl.innerHTML = '';
   for (const s of (steps || [])) {
     const div = document.createElement('div');
-    div.className = 'prog-step pending';
+    div.className = 'prog-step pending';  // pending, not done
     div.dataset.key = s.key;
     div.innerHTML = `
       <div class="prog-step-icon"></div>
@@ -402,8 +839,40 @@ function showProgress(title, subtitle, steps) {
     stepsEl.appendChild(div);
   }
 
-  // Clear log
+  // Clear log (no auto-logging until start)
+  document.getElementById('progress-log').innerHTML = '<div class="prog-log-line info"><span class="prog-log-text">等待用户点击 [开始] 按钮，任务即将启动</span></div>';
+
+  // Do NOT start timer yet — wait for actual start
+  clearInterval(_progTimer);
+  clearInterval(_progTipInterval);
+
+  // Add 'ready' banner class to the workbench
+  document.querySelector('.workbench').classList.add('wb-ready');
+
+  document.getElementById('progress-overlay').classList.remove('hidden');
+}
+
+// Called when user clicks Start — NOW activate timer, logging, tips rotation
+function onExtractionActuallyStarted() {
+  if (_progActuallyStarted) return;
+  _progActuallyStarted = true;
+  _progStart = Date.now();
+  _progLogs = [];
+
+  document.getElementById('progress-timer').textContent = '00:00';
+  document.getElementById('progress-message').textContent = '准备中...';
+
+  // LIVE badge now starts blinking red
+  const liveBadge = document.getElementById('wb-live-badge');
+  if (liveBadge) {
+    liveBadge.textContent = '● LIVE';
+    liveBadge.style.color = 'var(--red)';
+    liveBadge.style.animation = '';
+  }
+
+  // Clear initial "waiting" log, add actual start log
   document.getElementById('progress-log').innerHTML = '';
+  addLog('success', '▶ 任务启动');
   addLog('info', '正在连接AI大模型...');
 
   // Start timer
@@ -422,20 +891,24 @@ function showProgress(title, subtitle, steps) {
     }, 300);
   }, 8000);
 
-  document.getElementById('progress-overlay').classList.remove('hidden');
+  // Remove ready banner
+  document.querySelector('.workbench').classList.remove('wb-ready');
 }
 
 function hideProgress() {
   clearInterval(_progTimer);
   clearInterval(_progTipInterval);
   _progressMinimized = false;
+  _progActuallyStarted = false;
+  _progStart = null;
   document.getElementById('progress-overlay').classList.add('hidden');
-  // Also hide badge (extraction complete)
+  document.querySelector('.workbench').classList.remove('wb-ready');
   const badge = document.getElementById('progress-badge');
   badge.classList.add('hidden');
 }
 
 function updateTimer() {
+  if (!_progStart) return;  // Not started yet
   const elapsed = Math.floor((Date.now() - _progStart) / 1000);
   const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
   const s = String(elapsed % 60).padStart(2, '0');
@@ -446,17 +919,26 @@ function updateProgress(step, progress, message) {
   const pct = Math.round((progress || 0) * 100);
   document.getElementById('progress-fill').style.width = `${pct}%`;
   document.getElementById('progress-pct').textContent = `${pct}%`;
-  // Update floating badge if minimized
   if (_progressMinimized) {
     document.getElementById('badge-pct').textContent = `${pct}%`;
     document.getElementById('badge-step').textContent = (message || '').substring(0, 30);
   }
   document.getElementById('progress-message').textContent = message || '';
 
-  // Update pipeline steps
+  // KEY FIX: Don't touch pipeline steps if task hasn't actually started yet.
+  // When step is 'ready' or task is in ready state, all pipeline steps stay pending.
+  if (!_progActuallyStarted || step === 'ready') return;
+
+  // Known step keys (to avoid marking pipeline as done when step is an unknown value)
   const allSteps = document.querySelectorAll('#progress-steps .prog-step');
-  let reachedCurrent = false;
-  for (const el of allSteps) {
+  const stepKeys = [...allSteps].map(el => el.dataset.key);
+  const stepIdx = stepKeys.indexOf(step);
+
+  // If current step is unknown (not in pipeline), leave existing states as-is
+  if (stepIdx < 0 && step !== 'completed') return;
+
+  for (let i = 0; i < allSteps.length; i++) {
+    const el = allSteps[i];
     const key = el.dataset.key;
     if (key === step) {
       if (!el.classList.contains('active')) {
@@ -464,12 +946,10 @@ function updateProgress(step, progress, message) {
         _progStepTimes[key] = Date.now();
         addLog('step', message || el.querySelector('.prog-step-label').textContent);
       }
-      reachedCurrent = true;
-    } else if (!reachedCurrent) {
-      // Previous steps are done
+    } else if (i < stepIdx) {
+      // Step comes before the current step — mark as done
       if (!el.classList.contains('done')) {
         el.className = 'prog-step done';
-        // Show elapsed time for this step
         const startTime = _progStepTimes[key];
         if (startTime) {
           const dur = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -477,10 +957,10 @@ function updateProgress(step, progress, message) {
         }
       }
     }
-    // Future steps stay pending
+    // Future steps (i > stepIdx) stay in their current state
   }
 
-  // If completed, mark all done
+  // If completed, mark all as done
   if (step === 'completed') {
     for (const el of allSteps) {
       if (!el.classList.contains('done')) {
@@ -498,7 +978,7 @@ function updateProgress(step, progress, message) {
 }
 
 function addLog(type, text) {
-  const elapsed = ((Date.now() - _progStart) / 1000).toFixed(1);
+  const elapsed = _progStart ? ((Date.now() - _progStart) / 1000).toFixed(1) : '0.0';
   const logEl = document.getElementById('progress-log');
   const line = document.createElement('div');
   line.className = `prog-log-line ${type}`;
@@ -528,6 +1008,19 @@ async function pollTask(taskId, onComplete, logMessages) {
       const s = await API.pollTask(taskId);
       if (_pollAborted) return;  // Abort check after fetch
 
+      // Sync control buttons FIRST (so downstream logic knows state)
+      if (s.status === 'ready') updateProgressControlButtons('ready');
+      else if (s.status === 'paused') updateProgressControlButtons('paused');
+      else if (s.status === 'running') {
+        updateProgressControlButtons('running');
+        // If transitioning from ready → running, activate extraction UI
+        if (!_progActuallyStarted) onExtractionActuallyStarted();
+      }
+      else if (s.status === 'completed' || s.status === 'cancelled' || s.status === 'failed') {
+        updateProgressControlButtons('done');
+        if (!_progActuallyStarted && s.status === 'completed') onExtractionActuallyStarted();
+      }
+
       updateProgress(s.step, s.progress, s.message);
 
       if (s.documents && s.documents.length) {
@@ -540,18 +1033,28 @@ async function pollTask(taskId, onComplete, logMessages) {
         document.getElementById('progress-parallel').innerHTML = '';
       }
 
+      // Only stream server logs after extraction has actually started
+      // (Before start, logs just have "等待用户点击..." which is shown elsewhere)
       const serverLogs = s.logs || [];
-      if (serverLogs.length > lastLogCount) {
+      if (_progActuallyStarted && serverLogs.length > lastLogCount) {
         for (let i = lastLogCount; i < serverLogs.length; i++) {
           const l = serverLogs[i];
           addLogRaw(l.type, l.text, l.time);
         }
         lastLogCount = serverLogs.length;
+      } else if (!_progActuallyStarted) {
+        lastLogCount = serverLogs.length;  // Skip ahead so we don't replay old logs
       }
 
       // Render LLM conversation stream
       if (s.llm_conversations && s.llm_conversations.length) {
         renderConversations(s.llm_conversations);
+      }
+
+      // Live update right-zone results (partial or final)
+      if (s.result && s.result.package) {
+        const isFinal = s.status === 'completed';
+        updateWorkbenchResults(s.result, s.failed_batches || [], isFinal);
       }
 
       if (s.step !== lastStep) {
@@ -763,13 +1266,1357 @@ async function loadModel(modelId, layer) {
       renderTree('m1');
     }
     updateToolbarState();
+    // If the user is currently viewing the graph tab, refresh it so new data appears
+    const diagramTab = document.querySelector('#diagram-view.tab-content.active');
+    if (diagramTab) renderDiagram();
   } catch (e) { console.error('Failed to load model:', e); }
 }
 
 // ============================================================
 // Tree Rendering (shared for M1 and M2)
 // ============================================================
-const _treeViewMode = { m1: 'hierarchy', m2: 'hierarchy' };  // 'hierarchy' or 'flat'
+const _treeViewMode = { m1: 'cards', m2: 'cards' };  // 'cards' | 'hierarchy' | 'flat'
+
+// ============================================================
+// Entity Detail Page — rich relationship view
+// ============================================================
+
+const _detailHistory = [];
+
+function openEntityDetailPage(cls, allClasses, allEnums, allAssocs, layer, opts = {}) {
+  // Stack-based navigation: push to history if not returning
+  if (!opts.fromBack) {
+    _detailHistory.push({ clsId: cls.id, layer });
+  }
+
+  const layerLabel = layer === 'm2' ? 'M2 元模型' : 'M1 领域层';
+  document.getElementById('ed-layer').textContent = layerLabel;
+  document.getElementById('ed-current-name').textContent = `${cls.name} ${cls.label ? '· ' + cls.label : ''}`;
+
+  // ----- Cross-layer class index (critical for M2↔M1 parent/child resolution) -----
+  // M2 classes' children live in the M1 package (M1 inherits from M2 via parent_class_name).
+  // M1 classes' parent may be in M1 (intra-M1 inheritance) OR in M2 (cross-layer).
+  // Build a single cross-layer index with layer info so we can resolve in either direction.
+  const m1Pkg = state.m1Model?.versions?.slice(-1)[0]?.package;
+  const m2Pkg = state.m2Model?.versions?.slice(-1)[0]?.package;
+  const m1Classes = m1Pkg?.classes || [];
+  const m2Classes = m2Pkg?.classes || [];
+
+  // Prefer same-layer (passed `allClasses`) for name lookup, fall back cross-layer
+  const byName = {}; for (const c of allClasses) byName[c.name] = c;
+  const crossByName = {};  // name -> { cls, layer }
+  for (const c of m1Classes) if (!crossByName[c.name]) crossByName[c.name] = { cls: c, layer: 'm1' };
+  for (const c of m2Classes) if (!crossByName[c.name]) crossByName[c.name] = { cls: c, layer: 'm2' };
+
+  const enumById = {}; for (const en of allEnums) enumById[en.id] = en;
+
+  // Parent class (cross-layer resolve)
+  let parentCls = cls.parent_class_name ? byName[cls.parent_class_name] : null;
+  let parentLayer = layer;
+  if (!parentCls && cls.parent_class_name) {
+    const entry = crossByName[cls.parent_class_name];
+    if (entry) { parentCls = entry.cls; parentLayer = entry.layer; }
+  }
+
+  // Children classes (cross-layer aware):
+  //   - If viewing an M2 class: its children are M1 classes whose parent_class_name = this.name
+  //   - If viewing an M1 class: its children are M1 classes same-layer (intra-M1 inheritance).
+  //     Rare but possible: an M2 class whose parent is an M1 class (skip that direction).
+  let childrenClasses, childrenLayer;
+  if (layer === 'm2') {
+    childrenClasses = m1Classes.filter(c => c.parent_class_name === cls.name);
+    childrenLayer = 'm1';
+  } else {
+    childrenClasses = m1Classes.filter(c => c.parent_class_name === cls.name && c.id !== cls.id);
+    childrenLayer = 'm1';
+  }
+
+  // Outgoing associations (this → others) — same layer only (associations are per-layer)
+  const outgoing = allAssocs.filter(a => a.source?.class_name === cls.name);
+  // Incoming associations (others → this)
+  const incoming = allAssocs.filter(a => a.target?.class_name === cls.name);
+  // Used enumerations
+  const usedEnumIds = new Set();
+  for (const a of (cls.attributes || [])) {
+    if (a.data_type === 'Enum' && a.enum_ref) usedEnumIds.add(a.enum_ref);
+  }
+  const usedEnums = [...usedEnumIds].map(id => enumById[id]).filter(Boolean);
+
+  // Split attributes
+  const ownAttrs = (cls.attributes || []).filter(a => !a.is_inherited);
+  const inhAttrs = (cls.attributes || []).filter(a => a.is_inherited);
+
+  const body = document.getElementById('ed-body');
+  body.innerHTML = `
+    <!-- Hero section -->
+    <div class="ed-hero">
+      <div class="ed-hero-badge"><span class="tree-badge badge-class">C</span></div>
+      <div class="ed-hero-info">
+        <h1 class="ed-hero-name">${escapeHtml(cls.name)}</h1>
+        <div class="ed-hero-label">${escapeHtml(cls.label || '(未命名)')}</div>
+        ${cls.description ? `<p class="ed-hero-desc">${escapeHtml(cls.description)}</p>` : ''}
+        ${cls.parent_class_name ? `<div class="ed-hero-extends">继承自 <a class="ed-link" data-class="${escapeHtml(cls.parent_class_name)}" data-layer="${parentLayer}">${escapeHtml(cls.parent_class_name)}${parentLayer !== layer ? ` <span class="ed-layer-tag">[${parentLayer.toUpperCase()}]</span>` : ''}</a></div>` : ''}
+      </div>
+      <div class="ed-hero-stats">
+        <div class="ed-stat"><div class="ed-stat-num">${ownAttrs.length}</div><div class="ed-stat-label">自有属性</div></div>
+        <div class="ed-stat"><div class="ed-stat-num">${inhAttrs.length}</div><div class="ed-stat-label">继承属性</div></div>
+        <div class="ed-stat"><div class="ed-stat-num">${childrenClasses.length}</div><div class="ed-stat-label">${layer === 'm2' ? 'M1子类' : '子类'}</div></div>
+        <div class="ed-stat"><div class="ed-stat-num">${outgoing.length + incoming.length}</div><div class="ed-stat-label">关联</div></div>
+        <div class="ed-stat"><div class="ed-stat-num">${usedEnums.length}</div><div class="ed-stat-label">枚举</div></div>
+      </div>
+      <div class="ed-hero-actions">
+        <button class="btn btn-primary btn-edit-entity" data-class-id="${cls.id}">&#9998; 编辑</button>
+      </div>
+    </div>
+
+    <!-- Two-column: Attributes | Relationships -->
+    <div class="ed-grid">
+      <div class="ed-col-attrs">
+        ${renderAttrsPanel(ownAttrs, inhAttrs, enumById, cls.id, layer)}
+      </div>
+      <div class="ed-col-rels">
+        ${renderRelsPanel(cls, parentCls, parentLayer, childrenClasses, childrenLayer, outgoing, incoming, usedEnums, layer)}
+      </div>
+    </div>
+  `;
+
+  // Wire edit button
+  body.querySelectorAll('.btn-edit-entity').forEach(btn => {
+    btn.addEventListener('click', () => {
+      EntityEdit.open(cls, layer, allClasses, allEnums, allAssocs);
+    });
+  });
+
+  // Wire all entity-navigation links — respect explicit data-layer for cross-layer jumps
+  body.querySelectorAll('.ed-link[data-class]').forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      const targetName = link.dataset.class;
+      const targetLayer = link.dataset.layer || layer;
+
+      // Resolve target in the correct package for its layer
+      let targetCls = null, targetPkg = null;
+      if (targetLayer === 'm2') {
+        targetPkg = state.m2Model?.versions?.slice(-1)[0]?.package;
+      } else {
+        targetPkg = state.m1Model?.versions?.slice(-1)[0]?.package;
+      }
+      if (targetPkg) {
+        targetCls = targetPkg.classes.find(c => c.name === targetName);
+      }
+
+      // Fallback: same-package lookup (handles cases with missing data-layer)
+      if (!targetCls) {
+        targetCls = byName[targetName];
+        if (targetCls) {
+          openEntityDetailPage(targetCls, allClasses, allEnums, allAssocs, layer);
+          return;
+        }
+      }
+      if (targetCls && targetPkg) {
+        openEntityDetailPage(
+          targetCls,
+          targetPkg.classes,
+          targetPkg.enumerations || [],
+          targetPkg.associations || [],
+          targetLayer,
+        );
+      }
+    });
+  });
+  body.querySelectorAll('.ed-link[data-enum]').forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      // Focus on enum but stay in detail page — show enum modal or highlight
+      const en = enumById[link.dataset.enum];
+      if (en) showDialog({
+        type: 'info',
+        title: `枚举: ${en.name}${en.label ? ' · ' + en.label : ''}`,
+        message: (en.literals || []).map(l => `• ${l.label || l.name}${l.name !== l.label ? ` (${l.name})` : ''}`).join('\n') || '(无枚举值)',
+      });
+    });
+  });
+
+  // Show overlay
+  document.getElementById('entity-detail-overlay').classList.remove('hidden');
+}
+
+function renderAttrsPanel(ownAttrs, inhAttrs, enumById, classId, layer) {
+  const renderAttrRow = (a) => {
+    const unit = a.unit ? ` <span class="ed-attr-unit">(${a.unit})</span>` : '';
+    const enumName = a.enum_ref && enumById[a.enum_ref] ? enumById[a.enum_ref].name : '';
+    const enumLink = enumName ? ` → <a class="ed-link" data-enum="${a.enum_ref}">${escapeHtml(enumName)}</a>` : '';
+    const mult = a.multiplicity ? `[${a.multiplicity.lower}..${a.multiplicity.upper === -1 ? '*' : a.multiplicity.upper}]` : '';
+    // Show default_value when present (typical case: M1 class's inherited `level` attribute
+    // with the level auto-assigned by Phase 2.5 hierarchy detection).
+    const defaultBadge = (a.default_value !== null && a.default_value !== undefined && a.default_value !== '')
+      ? `<span class="ed-attr-default" title="默认值 (实例未指定时自动填入)">默认: ${escapeHtml(String(a.default_value))}</span>`
+      : '';
+    return `<div class="ed-attr-row">
+      <span class="ed-attr-name">${escapeHtml(a.name)}</span>
+      <span class="ed-attr-chinese">${escapeHtml(a.label || '')}</span>
+      <span class="ed-attr-type">${a.data_type}${unit}${enumLink}</span>
+      <span class="ed-attr-mult">${mult}</span>
+      ${defaultBadge}
+    </div>`;
+  };
+  let html = '<div class="ed-section"><div class="ed-section-title">📋 属性列表</div>';
+  if (ownAttrs.length) {
+    html += `<div class="ed-subsection">
+      <div class="ed-subsection-title"><span class="ed-tag tag-own">自有 ${ownAttrs.length}</span></div>
+      <div class="ed-attrs">${ownAttrs.map(renderAttrRow).join('')}</div>
+    </div>`;
+  }
+  if (inhAttrs.length) {
+    html += `<div class="ed-subsection">
+      <div class="ed-subsection-title"><span class="ed-tag tag-inherited">继承 ${inhAttrs.length}</span></div>
+      <div class="ed-attrs ed-attrs-inherited">${inhAttrs.map(renderAttrRow).join('')}</div>
+    </div>`;
+  }
+  if (!ownAttrs.length && !inhAttrs.length) {
+    html += '<div class="ed-empty">暂无属性</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function renderRelsPanel(cls, parentCls, parentLayer, children, childrenLayer, outgoing, incoming, usedEnums, currentLayer) {
+  let html = '<div class="ed-section"><div class="ed-section-title">🌐 关联与继承关系</div>';
+
+  const layerTag = (lyr) => lyr && lyr !== currentLayer
+    ? ` <span class="ed-layer-tag">[${lyr.toUpperCase()}]</span>` : '';
+
+  // Inheritance tree
+  if (parentCls || children.length) {
+    html += `<div class="ed-subsection">
+      <div class="ed-subsection-title">继承关系</div>
+      <div class="ed-tree-viz">`;
+    if (parentCls) {
+      html += `<div class="ed-tree-node ed-tree-parent">
+        <span class="ed-tree-arrow">▲</span>
+        <span class="ed-tree-label">父类</span>
+        <a class="ed-tree-class ed-link" data-class="${escapeHtml(parentCls.name)}" data-layer="${parentLayer || currentLayer}">
+          <span class="tree-badge badge-class">C</span> ${escapeHtml(parentCls.name)}${layerTag(parentLayer)}
+          ${parentCls.label ? ` · ${escapeHtml(parentCls.label)}` : ''}
+        </a>
+      </div>`;
+    }
+    html += `<div class="ed-tree-node ed-tree-self">
+      <span class="tree-badge badge-class">C</span>
+      <strong>${escapeHtml(cls.name)}</strong>
+    </div>`;
+    if (children.length) {
+      const childBadgeTag = childrenLayer && childrenLayer !== currentLayer
+        ? ` <span class="ed-layer-tag">[${childrenLayer.toUpperCase()} 子类]</span>` : '';
+      html += `<div class="ed-tree-children-wrap">
+        <span class="ed-tree-arrow">▼</span>
+        <span class="ed-tree-label">子类 (${children.length})${childBadgeTag}</span>
+        <div class="ed-tree-children">`;
+      for (const child of children) {
+        html += `<a class="ed-tree-class ed-link" data-class="${escapeHtml(child.name)}" data-layer="${childrenLayer || currentLayer}">
+          <span class="tree-badge badge-class">C</span> ${escapeHtml(child.name)}
+          ${child.label ? ` · ${escapeHtml(child.label)}` : ''}
+        </a>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Outgoing associations
+  if (outgoing.length) {
+    html += `<div class="ed-subsection">
+      <div class="ed-subsection-title">→ 关联出 (${outgoing.length})<span class="ed-hint">本类引用/包含其他类</span></div>
+      <div class="ed-rel-list">`;
+    for (const a of outgoing) {
+      const mult = a.target?.multiplicity ? `[${a.target.multiplicity.lower}..${a.target.multiplicity.upper === -1 ? '*' : a.target.multiplicity.upper}]` : '';
+      const typeTag = a.association_type === 'composition' ? '组合' : (a.association_type === 'aggregation' ? '聚合' : '引用');
+      html += `<div class="ed-rel-row">
+        <span class="ed-rel-type ed-rel-${a.association_type || 'association'}">${typeTag}</span>
+        <span class="ed-rel-name">${escapeHtml(a.label || a.name)}</span>
+        <span class="ed-rel-arrow">→</span>
+        <a class="ed-link" data-class="${escapeHtml(a.target?.class_name || '')}">${escapeHtml(a.target?.class_name || '?')}</a>
+        <span class="ed-rel-mult">${mult}</span>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Incoming associations
+  if (incoming.length) {
+    html += `<div class="ed-subsection">
+      <div class="ed-subsection-title">← 关联入 (${incoming.length})<span class="ed-hint">被其他类引用/包含</span></div>
+      <div class="ed-rel-list">`;
+    for (const a of incoming) {
+      const mult = a.source?.multiplicity ? `[${a.source.multiplicity.lower}..${a.source.multiplicity.upper === -1 ? '*' : a.source.multiplicity.upper}]` : '';
+      const typeTag = a.association_type === 'composition' ? '组合' : (a.association_type === 'aggregation' ? '聚合' : '引用');
+      html += `<div class="ed-rel-row">
+        <a class="ed-link" data-class="${escapeHtml(a.source?.class_name || '')}">${escapeHtml(a.source?.class_name || '?')}</a>
+        <span class="ed-rel-mult">${mult}</span>
+        <span class="ed-rel-arrow">→</span>
+        <span class="ed-rel-type ed-rel-${a.association_type || 'association'}">${typeTag}</span>
+        <span class="ed-rel-name">${escapeHtml(a.label || a.name)}</span>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Used enumerations
+  if (usedEnums.length) {
+    html += `<div class="ed-subsection">
+      <div class="ed-subsection-title">🟨 使用的枚举 (${usedEnums.length})</div>
+      <div class="ed-enum-list">`;
+    for (const en of usedEnums) {
+      const litPreview = (en.literals || []).slice(0, 5).map(l => l.label || l.name).join(' · ');
+      html += `<div class="ed-enum-row">
+        <a class="ed-link" data-enum="${en.id}">
+          <span class="tree-badge badge-enum">E</span>
+          <strong>${escapeHtml(en.name)}</strong>
+          ${en.label ? ` · ${escapeHtml(en.label)}` : ''}
+        </a>
+        <div class="ed-enum-values">${escapeHtml(litPreview)}${en.literals.length > 5 ? ' ...' : ''}</div>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  if (!parentCls && !children.length && !outgoing.length && !incoming.length && !usedEnums.length) {
+    html += '<div class="ed-empty">此类没有继承或关联关系（独立实体）</div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+// ============================================================
+// Entity Edit Module — full CRUD with cascade + diff preview
+// ============================================================
+// Flow:
+//   1. open(cls, layer, allClasses, allEnums, allAssocs)
+//   2. User edits basic fields / attrs / outgoing assocs
+//   3. Live change summary updates in sidebar
+//   4. User clicks "预览变更" → diff + cascade shown
+//   5. "确认保存" → compute new package → PUT /models/{id} → reload
+
+const PRIMITIVE_TYPES = ['String', 'Integer', 'Float', 'Boolean', 'Date', 'Enum', 'Reference'];
+const ASSOC_TYPES = [
+  { value: 'association', label: '引用' },
+  { value: 'aggregation', label: '聚合' },
+  { value: 'composition', label: '组合' },
+];
+
+const EntityEdit = {
+  // --- state (populated on open) ---
+  state: null,
+
+  setup() {
+    document.getElementById('btn-ee-close').addEventListener('click', () => EntityEdit.close(false));
+    document.getElementById('btn-ee-cancel').addEventListener('click', () => EntityEdit.cancel());
+    document.getElementById('btn-ee-preview').addEventListener('click', () => EntityEdit.openPreview());
+
+    document.getElementById('btn-ep-close').addEventListener('click', () => EntityEdit.closePreview());
+    document.getElementById('btn-ep-back').addEventListener('click', () => EntityEdit.closePreview());
+    document.getElementById('btn-ep-commit').addEventListener('click', () => EntityEdit.commit());
+  },
+
+  open(cls, layer, allClasses, allEnums, allAssocs) {
+    const modelId = layer === 'm2' ? state.m2ModelId : state.m1ModelId;
+    const model   = layer === 'm2' ? state.m2Model   : state.m1Model;
+    if (!modelId || !model?.versions?.length) {
+      appAlert('无法加载模型数据');
+      return;
+    }
+    const pkg = model.versions[model.versions.length - 1].package;
+
+    // Deep clone original class (so edits don't mutate source until commit)
+    const origClass = JSON.parse(JSON.stringify(cls));
+    const editingClass = JSON.parse(JSON.stringify(cls));
+    // Ensure attributes + nested defaults exist
+    editingClass.attributes = editingClass.attributes || [];
+    for (const a of editingClass.attributes) {
+      if (!a.multiplicity) a.multiplicity = { lower: 1, upper: 1 };
+    }
+
+    // Outgoing associations (source = this class)
+    const origOut = (allAssocs || []).filter(a => a.source?.class_name === cls.name);
+    const editingOut = JSON.parse(JSON.stringify(origOut));
+    for (const a of editingOut) {
+      if (!a.source?.multiplicity) a.source = { ...a.source, multiplicity: { lower: 1, upper: 1 } };
+      if (!a.target?.multiplicity) a.target = { ...a.target, multiplicity: { lower: 0, upper: -1 } };
+    }
+
+    // Incoming (read-only)
+    const incoming = (allAssocs || []).filter(a => a.target?.class_name === cls.name);
+
+    // ---- Parent class candidates ----
+    // M1 can inherit from other M1 OR from M2 classes (cross-layer).
+    // M2 should only inherit from other M2.
+    // We mark each candidate with _layer so the dropdown can display a prefix.
+    const parentCandidates = [];
+    parentCandidates.push(
+      ...allClasses
+        .filter(x => x.id !== cls.id)
+        .map(x => ({ id: x.id, name: x.name, label: x.label || '', attributes: x.attributes || [], parent_class_name: x.parent_class_name || null, _layer: layer }))
+    );
+    if (layer === 'm1') {
+      const m2Pkg = state.m2Model?.versions?.slice(-1)[0]?.package;
+      for (const m2c of (m2Pkg?.classes || [])) {
+        parentCandidates.push({
+          id: m2c.id,
+          name: m2c.name,
+          label: m2c.label || '',
+          attributes: m2c.attributes || [],
+          parent_class_name: m2c.parent_class_name || null,
+          _layer: 'm2',
+        });
+      }
+    }
+
+    EntityEdit.state = {
+      layer,
+      modelId,
+      origPackage: JSON.parse(JSON.stringify(pkg)),
+      origClass,
+      editingClass,
+      origOut,
+      editingOut,
+      incoming,
+      allClasses,               // same-layer classes (for target dropdown)
+      allEnums,
+      parentCandidates,         // cross-layer classes (for parent dropdown + inheritance walk)
+    };
+
+    // Update header chrome
+    const badgeEl = document.getElementById('ee-layer-badge');
+    badgeEl.textContent = layer.toUpperCase();
+    badgeEl.className = 'ee-badge ' + layer;
+    document.getElementById('ee-subtitle').textContent = cls.name;
+
+    EntityEdit.render();
+    document.getElementById('entity-edit-overlay').classList.remove('hidden');
+  },
+
+  close(reloadDetail) {
+    document.getElementById('entity-edit-overlay').classList.add('hidden');
+    EntityEdit.closePreview();
+    // If committed, refresh entity detail page with fresh data
+    if (reloadDetail && EntityEdit.state) {
+      const { layer } = EntityEdit.state;
+      const model = layer === 'm2' ? state.m2Model : state.m1Model;
+      const pkg = model?.versions?.slice(-1)[0]?.package;
+      if (pkg) {
+        // Find the (possibly renamed) class — use id
+        const id = EntityEdit.state.editingClass.id;
+        const cls = pkg.classes.find(c => c.id === id);
+        if (cls) {
+          openEntityDetailPage(cls, pkg.classes, pkg.enumerations || [], pkg.associations || [], layer, { fromBack: true });
+        }
+      }
+    }
+    EntityEdit.state = null;
+  },
+
+  async cancel() {
+    if (EntityEdit.hasChanges()) {
+      const ok = await showDialog({
+        type: 'warning',
+        title: '放弃修改?',
+        message: '您有未保存的修改，确定放弃?',
+        okText: '放弃', cancelText: '继续编辑', danger: true,
+      });
+      if (!ok) return;
+    }
+    EntityEdit.close(false);
+  },
+
+  // --- Dirty detection ---
+  hasChanges() {
+    if (!EntityEdit.state) return false;
+    return JSON.stringify(EntityEdit.state.editingClass) !== JSON.stringify(EntityEdit.state.origClass)
+      || JSON.stringify(EntityEdit.state.editingOut) !== JSON.stringify(EntityEdit.state.origOut);
+  },
+
+  // --- Render ---
+  render() {
+    const s = EntityEdit.state;
+    if (!s) return;
+    const c = s.editingClass;
+    const otherClassNames = s.allClasses.filter(x => x.id !== c.id).map(x => x.name).sort();
+    const enumsList = s.allEnums || [];
+
+    // Parent candidates: cross-layer (M1 can inherit from M1 OR M2). Sort by layer then label.
+    const parentOptions = (s.parentCandidates || [])
+      .slice()
+      .sort((a, b) => {
+        // M2 first (more abstract, conceptually "upstream")
+        if (a._layer !== b._layer) return a._layer === 'm2' ? -1 : 1;
+        return (a.label || a.name).localeCompare(b.label || b.name, 'zh-Hans');
+      });
+
+    const ownAttrs = (c.attributes || []).filter(a => !a.is_inherited);
+    const inhAttrs = (c.attributes || []).filter(a => a.is_inherited);
+
+    const area = document.getElementById('ee-form-area');
+    area.innerHTML = `
+      <!-- Basic info -->
+      <section class="ee-section">
+        <div class="ee-section-header">
+          <div class="ee-section-title">基本信息</div>
+        </div>
+        <div class="ee-basic-grid">
+          <div class="ee-field">
+            <label>名称 (English) <span class="ee-section-hint">改名会自动级联</span></label>
+            <input type="text" data-field="name" value="${escapeAttr(c.name || '')}" placeholder="PascalCase, e.g. PumpedStorageUnit" />
+          </div>
+          <div class="ee-field">
+            <label>标签 (中文)</label>
+            <input type="text" data-field="label" value="${escapeAttr(c.label || '')}" placeholder="中文名称" />
+          </div>
+          <div class="ee-field full-width">
+            <label>描述</label>
+            <textarea data-field="description" placeholder="类的业务含义...">${escapeHtml(c.description || '')}</textarea>
+          </div>
+          <div class="ee-field">
+            <label>父类 <span class="ee-section-hint">改父类会自动更新继承属性</span></label>
+            <select data-field="parent_class_name">
+              <option value="">(无父类)</option>
+              ${parentOptions.map(p => {
+                const prefix = p._layer === 'm2' ? '[M2] ' : '[M1] ';
+                const display = p.label && p.label !== p.name
+                  ? `${prefix}${escapeHtml(p.label)} (${escapeHtml(p.name)})`
+                  : `${prefix}${escapeHtml(p.name)}`;
+                return `<option value="${escapeAttr(p.name)}" ${c.parent_class_name === p.name ? 'selected' : ''}>${display}</option>`;
+              }).join('')}
+            </select>
+          </div>
+          <div class="ee-field-check">
+            <input type="checkbox" id="ee-is-abstract" data-field="is_abstract" ${c.is_abstract ? 'checked' : ''}>
+            <label for="ee-is-abstract">抽象类 (is_abstract)</label>
+          </div>
+        </div>
+      </section>
+
+      <!-- Attributes (editable) -->
+      <section class="ee-section">
+        <div class="ee-section-header">
+          <div class="ee-section-title">属性
+            <span class="ee-section-count">${ownAttrs.length} 自有 · ${inhAttrs.length} 继承</span>
+          </div>
+        </div>
+        ${EntityEdit._renderAttrTable(ownAttrs, enumsList, false)}
+        ${inhAttrs.length ? `
+          <div class="ee-section-hint" style="margin-top:12px">继承属性 (只读 — 需到父类修改):</div>
+          ${EntityEdit._renderAttrTable(inhAttrs, enumsList, true)}
+        ` : ''}
+        <button class="ee-add-row" id="ee-add-attr">+ 添加属性</button>
+      </section>
+
+      <!-- Outgoing associations -->
+      <section class="ee-section">
+        <div class="ee-section-header">
+          <div class="ee-section-title">出向关联 (本类 → 其他类)
+            <span class="ee-section-count">${s.editingOut.length}</span>
+          </div>
+        </div>
+        ${EntityEdit._renderAssocTable(s.editingOut, otherClassNames)}
+        <button class="ee-add-row" id="ee-add-assoc">+ 添加关联</button>
+      </section>
+
+      <!-- Incoming associations (read-only) -->
+      ${s.incoming.length ? `
+      <section class="ee-section">
+        <div class="ee-section-header">
+          <div class="ee-section-title">入向关联 (其他类 → 本类)
+            <span class="ee-section-count">${s.incoming.length} 只读</span>
+          </div>
+        </div>
+        <div class="ee-section-hint">以下关联由其他类定义。要修改请点源类名跳转过去编辑。</div>
+        <div class="ee-incoming-list">
+          ${s.incoming.map(a => `
+            <div class="ee-incoming-item">
+              <span class="ee-inc-source" data-goto="${escapeAttr(a.source?.class_name || '')}">${escapeHtml(a.source?.class_name || '?')}</span>
+              <span class="ep-arrow">→</span>
+              <span class="ee-inc-name">${escapeHtml(a.label || a.name)}</span>
+              <span class="ee-inc-type">${EntityEdit._assocTypeLabel(a.association_type)}</span>
+            </div>
+          `).join('')}
+        </div>
+      </section>` : ''}
+    `;
+
+    // Wire basic field changes
+    area.querySelectorAll('[data-field]').forEach(el => {
+      const commit = () => {
+        const field = el.dataset.field;
+        if (field === 'is_abstract') c[field] = el.checked;
+        else c[field] = el.value;
+        // Parent change has cascading effect on this class's inherited attrs —
+        // rebuild them from the new parent chain, then re-render so the
+        // "继承属性" read-only table reflects the new state.
+        if (field === 'parent_class_name') {
+          EntityEdit._rebuildInheritedAttrs();
+          EntityEdit.render();
+          return;  // render() calls _updateSummary already
+        }
+        EntityEdit._updateSummary();
+      };
+      el.addEventListener('input', commit);
+      el.addEventListener('change', commit);
+    });
+
+    // Wire attribute rows
+    EntityEdit._wireAttrRows(area);
+    // Wire assoc rows
+    EntityEdit._wireAssocRows(area);
+
+    // Add buttons
+    document.getElementById('ee-add-attr').addEventListener('click', () => {
+      c.attributes = c.attributes || [];
+      c.attributes.push({
+        id: 'new_' + Math.random().toString(36).slice(2, 10),
+        name: 'newAttribute', label: '新属性',
+        data_type: 'String',
+        multiplicity: { lower: 1, upper: 1 },
+        _isNew: true,
+      });
+      EntityEdit.render();
+      EntityEdit._updateSummary();
+    });
+    document.getElementById('ee-add-assoc').addEventListener('click', () => {
+      s.editingOut.push({
+        id: 'new_' + Math.random().toString(36).slice(2, 10),
+        name: 'newAssoc', label: '新关联',
+        association_type: 'association',
+        source: {
+          class_ref: c.id, class_name: c.name,
+          role_name: '', multiplicity: { lower: 1, upper: 1 },
+        },
+        target: {
+          class_ref: '', class_name: otherClassNames[0] || '',
+          role_name: '', multiplicity: { lower: 0, upper: -1 },
+        },
+        _isNew: true,
+      });
+      EntityEdit.render();
+      EntityEdit._updateSummary();
+    });
+
+    // Wire incoming "goto" links
+    area.querySelectorAll('[data-goto]').forEach(el => {
+      el.addEventListener('click', () => {
+        const targetName = el.dataset.goto;
+        const targetCls = s.allClasses.find(x => x.name === targetName);
+        if (!targetCls) return;
+        EntityEdit.close(false);
+        openEntityDetailPage(targetCls, s.allClasses, s.allEnums, s.origPackage.associations || [], s.layer);
+      });
+    });
+
+    EntityEdit._updateSummary();
+  },
+
+  _renderAttrTable(attrs, enumsList, readonly) {
+    if (!attrs.length) return '<div class="ee-empty-table">暂无属性</div>';
+    const enumOptions = (current) => {
+      const opts = ['<option value="">(无)</option>'];
+      for (const en of enumsList) {
+        opts.push(`<option value="${escapeAttr(en.id)}" ${en.id === current ? 'selected' : ''}>${escapeHtml(en.name)}</option>`);
+      }
+      return opts.join('');
+    };
+    const typeOptions = (current) => PRIMITIVE_TYPES.map(t =>
+      `<option value="${t}" ${t === current ? 'selected' : ''}>${t}</option>`
+    ).join('');
+
+    return `<table class="ee-table">
+      <thead><tr>
+        <th style="width:18%">名称</th>
+        <th style="width:18%">标签</th>
+        <th style="width:13%">类型</th>
+        <th style="width:10%">单位</th>
+        <th style="width:16%">枚举</th>
+        <th style="width:14%">多重性</th>
+        ${readonly ? '' : '<th style="width:5%"></th>'}
+      </tr></thead>
+      <tbody>
+        ${attrs.map(a => {
+          const rowCls = a._isNew ? 'ee-row-new' : (readonly ? 'ee-row-inherited' : '');
+          const ro = readonly ? 'readonly' : '';
+          return `<tr class="${rowCls}" data-attr-id="${escapeAttr(a.id)}">
+            <td><input class="ee-cell-input mono" data-attr-field="name" value="${escapeAttr(a.name || '')}" ${ro}></td>
+            <td><input class="ee-cell-input" data-attr-field="label" value="${escapeAttr(a.label || '')}" ${ro}></td>
+            <td>
+              <select class="ee-cell-select" data-attr-field="data_type" ${ro ? 'disabled' : ''}>${typeOptions(a.data_type || 'String')}</select>
+            </td>
+            <td><input class="ee-cell-input" data-attr-field="unit" value="${escapeAttr(a.unit || '')}" ${ro} placeholder="MW"></td>
+            <td>
+              <select class="ee-cell-select" data-attr-field="enum_ref" ${ro ? 'disabled' : ''}>${enumOptions(a.enum_ref || '')}</select>
+            </td>
+            <td>
+              <span class="ee-mult-pair">
+                <input type="number" data-attr-field="mult_lower" value="${a.multiplicity?.lower ?? 1}" ${ro} min="0" title="lower">
+                <span>..</span>
+                <input type="number" data-attr-field="mult_upper" value="${a.multiplicity?.upper ?? 1}" ${ro} min="-1" title="upper (-1 = *)">
+              </span>
+            </td>
+            ${readonly ? '' : `<td><button class="ee-row-delete" data-del-attr="${escapeAttr(a.id)}" title="删除">&times;</button></td>`}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+  },
+
+  _renderAssocTable(assocs, otherClassNames) {
+    if (!assocs.length) return '<div class="ee-empty-table">暂无出向关联</div>';
+    const typeOptions = (current) => ASSOC_TYPES.map(t =>
+      `<option value="${t.value}" ${t.value === current ? 'selected' : ''}>${t.label}</option>`
+    ).join('');
+    const classOptions = (current) => otherClassNames.map(n =>
+      `<option value="${escapeAttr(n)}" ${n === current ? 'selected' : ''}>${escapeHtml(n)}</option>`
+    ).join('');
+
+    return `<table class="ee-table">
+      <thead><tr>
+        <th style="width:18%">名称</th>
+        <th style="width:22%">标签</th>
+        <th style="width:12%">类型</th>
+        <th style="width:22%">目标类</th>
+        <th style="width:18%">目标多重性</th>
+        <th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        ${assocs.map(a => {
+          const rowCls = a._isNew ? 'ee-row-new' : '';
+          return `<tr class="${rowCls}" data-assoc-id="${escapeAttr(a.id)}">
+            <td><input class="ee-cell-input mono" data-assoc-field="name" value="${escapeAttr(a.name || '')}"></td>
+            <td><input class="ee-cell-input" data-assoc-field="label" value="${escapeAttr(a.label || '')}"></td>
+            <td><select class="ee-cell-select" data-assoc-field="association_type">${typeOptions(a.association_type || 'association')}</select></td>
+            <td>
+              <select class="ee-cell-select" data-assoc-field="target_class">
+                ${classOptions(a.target?.class_name || '')}
+              </select>
+            </td>
+            <td>
+              <span class="ee-mult-pair">
+                <input type="number" data-assoc-field="target_mult_lower" value="${a.target?.multiplicity?.lower ?? 0}" min="0" title="target lower">
+                <span>..</span>
+                <input type="number" data-assoc-field="target_mult_upper" value="${a.target?.multiplicity?.upper ?? -1}" min="-1" title="target upper (-1 = *)">
+              </span>
+            </td>
+            <td><button class="ee-row-delete" data-del-assoc="${escapeAttr(a.id)}" title="删除">&times;</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+  },
+
+  _wireAttrRows(area) {
+    const s = EntityEdit.state;
+    area.querySelectorAll('tr[data-attr-id]').forEach(tr => {
+      const attrId = tr.dataset.attrId;
+      const attr = s.editingClass.attributes.find(a => a.id === attrId);
+      if (!attr) return;
+      tr.querySelectorAll('[data-attr-field]').forEach(input => {
+        input.addEventListener('input', () => {
+          const f = input.dataset.attrField;
+          if (f === 'mult_lower')      attr.multiplicity.lower = parseInt(input.value) || 0;
+          else if (f === 'mult_upper') attr.multiplicity.upper = parseInt(input.value);
+          else                          attr[f] = input.value;
+          if (attr.data_type !== 'Enum') attr.enum_ref = '';
+          EntityEdit._updateSummary();
+        });
+      });
+    });
+    area.querySelectorAll('[data-del-attr]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.delAttr;
+        const attr = s.editingClass.attributes.find(a => a.id === id);
+        if (!attr._isNew) {
+          const ok = await showDialog({
+            type: 'danger',
+            title: '删除属性?',
+            message: `确认删除属性「${attr.name}」?\n此修改需点击"预览变更"确认后才会持久化。`,
+            okText: '删除', danger: true,
+          });
+          if (!ok) return;
+        }
+        s.editingClass.attributes = s.editingClass.attributes.filter(a => a.id !== id);
+        EntityEdit.render();
+        EntityEdit._updateSummary();
+      });
+    });
+  },
+
+  _wireAssocRows(area) {
+    const s = EntityEdit.state;
+    area.querySelectorAll('tr[data-assoc-id]').forEach(tr => {
+      const aid = tr.dataset.assocId;
+      const assoc = s.editingOut.find(a => a.id === aid);
+      if (!assoc) return;
+      tr.querySelectorAll('[data-assoc-field]').forEach(input => {
+        input.addEventListener('input', () => {
+          const f = input.dataset.assocField;
+          if (f === 'target_class') {
+            assoc.target.class_name = input.value;
+            // Try to resolve class_ref
+            const found = s.allClasses.find(x => x.name === input.value);
+            if (found) assoc.target.class_ref = found.id;
+          } else if (f === 'target_mult_lower') {
+            assoc.target.multiplicity.lower = parseInt(input.value) || 0;
+          } else if (f === 'target_mult_upper') {
+            assoc.target.multiplicity.upper = parseInt(input.value);
+          } else {
+            assoc[f] = input.value;
+          }
+          EntityEdit._updateSummary();
+        });
+      });
+    });
+    area.querySelectorAll('[data-del-assoc]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.delAssoc;
+        const assoc = s.editingOut.find(a => a.id === id);
+        if (!assoc._isNew) {
+          const ok = await showDialog({
+            type: 'danger',
+            title: '删除关联?',
+            message: `确认删除关联「${assoc.label || assoc.name}」?`,
+            okText: '删除', danger: true,
+          });
+          if (!ok) return;
+        }
+        s.editingOut = s.editingOut.filter(a => a.id !== id);
+        EntityEdit.state.editingOut = s.editingOut;
+        EntityEdit.render();
+        EntityEdit._updateSummary();
+      });
+    });
+  },
+
+  _assocTypeLabel(t) {
+    return ({ composition: '组合', aggregation: '聚合' })[t] || '引用';
+  },
+
+  // --- Rebuild inherited attributes from current parent chain ---
+  // Called when user changes parent_class_name. Walks up the parent chain
+  // (cross-layer: M1 → M2 allowed), collecting each ancestor's OWN (non-inherited)
+  // attributes as is_inherited copies on this class. Skips duplicates and
+  // names already present as own attrs on this class (child overrides).
+  _rebuildInheritedAttrs() {
+    const s = EntityEdit.state;
+    if (!s) return;
+    const c = s.editingClass;
+    const byName = new Map();
+    for (const p of (s.parentCandidates || [])) byName.set(p.name, p);
+
+    // Keep only own attrs
+    const ownAttrs = (c.attributes || []).filter(a => !a.is_inherited);
+    const ownNames = new Set(ownAttrs.map(a => a.name));
+
+    // Walk parent chain
+    const collected = [];           // {name -> inherited copy}
+    const seenNames = new Set(ownNames);
+    const visited = new Set([c.name]);
+    let pname = c.parent_class_name;
+
+    while (pname && !visited.has(pname)) {
+      visited.add(pname);
+      const parent = byName.get(pname);
+      if (!parent) break;
+      for (const pa of (parent.attributes || [])) {
+        if (pa.is_inherited) continue;         // we'll reach those via chain walk
+        if (seenNames.has(pa.name)) continue;  // child (or closer ancestor) overrides
+        const copy = JSON.parse(JSON.stringify(pa));
+        copy.id = 'inh_' + Math.random().toString(36).slice(2, 10);
+        copy.is_inherited = true;
+        collected.push(copy);
+        seenNames.add(pa.name);
+      }
+      pname = parent.parent_class_name || null;
+    }
+
+    c.attributes = [...ownAttrs, ...collected];
+  },
+
+  // --- Live change summary (sidebar) ---
+  _updateSummary() {
+    const diff = EntityEdit._computeDiff();
+    const container = document.getElementById('ee-change-summary');
+    const cascadeHint = document.getElementById('ee-cascade-hint');
+    const previewBtn = document.getElementById('btn-ee-preview');
+
+    const totalChanges =
+      diff.classFields.length +
+      diff.attrAdds.length + diff.attrUpdates.length + diff.attrDeletes.length +
+      diff.assocAdds.length + diff.assocUpdates.length + diff.assocDeletes.length;
+
+    previewBtn.disabled = totalChanges === 0;
+
+    if (totalChanges === 0) {
+      container.innerHTML = '<div class="ee-change-empty">暂无修改</div>';
+      cascadeHint.innerHTML = '';
+      return;
+    }
+
+    let html = '';
+    if (diff.classFields.length) {
+      html += `<div class="ee-change-group">
+        <div class="ee-change-group-title">类字段 <span class="ch-count">${diff.classFields.length}</span></div>
+        ${diff.classFields.map(f => `<div class="ee-change-item update">修改 <code>${f.field}</code></div>`).join('')}
+      </div>`;
+    }
+    if (diff.attrAdds.length + diff.attrUpdates.length + diff.attrDeletes.length) {
+      html += `<div class="ee-change-group">
+        <div class="ee-change-group-title">属性 <span class="ch-count">${diff.attrAdds.length + diff.attrUpdates.length + diff.attrDeletes.length}</span></div>
+        ${diff.attrAdds.map(a => `<div class="ee-change-item add">+ ${escapeHtml(a.name)}</div>`).join('')}
+        ${diff.attrUpdates.map(u => `<div class="ee-change-item update">△ ${escapeHtml(u.after.name)}</div>`).join('')}
+        ${diff.attrDeletes.map(a => `<div class="ee-change-item delete">− ${escapeHtml(a.name)}</div>`).join('')}
+      </div>`;
+    }
+    if (diff.assocAdds.length + diff.assocUpdates.length + diff.assocDeletes.length) {
+      html += `<div class="ee-change-group">
+        <div class="ee-change-group-title">出向关联 <span class="ch-count">${diff.assocAdds.length + diff.assocUpdates.length + diff.assocDeletes.length}</span></div>
+        ${diff.assocAdds.map(a => `<div class="ee-change-item add">+ ${escapeHtml(a.label || a.name)}</div>`).join('')}
+        ${diff.assocUpdates.map(u => `<div class="ee-change-item update">△ ${escapeHtml(u.after.label || u.after.name)}</div>`).join('')}
+        ${diff.assocDeletes.map(a => `<div class="ee-change-item delete">− ${escapeHtml(a.label || a.name)}</div>`).join('')}
+      </div>`;
+    }
+    container.innerHTML = html;
+
+    // Cascade hint
+    const cascade = diff.cascade;
+    if (cascade.childClasses.length || cascade.classAssocs.length) {
+      cascadeHint.innerHTML = `<strong>🔗 级联影响</strong><br>
+        ${cascade.childClasses.length ? `${cascade.childClasses.length} 个子类的 <code>parent_class_name</code> 将自动同步。<br>` : ''}
+        ${cascade.classAssocs.length ? `${cascade.classAssocs.length} 个关联的类引用将自动更新。` : ''}`;
+    } else {
+      cascadeHint.innerHTML = '';
+    }
+  },
+
+  // --- Diff computation ---
+  _computeDiff() {
+    const s = EntityEdit.state;
+    if (!s) return { classFields: [], attrAdds: [], attrUpdates: [], attrDeletes: [], assocAdds: [], assocUpdates: [], assocDeletes: [], cascade: { childClasses: [], classAssocs: [] } };
+    const o = s.origClass, e = s.editingClass;
+
+    // Class-field diffs
+    const classFields = [];
+    for (const f of ['name', 'label', 'description', 'is_abstract', 'parent_class_name']) {
+      if ((o[f] || '') !== (e[f] || '')) classFields.push({ field: f, before: o[f], after: e[f] });
+    }
+
+    // Attribute diffs (by id, ignore inherited — those can't change)
+    const origAttrs = (o.attributes || []).filter(a => !a.is_inherited);
+    const editAttrs = (e.attributes || []).filter(a => !a.is_inherited);
+    const origAttrIds = new Set(origAttrs.map(a => a.id));
+    const editAttrIds = new Set(editAttrs.map(a => a.id));
+    const attrAdds = editAttrs.filter(a => !origAttrIds.has(a.id));
+    const attrDeletes = origAttrs.filter(a => !editAttrIds.has(a.id));
+    const attrUpdates = [];
+    for (const ea of editAttrs) {
+      const oa = origAttrs.find(x => x.id === ea.id);
+      if (!oa) continue;
+      if (JSON.stringify(oa) !== JSON.stringify(ea)) {
+        attrUpdates.push({ before: oa, after: ea });
+      }
+    }
+
+    // Outgoing association diffs (by id)
+    const origIds = new Set(s.origOut.map(a => a.id));
+    const editIds = new Set(s.editingOut.map(a => a.id));
+    const assocAdds = s.editingOut.filter(a => !origIds.has(a.id));
+    const assocDeletes = s.origOut.filter(a => !editIds.has(a.id));
+    const assocUpdates = [];
+    for (const ea of s.editingOut) {
+      const oa = s.origOut.find(x => x.id === ea.id);
+      if (!oa) continue;
+      if (JSON.stringify(oa) !== JSON.stringify(ea)) {
+        assocUpdates.push({ before: oa, after: ea });
+      }
+    }
+
+    // Cascade: rename detection
+    const cascade = { childClasses: [], classAssocs: [] };
+    if (o.name !== e.name && o.name) {
+      cascade.childClasses = s.origPackage.classes.filter(c =>
+        c.parent_class_name === o.name && c.id !== o.id
+      );
+      cascade.classAssocs = s.origPackage.associations.filter(a =>
+        (a.source?.class_name === o.name && a.source?.class_ref !== o.id) || // will update
+        (a.target?.class_name === o.name) ||
+        (a.source?.class_name === o.name)
+      );
+    }
+
+    return { classFields, attrAdds, attrUpdates, attrDeletes, assocAdds, assocUpdates, assocDeletes, cascade };
+  },
+
+  // --- Compute the new Package with cascades applied ---
+  _computeNewPackage() {
+    const s = EntityEdit.state;
+    const newPkg = JSON.parse(JSON.stringify(s.origPackage));
+    const origName = s.origClass.name;
+    const newName  = s.editingClass.name;
+    const renamed = origName !== newName;
+
+    // 1. Replace the class itself
+    const ci = newPkg.classes.findIndex(c => c.id === s.editingClass.id);
+    if (ci >= 0) {
+      // Strip internal _isNew markers from attrs
+      const cleaned = JSON.parse(JSON.stringify(s.editingClass));
+      for (const a of (cleaned.attributes || [])) delete a._isNew;
+      newPkg.classes[ci] = cleaned;
+    }
+
+    // 2. Cascade: rename → update other classes' parent_class_name
+    if (renamed) {
+      for (const c of newPkg.classes) {
+        if (c.id !== s.editingClass.id && c.parent_class_name === origName) {
+          c.parent_class_name = newName;
+        }
+      }
+    }
+
+    // 3. Cascade: rename → update association class_names (incoming assocs handled here)
+    if (renamed) {
+      for (const a of newPkg.associations) {
+        if (a.source?.class_name === origName && a.source?.class_ref !== s.editingClass.id) {
+          a.source.class_name = newName;  // foreign incoming ref updated
+        } else if (a.source?.class_ref === s.editingClass.id) {
+          a.source.class_name = newName;
+        }
+        if (a.target?.class_name === origName && a.target?.class_ref !== s.editingClass.id) {
+          a.target.class_name = newName;
+        } else if (a.target?.class_ref === s.editingClass.id) {
+          a.target.class_name = newName;
+        }
+      }
+    }
+
+    // 4. Replace outgoing associations (delete old set, add edited set)
+    // Any assoc whose source.class_ref == this class's id is "owned" by this class
+    const thisId = s.editingClass.id;
+    newPkg.associations = newPkg.associations.filter(a => a.source?.class_ref !== thisId);
+    // Strip markers and add
+    const cleanedOut = JSON.parse(JSON.stringify(s.editingOut));
+    for (const a of cleanedOut) {
+      delete a._isNew;
+      // Ensure source reflects final class state
+      if (a.source) {
+        a.source.class_ref = thisId;
+        a.source.class_name = newName;
+      }
+      // Resolve target class_ref if missing
+      if (a.target && !a.target.class_ref && a.target.class_name) {
+        const resolved = newPkg.classes.find(c => c.name === a.target.class_name);
+        if (resolved) a.target.class_ref = resolved.id;
+      }
+    }
+    newPkg.associations.push(...cleanedOut);
+
+    return newPkg;
+  },
+
+  // --- Preview modal ---
+  openPreview() {
+    const diff = EntityEdit._computeDiff();
+    EntityEdit._renderPreview(diff);
+    document.getElementById('entity-preview-overlay').classList.remove('hidden');
+  },
+
+  closePreview() {
+    document.getElementById('entity-preview-overlay').classList.add('hidden');
+  },
+
+  _renderPreview(diff) {
+    const s = EntityEdit.state;
+    const body = document.getElementById('ep-body');
+    const total = diff.classFields.length + diff.attrAdds.length + diff.attrUpdates.length + diff.attrDeletes.length
+      + diff.assocAdds.length + diff.assocUpdates.length + diff.assocDeletes.length;
+
+    if (total === 0) {
+      body.innerHTML = '<div class="ep-empty-preview">没有检测到变更</div>';
+      return;
+    }
+
+    let html = '';
+
+    // Cascade banner (upfront, for visibility)
+    const renamed = s.origClass.name !== s.editingClass.name;
+    if (renamed && (diff.cascade.childClasses.length || diff.cascade.classAssocs.length)) {
+      html += `<div class="ep-banner cascade-info">
+        <strong>🔗 类重命名级联:</strong>
+        <code>${escapeHtml(s.origClass.name)}</code> → <code>${escapeHtml(s.editingClass.name)}</code>
+        会自动同步 <strong>${diff.cascade.childClasses.length}</strong> 个子类的父类引用，
+        <strong>${diff.cascade.classAssocs.length}</strong> 个关联的类名引用。
+      </div>`;
+    }
+
+    // --- Class-level changes ---
+    if (diff.classFields.length) {
+      html += `<section class="ep-section">
+        <div class="ep-section-title">类字段变更 <span class="ep-count">${diff.classFields.length}</span></div>
+        <div class="ep-diff-item update">
+          <div class="ep-diff-name">${escapeHtml(s.origClass.name)}</div>
+          ${diff.classFields.map(f => `
+            <div class="ep-field-diff">
+              <span class="ep-field-name">${f.field}:</span>
+              <span class="ep-field-before">${escapeHtml(String(f.before ?? '(空)'))}</span>
+              <span class="ep-arrow">→</span>
+              <span class="ep-field-after">${escapeHtml(String(f.after ?? '(空)'))}</span>
+            </div>
+          `).join('')}
+        </div>
+      </section>`;
+    }
+
+    // --- Attribute changes ---
+    const attrTotal = diff.attrAdds.length + diff.attrUpdates.length + diff.attrDeletes.length;
+    if (attrTotal) {
+      html += `<section class="ep-section">
+        <div class="ep-section-title">属性变更 <span class="ep-count">${attrTotal}</span></div>`;
+      if (diff.attrAdds.length) {
+        html += `<div class="ep-diff-group">
+          <div class="ep-diff-label add">+ 新增 (${diff.attrAdds.length})</div>
+          ${diff.attrAdds.map(a => `
+            <div class="ep-diff-item add">
+              <div class="ep-diff-name">${escapeHtml(a.name)} — ${escapeHtml(a.label || '')}</div>
+              <div class="ep-field-diff"><span class="ep-field-name">类型:</span><span class="ep-field-after">${a.data_type}${a.unit ? ' (' + a.unit + ')' : ''}</span></div>
+              <div class="ep-field-diff"><span class="ep-field-name">多重性:</span><span class="ep-field-after">[${a.multiplicity?.lower ?? 1}..${a.multiplicity?.upper === -1 ? '*' : (a.multiplicity?.upper ?? 1)}]</span></div>
+            </div>
+          `).join('')}
+        </div>`;
+      }
+      if (diff.attrUpdates.length) {
+        html += `<div class="ep-diff-group">
+          <div class="ep-diff-label update">△ 修改 (${diff.attrUpdates.length})</div>
+          ${diff.attrUpdates.map(u => `
+            <div class="ep-diff-item update">
+              <div class="ep-diff-name">${escapeHtml(u.after.name)}${u.before.name !== u.after.name ? ` <span style="color:var(--text-dim);font-size:10px;font-weight:normal">(原: ${escapeHtml(u.before.name)})</span>` : ''}</div>
+              ${EntityEdit._attrFieldDiff(u.before, u.after)}
+            </div>
+          `).join('')}
+        </div>`;
+      }
+      if (diff.attrDeletes.length) {
+        html += `<div class="ep-diff-group">
+          <div class="ep-diff-label delete">− 删除 (${diff.attrDeletes.length})</div>
+          ${diff.attrDeletes.map(a => `
+            <div class="ep-diff-item delete">
+              <div class="ep-diff-name">${escapeHtml(a.name)} — ${escapeHtml(a.label || '')}</div>
+            </div>
+          `).join('')}
+        </div>`;
+      }
+      html += '</section>';
+    }
+
+    // --- Association changes ---
+    const assocTotal = diff.assocAdds.length + diff.assocUpdates.length + diff.assocDeletes.length;
+    if (assocTotal) {
+      html += `<section class="ep-section">
+        <div class="ep-section-title">出向关联变更 <span class="ep-count">${assocTotal}</span></div>`;
+      if (diff.assocAdds.length) {
+        html += `<div class="ep-diff-group">
+          <div class="ep-diff-label add">+ 新增 (${diff.assocAdds.length})</div>
+          ${diff.assocAdds.map(a => `
+            <div class="ep-diff-item add">
+              <div class="ep-diff-name">${escapeHtml(a.label || a.name)}
+                — <code>${escapeHtml(s.editingClass.name)}</code> ${EntityEdit._assocTypeLabel(a.association_type)} → <code>${escapeHtml(a.target?.class_name || '?')}</code>
+              </div>
+              <div class="ep-field-diff"><span class="ep-field-name">目标多重性:</span>
+                <span class="ep-field-after">[${a.target?.multiplicity?.lower ?? 0}..${a.target?.multiplicity?.upper === -1 ? '*' : a.target?.multiplicity?.upper ?? 1}]</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>`;
+      }
+      if (diff.assocUpdates.length) {
+        html += `<div class="ep-diff-group">
+          <div class="ep-diff-label update">△ 修改 (${diff.assocUpdates.length})</div>
+          ${diff.assocUpdates.map(u => `
+            <div class="ep-diff-item update">
+              <div class="ep-diff-name">${escapeHtml(u.after.label || u.after.name)}</div>
+              ${EntityEdit._assocFieldDiff(u.before, u.after)}
+            </div>
+          `).join('')}
+        </div>`;
+      }
+      if (diff.assocDeletes.length) {
+        html += `<div class="ep-diff-group">
+          <div class="ep-diff-label delete">− 删除 (${diff.assocDeletes.length})</div>
+          ${diff.assocDeletes.map(a => `
+            <div class="ep-diff-item delete">
+              <div class="ep-diff-name">${escapeHtml(a.label || a.name)} — → ${escapeHtml(a.target?.class_name || '?')}</div>
+            </div>
+          `).join('')}
+        </div>`;
+      }
+      html += '</section>';
+    }
+
+    // --- Cascaded changes (details) ---
+    if (renamed && (diff.cascade.childClasses.length || diff.cascade.classAssocs.length)) {
+      html += `<section class="ep-section">
+        <div class="ep-section-title">🔗 级联变更 <span class="ep-count">${diff.cascade.childClasses.length + diff.cascade.classAssocs.length}</span></div>
+        <div class="ep-diff-group">
+          <div class="ep-diff-label cascade">自动同步 (无需用户操作)</div>`;
+      for (const c of diff.cascade.childClasses) {
+        html += `<div class="ep-diff-item cascade">
+          <div class="ep-diff-name">${escapeHtml(c.name)} (子类)</div>
+          <div class="ep-field-diff"><span class="ep-field-name">父类:</span>
+            <span class="ep-field-before">${escapeHtml(s.origClass.name)}</span>
+            <span class="ep-arrow">→</span>
+            <span class="ep-field-after">${escapeHtml(s.editingClass.name)}</span>
+          </div>
+        </div>`;
+      }
+      for (const a of diff.cascade.classAssocs) {
+        html += `<div class="ep-diff-item cascade">
+          <div class="ep-diff-name">关联: ${escapeHtml(a.label || a.name)}</div>
+          <div class="ep-field-diff"><span class="ep-field-name">类名引用:</span>
+            <span class="ep-field-before">${escapeHtml(s.origClass.name)}</span>
+            <span class="ep-arrow">→</span>
+            <span class="ep-field-after">${escapeHtml(s.editingClass.name)}</span>
+          </div>
+        </div>`;
+      }
+      html += '</div></section>';
+    }
+
+    body.innerHTML = html;
+  },
+
+  _attrFieldDiff(before, after) {
+    const rows = [];
+    for (const f of ['name', 'label', 'data_type', 'unit', 'enum_ref', 'description']) {
+      if ((before[f] || '') !== (after[f] || '')) {
+        rows.push(`<div class="ep-field-diff">
+          <span class="ep-field-name">${f}:</span>
+          <span class="ep-field-before">${escapeHtml(String(before[f] ?? '(空)'))}</span>
+          <span class="ep-arrow">→</span>
+          <span class="ep-field-after">${escapeHtml(String(after[f] ?? '(空)'))}</span>
+        </div>`);
+      }
+    }
+    const bm = before.multiplicity, am = after.multiplicity;
+    if (bm && am && (bm.lower !== am.lower || bm.upper !== am.upper)) {
+      const fmt = m => `[${m.lower}..${m.upper === -1 ? '*' : m.upper}]`;
+      rows.push(`<div class="ep-field-diff">
+        <span class="ep-field-name">多重性:</span>
+        <span class="ep-field-before">${fmt(bm)}</span>
+        <span class="ep-arrow">→</span>
+        <span class="ep-field-after">${fmt(am)}</span>
+      </div>`);
+    }
+    return rows.join('');
+  },
+
+  _assocFieldDiff(before, after) {
+    const rows = [];
+    for (const f of ['name', 'label', 'association_type']) {
+      if ((before[f] || '') !== (after[f] || '')) {
+        rows.push(`<div class="ep-field-diff">
+          <span class="ep-field-name">${f}:</span>
+          <span class="ep-field-before">${escapeHtml(String(before[f] ?? '(空)'))}</span>
+          <span class="ep-arrow">→</span>
+          <span class="ep-field-after">${escapeHtml(String(after[f] ?? '(空)'))}</span>
+        </div>`);
+      }
+    }
+    if (before.target?.class_name !== after.target?.class_name) {
+      rows.push(`<div class="ep-field-diff">
+        <span class="ep-field-name">目标类:</span>
+        <span class="ep-field-before">${escapeHtml(before.target?.class_name || '(空)')}</span>
+        <span class="ep-arrow">→</span>
+        <span class="ep-field-after">${escapeHtml(after.target?.class_name || '(空)')}</span>
+      </div>`);
+    }
+    const bm = before.target?.multiplicity, am = after.target?.multiplicity;
+    if (bm && am && (bm.lower !== am.lower || bm.upper !== am.upper)) {
+      const fmt = m => `[${m.lower}..${m.upper === -1 ? '*' : m.upper}]`;
+      rows.push(`<div class="ep-field-diff">
+        <span class="ep-field-name">目标多重性:</span>
+        <span class="ep-field-before">${fmt(bm)}</span>
+        <span class="ep-arrow">→</span>
+        <span class="ep-field-after">${fmt(am)}</span>
+      </div>`);
+    }
+    return rows.join('');
+  },
+
+  // --- Commit ---
+  async commit() {
+    const s = EntityEdit.state;
+    if (!s) return;
+
+    // Validate: require name, check uniqueness
+    const e = s.editingClass;
+    if (!e.name || !e.name.trim()) {
+      await appAlert('类名称不能为空');
+      return;
+    }
+    // Check name clash with other classes
+    const nameClash = s.origPackage.classes.find(c => c.id !== e.id && c.name === e.name);
+    if (nameClash) {
+      await appAlert(`类名 "${e.name}" 已被其他类使用，请换一个`);
+      return;
+    }
+    // Attribute name uniqueness within this class
+    const attrNames = new Map();
+    for (const a of (e.attributes || [])) {
+      if (!a.name?.trim()) { await appAlert('存在名称为空的属性，请先修正'); return; }
+      if (attrNames.has(a.name)) { await appAlert(`属性名重复: "${a.name}"`); return; }
+      attrNames.set(a.name, true);
+    }
+
+    const commitBtn = document.getElementById('btn-ep-commit');
+    commitBtn.disabled = true;
+    commitBtn.textContent = '保存中...';
+
+    try {
+      const newPkg = EntityEdit._computeNewPackage();
+      await API.updateModel(s.modelId, { package: newPkg });
+      // Reload model into state
+      await loadModel(s.modelId, s.layer);
+      showToast('✓ 修改已保存');
+      EntityEdit.close(true);
+    } catch (e) {
+      console.error(e);
+      await appAlert('保存失败: ' + (e.message || String(e)));
+      commitBtn.disabled = false;
+      commitBtn.textContent = '✓ 确认保存';
+    }
+  },
+};
+
+// Helper: HTML-safe attribute value
+function escapeAttr(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function filterTreeEntities(container, query) {
+  if (!query) {
+    container.querySelectorAll('.tree-card').forEach(c => c.style.display = '');
+    container.querySelectorAll('.tree-cards-section').forEach(s => s.style.display = '');
+    return;
+  }
+  container.querySelectorAll('.tree-cards-section').forEach(section => {
+    const cards = section.querySelectorAll('.tree-card');
+    let anyVisible = false;
+    cards.forEach(card => {
+      const text = card.dataset.searchText || '';
+      if (text.includes(query)) {
+        card.style.display = '';
+        anyVisible = true;
+      } else {
+        card.style.display = 'none';
+      }
+    });
+    section.style.display = anyVisible ? '' : 'none';
+  });
+}
 
 function renderTree(layer) {
   const containerId = layer === 'm2' ? 'model-tree-m2' : 'model-tree-m1';
@@ -786,20 +2633,250 @@ function renderTree(layer) {
   }
 
   const pkg = model.versions[model.versions.length - 1].package;
+  const classes = pkg.classes || [];
+  const enums = pkg.enumerations || [];
+  const assocs = pkg.associations || [];
+  const totalAttrs = classes.reduce((sum, c) => sum + (c.attributes?.length || 0), 0);
+  const viewMode = _treeViewMode[layer] || 'cards';  // Default to cards now
+
   container.innerHTML = '';
+
+  // ---- Summary dashboard (always shown at top) ----
+  const dashboard = document.createElement('div');
+  dashboard.className = 'tree-dashboard';
+  const pkgLabel = layer === 'm2' ? `${pkg.label || pkg.name}` : `${pkg.label || pkg.name}`;
+  dashboard.innerHTML = `
+    <div class="tree-dashboard-header">
+      <span class="tree-badge ${layer === 'm2' ? 'badge-m2' : 'badge-m1'}">${layer.toUpperCase()}</span>
+      <span class="tree-dashboard-title">${escapeHtml(pkgLabel)}</span>
+      <span class="tree-dashboard-ver" title="当前版本">v${model.current_version || '1.0'}</span>
+    </div>
+    <div class="tree-dashboard-stats">
+      <div class="tree-stat tree-stat-classes">
+        <div class="tree-stat-num">${classes.length}</div>
+        <div class="tree-stat-label">类</div>
+      </div>
+      <div class="tree-stat tree-stat-attrs">
+        <div class="tree-stat-num">${totalAttrs}</div>
+        <div class="tree-stat-label">属性</div>
+      </div>
+      <div class="tree-stat tree-stat-assocs">
+        <div class="tree-stat-num">${assocs.length}</div>
+        <div class="tree-stat-label">关联</div>
+      </div>
+      <div class="tree-stat tree-stat-enums">
+        <div class="tree-stat-num">${enums.length}</div>
+        <div class="tree-stat-label">枚举</div>
+      </div>
+    </div>
+    <div class="tree-dashboard-search">
+      <input type="text" class="tree-search-input" id="tree-search-${layer}"
+             placeholder="🔍 搜索类名、属性、描述..." />
+    </div>
+  `;
+  container.appendChild(dashboard);
+
+  // Wire search box
+  const searchInput = dashboard.querySelector(`#tree-search-${layer}`);
+  searchInput.addEventListener('input', e => {
+    const q = e.target.value.toLowerCase().trim();
+    filterTreeEntities(container, q);
+  });
 
   const root = document.createElement('div');
   root.className = 'tree-node';
 
-  // Package header
-  const viewMode = _treeViewMode[layer] || 'hierarchy';
-  const pkgLabel = layer === 'm2' ? `M2: ${pkg.label || pkg.name}` : `M1: ${pkg.label || pkg.name}`;
-  const pkgHeader = document.createElement('div');
-  pkgHeader.className = 'tree-row pkg-header';
-  pkgHeader.innerHTML = `
-    <span class="tree-badge ${layer === 'm2' ? 'badge-m2' : 'badge-m1'}">${layer.toUpperCase()}</span>
-    <span class="tree-label" style="font-weight:600">${pkgLabel}</span>`;
-  root.appendChild(pkgHeader);
+  if (viewMode === 'cards') {
+    // Cards mode: compact browse — name + short description + attribute count
+    if (classes.length) {
+      const section = document.createElement('div');
+      section.className = 'tree-cards-section';
+      section.innerHTML = '<div class="tree-cards-section-title">🔷 类 Classes</div>';
+      const grid = document.createElement('div');
+      grid.className = 'tree-cards-grid';
+      // Pre-compute relationship indices for fast lookup per class
+      const assocsBySource = {};   // className -> [assoc]
+      const assocsByTarget = {};
+      for (const a of assocs) {
+        const s = a.source?.class_name; const t = a.target?.class_name;
+        if (s) (assocsBySource[s] = assocsBySource[s] || []).push(a);
+        if (t) (assocsByTarget[t] = assocsByTarget[t] || []).push(a);
+      }
+      const enumIdToObj = {};
+      for (const en of enums) enumIdToObj[en.id] = en;
+
+      for (const cls of classes) {
+        const attrCount = (cls.attributes || []).length;
+        const inheritedCount = (cls.attributes || []).filter(a => a.is_inherited).length;
+        const ownCount = attrCount - inheritedCount;
+        const parentHint = cls.parent_class_name ? ` extends <span class="card-parent">${escapeHtml(cls.parent_class_name)}</span>` : '';
+        const descShort = (cls.description || '').substring(0, 80) + ((cls.description || '').length > 80 ? '...' : '');
+        // Compute relationships
+        const outgoing = (assocsBySource[cls.name] || []).length;
+        const incoming = (assocsByTarget[cls.name] || []).length;
+        const totalAssocs = outgoing + incoming;
+        // Enum usage: count distinct enums referenced by this class's attributes
+        const usedEnumIds = new Set();
+        for (const a of (cls.attributes || [])) {
+          if (a.data_type === 'Enum' && a.enum_ref) usedEnumIds.add(a.enum_ref);
+        }
+        const enumCount = usedEnumIds.size;
+        // Child classes (inheritance)
+        const childCount = classes.filter(c => c.parent_class_name === cls.name).length;
+
+        const card = document.createElement('div');
+        card.className = 'tree-card tree-card-class';
+        card.dataset.searchText = `${cls.name} ${cls.label || ''} ${cls.description || ''} ${(cls.attributes || []).map(a => a.name).join(' ')}`.toLowerCase();
+        card.dataset.id = cls.id;
+        card.dataset.type = 'class';
+        card.innerHTML = `
+          <div class="tree-card-header">
+            <span class="tree-badge badge-class">C</span>
+            <span class="tree-card-name">${escapeHtml(cls.name)}</span>
+          </div>
+          <div class="tree-card-label">${escapeHtml(cls.label || '')}${parentHint}</div>
+          ${descShort ? `<div class="tree-card-desc">${escapeHtml(descShort)}</div>` : ''}
+          <div class="tree-card-stats-row">
+            <span class="card-stat card-stat-attrs" title="自有/继承属性">📋 ${ownCount}<span class="card-stat-sub">/${inheritedCount}</span></span>
+            <span class="card-stat card-stat-assocs" title="出/入关联"${totalAssocs === 0 ? ' style="opacity:0.4"' : ''}>🔗 ${outgoing}<span class="card-stat-sub">/${incoming}</span></span>
+            <span class="card-stat card-stat-enums" title="使用的枚举数"${enumCount === 0 ? ' style="opacity:0.4"' : ''}>🟨 ${enumCount}</span>
+            ${childCount ? `<span class="card-stat card-stat-children" title="子类数量">👶 ${childCount}</span>` : ''}
+          </div>
+          <div class="tree-card-footer">
+            <button class="tree-card-expand" title="展开属性列表">▼ 展开</button>
+            <button class="tree-card-detail" title="查看详情页">🔍 详情</button>
+          </div>
+          <div class="tree-card-details hidden"></div>
+        `;
+        grid.appendChild(card);
+
+        // Click card body (not buttons) → select in inspector
+        card.addEventListener('click', e => {
+          if (e.target.tagName === 'BUTTON') return;
+          document.querySelectorAll('.tree-card.selected').forEach(c => c.classList.remove('selected'));
+          card.classList.add('selected');
+          selectElement('class', cls.id, null, layer);
+        });
+
+        // Expand button → inline attribute list
+        const expandBtn = card.querySelector('.tree-card-expand');
+        const details = card.querySelector('.tree-card-details');
+        expandBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          const open = details.classList.toggle('hidden');
+          expandBtn.textContent = open ? '▼ 展开' : '▲ 收起';
+          if (!open && !details.innerHTML) {
+            let html = '<div class="card-attrs-list">';
+            for (const a of (cls.attributes || [])) {
+              const unit = a.unit ? ` (${a.unit})` : '';
+              const inh = a.is_inherited ? ' <span class="attr-inh-tag">继承</span>' : '';
+              html += `<div class="card-attr-row" data-attr-id="${a.id}">
+                <span class="attr-name">${escapeHtml(a.name)}</span>
+                <span class="attr-chinese">${escapeHtml(a.label || '')}</span>
+                <span class="attr-type">${a.data_type}${unit}</span>${inh}
+              </div>`;
+            }
+            html += '</div>';
+            details.innerHTML = html;
+            details.querySelectorAll('.card-attr-row').forEach(row => {
+              row.addEventListener('click', ev => {
+                ev.stopPropagation();
+                selectElement('attribute', row.dataset.attrId, cls.id, layer);
+              });
+            });
+          }
+        });
+
+        // Detail button → open entity detail page
+        const detailBtn = card.querySelector('.tree-card-detail');
+        detailBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          openEntityDetailPage(cls, classes, enums, assocs, layer);
+        });
+      }
+      section.appendChild(grid);
+      root.appendChild(section);
+    }
+
+    // Enumerations in cards
+    if (enums.length) {
+      const section = document.createElement('div');
+      section.className = 'tree-cards-section';
+      section.innerHTML = '<div class="tree-cards-section-title">🟨 枚举 Enumerations</div>';
+      const grid = document.createElement('div');
+      grid.className = 'tree-cards-grid';
+      for (const en of enums) {
+        const lits = en.literals || [];
+        const litPreview = lits.slice(0, 4).map(l => l.label || l.name).join(' · ');
+        const card = document.createElement('div');
+        card.className = 'tree-card tree-card-enum';
+        card.dataset.searchText = `${en.name} ${en.label || ''} ${lits.map(l => (l.name+' '+(l.label||''))).join(' ')}`.toLowerCase();
+        card.dataset.id = en.id;
+        card.dataset.type = 'enumeration';
+        card.innerHTML = `
+          <div class="tree-card-header">
+            <span class="tree-badge badge-enum">E</span>
+            <span class="tree-card-name">${escapeHtml(en.name)}</span>
+            <span class="tree-card-meta">${lits.length} 值</span>
+          </div>
+          <div class="tree-card-label">${escapeHtml(en.label || '')}</div>
+          <div class="tree-card-desc">${escapeHtml(litPreview)}${lits.length > 4 ? ` ...+${lits.length - 4}` : ''}</div>
+        `;
+        card.addEventListener('click', () => {
+          document.querySelectorAll('.tree-card.selected').forEach(c => c.classList.remove('selected'));
+          card.classList.add('selected');
+          selectElement('enumeration', en.id, null, layer);
+        });
+        grid.appendChild(card);
+      }
+      section.appendChild(grid);
+      root.appendChild(section);
+    }
+
+    // Associations in cards
+    if (assocs.length) {
+      const section = document.createElement('div');
+      section.className = 'tree-cards-section';
+      section.innerHTML = '<div class="tree-cards-section-title">🟣 关联 Associations</div>';
+      const grid = document.createElement('div');
+      grid.className = 'tree-cards-grid tree-cards-grid-compact';
+      for (const a of assocs) {
+        const srcName = a.source?.class_name || '?';
+        const tgtName = a.target?.class_name || '?';
+        const multStr = a.target?.multiplicity ? `[${a.target.multiplicity.lower}..${a.target.multiplicity.upper === -1 ? '*' : a.target.multiplicity.upper}]` : '';
+        const card = document.createElement('div');
+        card.className = 'tree-card tree-card-assoc';
+        card.dataset.searchText = `${a.name} ${a.label || ''} ${srcName} ${tgtName}`.toLowerCase();
+        card.dataset.id = a.id;
+        card.dataset.type = 'association';
+        card.innerHTML = `
+          <div class="tree-card-header">
+            <span class="tree-badge badge-assoc">R</span>
+            <span class="tree-card-name">${escapeHtml(a.name)}</span>
+            <span class="tree-card-meta">${escapeHtml(a.association_type || 'association')}</span>
+          </div>
+          <div class="tree-card-label">${escapeHtml(a.label || '')}</div>
+          <div class="tree-card-assoc-flow">
+            <span class="assoc-endpoint">${escapeHtml(srcName)}</span>
+            <span class="assoc-arrow">→</span>
+            <span class="assoc-endpoint">${escapeHtml(tgtName)}</span>
+            <span class="assoc-mult">${multStr}</span>
+          </div>
+        `;
+        card.addEventListener('click', () => {
+          document.querySelectorAll('.tree-card.selected').forEach(c => c.classList.remove('selected'));
+          card.classList.add('selected');
+          selectElement('association', a.id, null, layer);
+        });
+        grid.appendChild(card);
+      }
+      section.appendChild(grid);
+      root.appendChild(section);
+    }
+
+    container.appendChild(root);
+    return;
+  }
 
   if (viewMode === 'hierarchy') {
     // Build hierarchy by inheritance + composition
@@ -933,14 +3010,19 @@ function renderClassNode(cls, modelId, layer) {
   const row = createTreeRow('C', 'badge-class', cls.name, `${cls.label || ''}${parentInfo}`, cls.id, 'class', null, layer);
 
   addTreeAction(row, '+A', '', async () => {
-    const name = prompt('属性技术名 (camelCase):');
+    const name = await appPrompt('属性技术名 (camelCase，如 ratedCapacity):', '', '添加属性');
     if (!name) return;
-    const label = prompt('属性中文名:') || '';
-    await API.addAttribute(modelId, cls.id, { name, label });
+    const label = await appPrompt('属性中文名 (如"额定容量"):', '', '属性中文名');
+    await API.addAttribute(modelId, cls.id, { name, label: label || '' });
     await loadModel(modelId, layer);
   });
   addTreeAction(row, '\u{1F5D1}', 'del', async () => {
-    if (!confirm(`删除类 ${cls.name}？`)) return;
+    const ok = await showDialog({
+      type: 'danger', title: '删除类',
+      message: `确定删除类 "${cls.name}" 吗？\n该类的所有属性也会一起删除。`,
+      okText: '删除', cancelText: '取消', danger: true,
+    });
+    if (!ok) return;
     await API.deleteClass(modelId, cls.id);
     await loadModel(modelId, layer);
   });
@@ -1250,29 +3332,37 @@ function renderAssocInspector(container, assoc) {
 function setupEditorActions() {
   document.getElementById('btn-add-class').addEventListener('click', async () => {
     const mid = activeModelId(); if (!mid) return;
-    const name = prompt('类技术名 (PascalCase):'); if (!name) return;
-    const label = prompt('类中文名:') || '';
-    await API.addClass(mid, { name, label });
+    const name = await appPrompt('类技术名 (PascalCase，如 PumpedStorageUnit):', '', '添加新类');
+    if (!name) return;
+    const label = await appPrompt('类中文名 (如"抽水蓄能机组"):', '', '类中文名');
+    await API.addClass(mid, { name, label: label || '' });
     await loadModel(mid, state.activeTab);
   });
   document.getElementById('btn-add-enum').addEventListener('click', async () => {
     const mid = activeModelId(); if (!mid) return;
-    const name = prompt('枚举技术名 (PascalCase):'); if (!name) return;
-    const label = prompt('枚举中文名:') || '';
-    await API.addEnumeration(mid, { name, label, literals: [] });
+    const name = await appPrompt('枚举技术名 (PascalCase，如 OperatingMode):', '', '添加枚举');
+    if (!name) return;
+    const label = await appPrompt('枚举中文名 (如"运行模式"):', '', '枚举中文名');
+    await API.addEnumeration(mid, { name, label: label || '', literals: [] });
     await loadModel(mid, state.activeTab);
   });
   document.getElementById('btn-add-assoc').addEventListener('click', async () => {
     const mid = activeModelId(); if (!mid) return;
     const model = activeModel();
     const pkg = model.versions[model.versions.length - 1].package;
-    if (!pkg?.classes?.length) { alert('请先添加至少两个类'); return; }
-    const name = prompt('关联名称:'); if (!name) return;
-    const classInfo = pkg.classes.map(c => `${c.id}: ${c.name}`).join('\n');
-    const srcId = prompt(`源类ID:\n${classInfo}`);
-    const tgtId = prompt(`目标类ID:\n${classInfo}`);
-    if (!srcId || !tgtId) return;
-    await API.addAssociation(mid, { name, source_class_id: srcId, target_class_id: tgtId });
+    if (!pkg?.classes?.length) {
+      await showDialog({ type: 'warning', title: '无法添加关联', message: '请先添加至少两个类，才能创建它们之间的关联。' });
+      return;
+    }
+    const name = await appPrompt('关联名称 (如 unitContainsTurbine):', '', '添加关联');
+    if (!name) return;
+    // Use a structured dialog to pick source/target instead of unwieldy prompts
+    const classInfo = pkg.classes.map(c => `${c.label || c.name} [${c.id}]`).join('\n');
+    const srcId = await appPrompt(`请复制下面的 源类ID (完整字符串):\n\n${classInfo}`, '', '源类');
+    if (!srcId) return;
+    const tgtId = await appPrompt(`请复制下面的 目标类ID:\n\n${classInfo}`, '', '目标类');
+    if (!tgtId) return;
+    await API.addAssociation(mid, { name, source_class_id: srcId.trim(), target_class_id: tgtId.trim() });
     await loadModel(mid, state.activeTab);
   });
 }
@@ -1280,36 +3370,185 @@ function setupEditorActions() {
 // ============================================================
 // Validation / Export / Version
 // ============================================================
-async function validateModel() {
-  const mid = activeModelId(); if (!mid) return;
+function validateModel() {
+  const modal = document.getElementById('validation-modal');
+  document.getElementById('validation-title').textContent = '✓ MOF规范验证';
+  document.getElementById('validation-content').innerHTML = '';
+  document.getElementById('validation-mode').value = 'local';
+  document.getElementById('validation-llm-pickers').classList.add('hidden');
+  populateValidatePickers();
+  modal.classList.remove('hidden');
+  // Auto-run local validation on open
+  runLocalValidate();
+}
+
+function populateValidatePickers() {
+  const m1Sel = document.getElementById('val-m1-picker');
+  const m2Sel = document.getElementById('val-m2-picker');
+  const m1s = (state.allModels || []).filter(m => !m.id.startsWith('m2_'));
+  const m2s = (state.allModels || []).filter(m => m.id.startsWith('m2_'));
+
+  m1Sel.innerHTML = m1s.map(m => `<option value="${m.id}" ${m.id === state.m1ModelId ? 'selected' : ''}>${escapeHtml(m.label || m.name)} [${m.id}]</option>`).join('') || '<option value="">无M1模型</option>';
+  m2Sel.innerHTML = m2s.map(m => `<option value="${m.id}" ${m.id === state.m2ModelId ? 'selected' : ''}>${escapeHtml(m.label || m.name)} [${m.id}]</option>`).join('') || '<option value="">无M2模型（需先反推M2）</option>';
+}
+
+async function runLocalValidate() {
+  const mid = activeModelId();
+  if (!mid) { showToast('请先选择模型', 'error'); return; }
+  const content = document.getElementById('validation-content');
+  content.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim)">检查中...</div>';
   try {
     const result = await API.validateModel(mid);
-    const modal = document.getElementById('validation-modal');
-    const title = document.getElementById('validation-title');
-    const content = document.getElementById('validation-content');
-    title.textContent = result.is_valid ? '\u2705 验证通过' : '\u274C 验证失败';
     if (result.is_valid && !result.warnings?.length) {
-      content.innerHTML = '<div class="val-success">模型符合M3规范，无错误或警告。</div>';
+      content.innerHTML = `
+        <div class="val-section">
+          <div class="val-section-title val-success-h">✓ 本地M3规范检查通过</div>
+          <div class="val-section-items">模型符合M3元元模型规范，类型/多重性/引用均有效。</div>
+        </div>`;
     } else {
-      content.innerHTML = (result.errors || []).map(e => `<div class="val-item val-error"><span class="val-icon">\u274C</span>${e.message}</div>`).join('') +
-        (result.warnings || []).map(w => `<div class="val-item val-warning"><span class="val-icon">\u26A0\uFE0F</span>${w.message}</div>`).join('');
+      let html = '';
+      if ((result.errors || []).length) {
+        html += `
+          <div class="val-section">
+            <div class="val-section-title val-issue-h">❌ 错误 (${result.errors.length})</div>
+            <div class="val-section-items">
+              ${result.errors.map(e => `<div>${escapeHtml(e.message)}</div>`).join('')}
+            </div>
+          </div>`;
+      }
+      if ((result.warnings || []).length) {
+        html += `
+          <div class="val-section">
+            <div class="val-section-title val-rec-h">⚠ 警告 (${result.warnings.length})</div>
+            <div class="val-section-items">
+              ${result.warnings.map(w => `<div>${escapeHtml(w.message)}</div>`).join('')}
+            </div>
+          </div>`;
+      }
+      content.innerHTML = html;
     }
-    modal.classList.remove('hidden');
-  } catch (e) { alert('验证错误: ' + e.message); }
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--red)">验证失败: ${escapeHtml(e.message)}</div>`;
+  }
 }
+
+async function runLLMValidate() {
+  const m1Id = document.getElementById('val-m1-picker').value;
+  const m2Id = document.getElementById('val-m2-picker').value;
+  if (!m1Id || !m2Id) { showToast('请选择M1和M2模型', 'error'); return; }
+
+  const content = document.getElementById('validation-content');
+  content.innerHTML = '<div style="padding:30px;text-align:center;color:var(--text-dim)">🧠 AI正在分析MOF继承关系，约需30-60秒...</div>';
+
+  const btn = document.getElementById('btn-run-llm-validate');
+  btn.disabled = true; btn.textContent = '⏳ 分析中...';
+
+  try {
+    const r = await API.validateMOF(m1Id, m2Id);
+    const score = r.overall_score || 0;
+    const scoreClass = score >= 80 ? 'good' : (score >= 60 ? 'ok' : 'bad');
+
+    let html = `
+      <div class="val-score-card">
+        <div class="val-score-num ${scoreClass}">${score}</div>
+        <div class="val-score-summary">${escapeHtml(r.summary || '')}</div>
+      </div>`;
+
+    if ((r.compliant || []).length) {
+      html += `
+        <div class="val-section">
+          <div class="val-section-title val-success-h">✓ 合规项 (${r.compliant.length})</div>
+          <div class="val-section-items">
+            ${r.compliant.map(c => `<div>${escapeHtml(c)}</div>`).join('')}
+          </div>
+        </div>`;
+    }
+
+    if ((r.issues || []).length) {
+      html += `
+        <div class="val-section">
+          <div class="val-section-title val-issue-h">❌ 违规项 (${r.issues.length})</div>
+          <div class="val-section-items">
+            ${r.issues.map(i => `<div>
+              <span class="val-severity-${i.severity || 'medium'}">[${i.severity || 'medium'}]</span>
+              <strong>${escapeHtml(i.target || '')}</strong>: ${escapeHtml(i.problem || '')}
+            </div>`).join('')}
+          </div>
+        </div>`;
+    }
+
+    if ((r.recommendations || []).length) {
+      html += `
+        <div class="val-section">
+          <div class="val-section-title val-rec-h">💡 改进建议 (${r.recommendations.length})</div>
+          <div class="val-section-items">
+            ${r.recommendations.map(rec => `<div>
+              <strong>${escapeHtml(rec.target || '')}</strong>: ${escapeHtml(rec.suggestion || '')}
+            </div>`).join('')}
+          </div>
+        </div>`;
+    }
+
+    content.innerHTML = html;
+  } catch (e) {
+    content.innerHTML = `<div style="padding:20px;color:var(--red)">AI校验失败: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔍 开始AI校验';
+  }
+}
+
+let _exportMode = 'raw';  // 'raw' | 'review'
 
 function showExportModal() {
   document.getElementById('export-preview').classList.add('hidden');
   // Pre-select the active layer
   const layerRadio = document.querySelector(`input[name="export-layer"][value="${state.activeTab}"]`);
   if (layerRadio) layerRadio.checked = true;
+
+  // Populate the review-mode sidebar info
+  const m1 = state.m1Model;
+  const m2 = state.m2Model;
+  document.getElementById('review-m1-name').textContent =
+    m1 ? `${m1.label || m1.name} [${m1.id}]` : '(未选择)';
+  document.getElementById('review-m2-name').textContent =
+    m2 ? `${m2.label || m2.name} [${m2.id}]` : '(未生成)';
+  const m2Check = document.getElementById('review-include-m2');
+  m2Check.checked = !!m2;
+  m2Check.disabled = !m2;
+
+  const statusEl = document.getElementById('review-status');
+  statusEl.textContent = '';
+  statusEl.className = 'export-review-status';
+
+  // Default to "raw" tab
+  switchExportMode('raw');
+
   document.getElementById('export-modal').classList.remove('hidden');
 }
 
+function switchExportMode(mode) {
+  _exportMode = mode;
+  document.querySelectorAll('.export-mode-tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.mode === mode));
+  document.querySelectorAll('.export-mode-section').forEach(s =>
+    s.classList.toggle('hidden', s.dataset.mode !== mode));
+  // Update primary button text
+  const btn = document.getElementById('btn-export-confirm');
+  if (btn) btn.textContent = mode === 'review' ? '📦 生成审查包 (.zip)' : '导出';
+}
+
 async function doExport() {
+  if (_exportMode === 'review') {
+    return doExportReviewPackage();
+  }
+  return doExportRaw();
+}
+
+async function doExportRaw() {
   const layer = document.querySelector('input[name="export-layer"]:checked').value;
   const mid = layer === 'm2' ? state.m2ModelId : state.m1ModelId;
-  if (!mid) { alert(`没有${layer.toUpperCase()}模型可导出`); return; }
+  if (!mid) { await showDialog({ type: 'warning', title: '无法导出', message: `当前没有 ${layer.toUpperCase()} 模型可导出。` }); return; }
   const fmt = document.querySelector('input[name="export-fmt"]:checked').value;
   try {
     const content = await API.exportModel(mid, fmt);
@@ -1324,40 +3563,321 @@ async function doExport() {
     a.download = `${layer}_model.${ext}`;
     a.click();
     URL.revokeObjectURL(url);
-  } catch (e) { alert('导出失败: ' + e.message); }
+  } catch (e) { showDialog({ type: 'error', title: '导出失败', message: e.message }); }
+}
+
+// ==========================================================================
+// Review-package generation — with staged progress UI
+// ==========================================================================
+// Strategy: client-side asymptotic "fake" progress that stops at 95%, then
+// snaps to 100% when the real response arrives. Stage messages rotate based
+// on current progress to mirror the server's actual work (data fetch → Word →
+// Excel → diagrams → PDF → zip). Real backend timing varies 5-30 seconds;
+// the animator uses an exponential decay so the bar keeps moving either way.
+
+// Stage definitions: [thresholdPct, label, icon]. When progress crosses the
+// threshold, we mark that stage "active" and previous ones "done".
+const REVIEW_EXPORT_STAGES = [
+  { pct: 8,  label: '准备数据',      icon: '📝' },
+  { pct: 28, label: '生成 Word 报告',  icon: '📄' },
+  { pct: 48, label: '构建 Excel 意见表', icon: '📊' },
+  { pct: 68, label: '渲染关系图集',     icon: '🎨' },
+  { pct: 85, label: '生成 PDF + 打包', icon: '📦' },
+];
+
+function createReviewExportProgress() {
+  const overlay  = document.getElementById('export-progress-overlay');
+  const card     = overlay.querySelector('.export-progress-card');
+  const fillEl   = document.getElementById('export-progress-fill');
+  const pctEl    = document.getElementById('export-progress-pct');
+  const msgEl    = document.getElementById('export-progress-message');
+  const titleEl  = document.getElementById('export-progress-title');
+  const elapsedEl = document.getElementById('export-progress-elapsed');
+  const stagesEl = document.getElementById('export-progress-stages');
+
+  // Render stage chips
+  stagesEl.innerHTML = '';
+  for (const s of REVIEW_EXPORT_STAGES) {
+    const chip = document.createElement('span');
+    chip.className = 'export-progress-stage';
+    chip.dataset.threshold = s.pct;
+    chip.textContent = `${s.icon} ${s.label}`;
+    stagesEl.appendChild(chip);
+  }
+
+  const startMs = Date.now();
+  let rafId = null;
+  let done = false;
+  let lastPct = 0;
+  // Estimated total ms (rough). Actual time varies; the bar uses asymptotic
+  // curve so if real time is longer, bar just creeps more slowly toward 95%.
+  const estMs = 12000;
+
+  card.classList.remove('done', 'error');
+  titleEl.textContent = '正在生成审查包';
+
+  function updateStages(pct) {
+    const chips = stagesEl.querySelectorAll('.export-progress-stage');
+    // Find current stage = last chip whose threshold <= pct
+    let activeIdx = -1;
+    for (let i = 0; i < REVIEW_EXPORT_STAGES.length; i++) {
+      if (pct >= REVIEW_EXPORT_STAGES[i].pct) activeIdx = i;
+    }
+    chips.forEach((chip, i) => {
+      chip.classList.remove('active', 'done');
+      if (i < activeIdx) chip.classList.add('done');
+      else if (i === activeIdx) chip.classList.add('active');
+    });
+    // Update message to current stage
+    if (activeIdx >= 0) {
+      const s = REVIEW_EXPORT_STAGES[activeIdx];
+      msgEl.textContent = `${s.icon} ${s.label}...`;
+    } else {
+      msgEl.textContent = '📤 发送请求到服务器...';
+    }
+  }
+
+  function tick() {
+    if (done) return;
+    const elapsed = Date.now() - startMs;
+    // Asymptotic curve: pct = 95 * (1 - e^(-2.3 * t/est))
+    // Reaches ~80% at t=est, ~95% at t=2*est, never actually 100%
+    const t = elapsed / estMs;
+    const pct = Math.min(95, 95 * (1 - Math.exp(-2.3 * t)));
+    lastPct = pct;
+    fillEl.style.width = pct + '%';
+    pctEl.textContent = Math.floor(pct) + '%';
+    // Elapsed timer
+    const s = Math.floor(elapsed / 1000);
+    elapsedEl.textContent =
+      `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    updateStages(pct);
+    rafId = requestAnimationFrame(tick);
+  }
+
+  overlay.classList.remove('hidden');
+  tick();
+
+  return {
+    complete: () => {
+      done = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      fillEl.style.width = '100%';
+      pctEl.textContent = '100%';
+      msgEl.textContent = '✓ 完成！正在触发下载...';
+      card.classList.add('done');
+      // Mark all stages done
+      stagesEl.querySelectorAll('.export-progress-stage').forEach(c => {
+        c.classList.remove('active');
+        c.classList.add('done');
+      });
+    },
+    error: (msg) => {
+      done = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      titleEl.textContent = '生成失败';
+      msgEl.textContent = '✗ ' + (msg || '未知错误');
+      card.classList.add('error');
+    },
+    hide: () => {
+      done = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      overlay.classList.add('hidden');
+    },
+  };
+}
+
+async function doExportReviewPackage() {
+  if (!state.m1ModelId) {
+    await showDialog({ type: 'warning', title: '无法生成审查包', message: '请先选择一个 M1 模型。' });
+    return;
+  }
+  const includeM2 = document.getElementById('review-include-m2').checked;
+  const m2Id = includeM2 && state.m2ModelId ? state.m2ModelId : null;
+
+  // Close the export modal — the progress modal takes over
+  document.getElementById('export-modal').classList.add('hidden');
+
+  const statusEl = document.getElementById('review-status');
+  statusEl.textContent = '';
+  statusEl.className = 'export-review-status';
+
+  const progress = createReviewExportProgress();
+
+  try {
+    const { blob, filename } = await API.exportReviewPackage(state.m1ModelId, m2Id);
+    progress.complete();
+    // Small delay so the user visually sees the 100% before the download dialog pops
+    await new Promise(r => setTimeout(r, 400));
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    showToast(`✓ 审查包已生成 (${(blob.size / 1024).toFixed(0)} KB)`);
+    // Auto-hide progress after brief success display
+    setTimeout(() => progress.hide(), 1000);
+  } catch (e) {
+    console.error(e);
+    progress.error(e.message || String(e));
+    // Keep error visible briefly, then hide + also show dialog for the full error
+    setTimeout(() => progress.hide(), 2000);
+    showDialog({ type: 'error', title: '审查包生成失败', message: e.message || String(e) });
+  }
 }
 
 async function createVersion() {
-  const mid = activeModelId(); if (!mid) return;
-  const changelog = prompt('版本变更说明:') || '';
+  const mid = activeModelId();
+  if (!mid) return;
+  const model = activeModel();
+  if (!model) return;
+
+  // Show version modal and populate
+  document.getElementById('version-model-name').textContent = model.label || model.name;
+  document.getElementById('version-current').textContent = 'v' + (model.current_version || '1.0');
+  document.getElementById('version-changelog').value = '';
+  await renderVersionList(mid);
+  document.getElementById('version-modal').classList.remove('hidden');
+}
+
+async function renderVersionList(modelId) {
+  const listEl = document.getElementById('version-list');
   try {
-    const result = await API.createVersion(mid, changelog);
-    alert(`版本 ${result.version} 已创建`);
+    const res = await API.listVersions(modelId);
+    const current = res.current_version;
+    const versions = (res.versions || []).slice().reverse();
+    if (!versions.length) {
+      listEl.innerHTML = '<div class="empty-state" style="padding:20px">暂无版本</div>';
+      return;
+    }
+    listEl.innerHTML = '';
+    for (const v of versions) {
+      const isCurrent = v.version === current;
+      const date = v.created_at ? new Date(v.created_at).toLocaleString('zh-CN') : '';
+      const item = document.createElement('div');
+      item.className = `version-item${isCurrent ? ' current' : ''}`;
+      item.innerHTML = `
+        <span class="version-tag">v${v.version}</span>
+        <div class="version-info-col">
+          <div class="version-changelog">${escapeHtml(v.changelog || '')}</div>
+          <div class="version-date">${date}${isCurrent ? ' · 当前' : ''}</div>
+        </div>
+        <div class="version-actions">
+          ${!isCurrent ? `<button class="btn-sm ver-switch" data-ver="${v.version}">切换到此版本</button>` : ''}
+        </div>
+      `;
+      listEl.appendChild(item);
+    }
+    listEl.querySelectorAll('.ver-switch').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        {
+          const ok = await showDialog({
+            type: 'warning',
+            title: '切换版本',
+            message: `切换到 v${btn.dataset.ver} 吗？\n\n当前未保存的更改将丢失（除非先创建快照）。`,
+            okText: '确认切换', cancelText: '取消',
+          });
+          if (!ok) return;
+        }
+        try {
+          await API.switchVersion(modelId, btn.dataset.ver);
+          showToast(`已切换到 v${btn.dataset.ver}`);
+          await loadModel(modelId, state.activeTab);
+          document.getElementById('version-modal').classList.add('hidden');
+        } catch (e) { showToast('切换失败: ' + e.message, 'error'); }
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = `<div style="padding:20px;color:var(--red)">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function doCreateVersionSnapshot() {
+  const mid = activeModelId(); if (!mid) return;
+  const changelog = document.getElementById('version-changelog').value.trim();
+  const btn = document.getElementById('btn-version-create');
+  btn.disabled = true; btn.textContent = '创建中...';
+  try {
+    const result = await API.createVersion(mid, changelog || '手动创建的版本快照');
+    showToast(`✓ 新版本 v${result.version} 已创建`);
     await loadModel(mid, state.activeTab);
-  } catch (e) { alert('版本创建失败: ' + e.message); }
+    await renderVersionList(mid);
+    document.getElementById('version-current').textContent = 'v' + result.version;
+    document.getElementById('version-changelog').value = '';
+  } catch (e) {
+    showToast('创建失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '💾 创建新版本快照';
+  }
 }
 
 // ============================================================
 // Extraction Review Panel
 // ============================================================
 
-let _reviewData = null; // holds the raw extraction result for review
+let _reviewData = null;
+let _reviewTaskId = null;  // task_id for retry API
 
 function setupReviewPanel() {
-  document.getElementById('btn-review-close').addEventListener('click', closeReviewPanel);
   document.getElementById('btn-review-cancel').addEventListener('click', closeReviewPanel);
   document.getElementById('btn-review-confirm').addEventListener('click', confirmReviewImport);
   document.getElementById('btn-review-all').addEventListener('click', () => toggleAllReview(true));
   document.getElementById('btn-review-none').addEventListener('click', () => toggleAllReview(false));
+  document.getElementById('btn-retry-all').addEventListener('click', retryAllFailed);
 }
 
-function showReviewPanel(result) {
-  console.log('[Review] showReviewPanel called, result:', result ? Object.keys(result) : 'null');
+async function retryAllFailed(selectedIds = null) {
+  if (!_reviewTaskId) return;
+  const btn = document.getElementById('btn-retry-all');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '正在重试...';
 
-  if (!result || !result.package) {
-    alert('提取结果为空，请重新提取。');
-    return;
+  try {
+    const res = await API.retryFailed(_reviewTaskId, selectedIds);
+    if (res.status === 'no_failures') {
+      showToast('没有需要重试的批次', 'error');
+      btn.disabled = false;
+      btn.textContent = origText;
+      return;
+    }
+    showToast(`正在重试 ${res.count} 个批次，请稍候...`);
+
+    // Poll task until retry completes
+    let tries = 0;
+    while (tries < 300) {
+      await new Promise(r => setTimeout(r, 1500));
+      const s = await API.pollTask(_reviewTaskId);
+      if (s.status === 'completed' && s.step === 'completed') {
+        // Retry done — refresh review panel with new result
+        showReviewPanel(s.result);
+        showToast(`重试完成: ${s.message}`);
+        return;
+      }
+      if (s.status === 'failed' || s.status === 'cancelled') {
+        throw new Error(s.error || '重试失败');
+      }
+      tries++;
+    }
+    throw new Error('重试超时');
+  } catch (e) {
+    showToast('重试失败: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = origText;
   }
+}
+
+/**
+ * Update the workbench right-zone (results) with current package state.
+ * Safe to call repeatedly as extraction progresses.
+ * Preserves user's checkbox selections between calls.
+ */
+function updateWorkbenchResults(result, failedBatches = [], isFinal = false) {
+  if (!result || !result.package) return;
 
   _reviewData = result;
   const pkg = result.package;
@@ -1365,52 +3885,153 @@ function showReviewPanel(result) {
   const enums = pkg.enumerations || [];
   const assocs = pkg.associations || [];
 
-  // Pre-fill default label (user can edit)
-  const timestamp = new Date().toLocaleString('zh-CN', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
-  const defaultLabel = `M1模型 - ${timestamp}`;
-  const labelInput = document.getElementById('review-model-label');
-  if (labelInput) labelInput.value = pkg.label || defaultLabel;
+  // Stats (live-updating)
+  document.getElementById('wb-stat-classes').textContent = classes.length;
+  document.getElementById('wb-stat-attrs').textContent = result.attributes_found || 0;
+  document.getElementById('wb-stat-assocs').textContent = assocs.length;
+  document.getElementById('wb-stat-enums').textContent = enums.length;
 
-  // ---- Stats ----
-  const statsEl = document.getElementById('review-stats');
-  statsEl.innerHTML = `
-    <div class="review-stat-card stat-classes"><div class="review-stat-num">${classes.length}</div><div class="review-stat-label">类 Classes</div></div>
-    <div class="review-stat-card stat-attrs"><div class="review-stat-num">${result.attributes_found}</div><div class="review-stat-label">属性 Attributes</div></div>
-    <div class="review-stat-card stat-assocs"><div class="review-stat-num">${assocs.length}</div><div class="review-stat-label">关联 Associations</div></div>
-    <div class="review-stat-card stat-enums"><div class="review-stat-num">${enums.length}</div><div class="review-stat-label">枚举 Enumerations</div></div>
-  `;
-
-  // ---- Process summary ----
-  const procList = document.getElementById('review-process-list');
-  const totalDocs = result.total_documents || state.documents.length;
-  const totalChars = result.total_chars || 0;
-  let procHtml = `
-    <li>从 ${totalDocs} 份文档中提取（共 ${totalChars.toLocaleString()} 字符），识别出 ${classes.length} 个实体类型</li>
-    <li>各类共提取 ${result.attributes_found} 个领域属性，覆盖 String/Float/Integer/Date/Boolean/Enum 数据类型</li>
-  `;
-  if (assocs.length) {
-    const compCount = assocs.filter(a => a.association_type === 'composition').length;
-    const assocCount = assocs.length - compCount;
-    procHtml += `<li>发现 ${assocs.length} 条类间关联（${compCount} composition + ${assocCount} association/aggregation）</li>`;
+  // LIVE badge
+  const liveBadge = document.getElementById('wb-live-badge');
+  if (liveBadge) {
+    if (isFinal) {
+      liveBadge.textContent = '✓ 完成';
+      liveBadge.style.color = 'var(--green)';
+      liveBadge.style.animation = 'none';
+    } else {
+      liveBadge.textContent = '● LIVE';
+      liveBadge.style.color = 'var(--red)';
+      liveBadge.style.animation = '';
+    }
   }
-  procList.innerHTML = procHtml;
 
-  // ---- Confidence notes ----
+  // Detect M1 vs M2 pipeline from result
+  const isM2 = !!result.is_m2;
+
+  // Adapt labels for M1 vs M2 context
+  const labelField = labelInput => {
+    if (!labelInput) return;
+    if (!labelInput.value) {
+      const timestamp = new Date().toLocaleString('zh-CN', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+      const m1Src = state.m1Model?.label || 'M1';
+      labelInput.value = isM2 ? `${m1Src} 的M2元模型 - ${timestamp}` : `M1模型 - ${timestamp}`;
+    }
+  };
+  labelField(document.getElementById('wb-model-label'));
+
+  // Update header title if M2
+  const title = document.getElementById('progress-title');
+  if (title && isM2 && !title.textContent.includes('M2')) {
+    title.textContent = 'AI 推导 M2 元模型';
+  }
+
+  // Stats labels
+  const classLabel = document.querySelector('.stat-classes .wb-stat-label');
+  if (classLabel) classLabel.textContent = isM2 ? '抽象基类' : '类';
+
+  // Failed batches
+  renderFailedBatches(failedBatches);
+
+  // Notes (compact)
   const notesEl = document.getElementById('review-notes');
-  const notes = result.confidence_notes || [];
+  const notes = (result.confidence_notes || []).filter(n => n && !n.includes('失败'));
   if (notes.length) {
-    notesEl.innerHTML = '<strong>&#9888; AI注意事项:</strong> ' + notes.join(' | ');
+    notesEl.innerHTML = '<strong>⚠ AI注意:</strong> ' + notes.slice(0, 3).join(' | ') + (notes.length > 3 ? ` …+${notes.length-3}` : '');
     notesEl.classList.remove('hidden');
   } else {
     notesEl.classList.add('hidden');
   }
 
-  // ---- Selectable entity list ----
+  // Preserve user's checkbox state when re-rendering
+  const prevChecked = new Set();
+  const prevUnchecked = new Set();
+  document.querySelectorAll('.review-entity-check').forEach(cb => {
+    if (cb.checked) prevChecked.add(cb.dataset.id);
+    else prevUnchecked.add(cb.dataset.id);
+  });
+
+  // Render entities
   renderReviewEntities(classes, enums, assocs);
 
-  // Show
-  document.getElementById('review-overlay').classList.remove('hidden');
+  // Restore checkbox state (new entities default to checked)
+  document.querySelectorAll('.review-entity-check').forEach(cb => {
+    if (prevUnchecked.has(cb.dataset.id)) {
+      cb.checked = false;
+      cb.closest('.review-entity').classList.add('unchecked');
+    }
+  });
+
   updateReviewConfirmBtn();
+}
+
+// Legacy alias — now opens/updates the workbench directly
+function showReviewPanel(result, failedBatches = []) {
+  document.getElementById('progress-overlay').classList.remove('hidden');
+  updateWorkbenchResults(result, failedBatches, true);
+}
+
+function renderFailedBatches(failedBatches) {
+  const panel = document.getElementById('wb-failed-section');
+  const list = document.getElementById('review-failed-list');
+  const count = document.getElementById('failed-count');
+  const retryAllBtn = document.getElementById('btn-retry-all');
+
+  if (!panel) return;
+
+  // Filter to only un-retried or retry-failed batches
+  const retriable = (failedBatches || []).filter(fb => !fb.retried || !fb.retry_success);
+
+  if (!retriable.length) {
+    panel.classList.add('hidden');
+    return;
+  }
+
+  panel.classList.remove('hidden');
+  count.textContent = failedBatches.length;
+  retryAllBtn.disabled = false;
+  retryAllBtn.textContent = `↻ 重试全部 (${retriable.length})`;
+
+  const typeMap = {
+    // New combined (entity + attributes) batch type from the single-pass extractor
+    combined_extraction: '实体+属性',
+    // Legacy (kept for in-flight tasks from older server builds)
+    entity_discovery: '实体',
+    attribute_extraction: '属性',
+    association_extraction: '关联',
+    // M2 derivation phases
+    m2_clustering: 'M2聚类',
+    m2_synthesis: 'M2抽象',
+    m2_hierarchy: 'M2层级探测',
+    m2_consolidation: 'M2合并',
+  };
+
+  list.innerHTML = '';
+  for (const fb of failedBatches) {
+    const retriedOk = fb.retried && fb.retry_success;
+    const retriedFail = fb.retried && !fb.retry_success;
+    const cls = retriedOk ? 'retried-ok' : (retriedFail ? 'retried-fail' : '');
+    const statusIcon = retriedOk ? '✓' : (retriedFail ? '✗' : '');
+    const errorText = retriedFail ? (fb.retry_error || '') : (fb.error || '').substring(0, 80);
+
+    const item = document.createElement('div');
+    item.className = `failed-item ${cls}`;
+    item.innerHTML = `
+      <span class="failed-item-type">${typeMap[fb.type] || fb.type}</span>
+      <span class="failed-item-label">${statusIcon} ${escapeHtml(fb.label || fb.id)}</span>
+      <span class="failed-item-error" title="${escapeHtml(errorText)}">${escapeHtml(errorText)}</span>
+      ${!retriedOk ? `<button class="failed-item-retry" data-id="${fb.id}">${retriedFail ? '再试' : '重试'}</button>` : ''}
+    `;
+    list.appendChild(item);
+  }
+
+  // Wire individual retry buttons
+  list.querySelectorAll('.failed-item-retry').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = '...';
+      await retryAllFailed([btn.dataset.id]);
+    });
+  });
 }
 
 function renderReviewEntities(classes, enums, assocs) {
@@ -1522,18 +4143,41 @@ function updateReviewConfirmBtn() {
   const checked = document.querySelectorAll('.review-entity-check:checked').length;
   const total = document.querySelectorAll('.review-entity-check').length;
   const btn = document.getElementById('btn-review-confirm');
-  btn.textContent = `确认导入选中的 ${checked} 项`;
-  btn.disabled = checked === 0;
+  if (!btn) return;
+  if (total === 0) {
+    btn.textContent = '尚无可保存的内容';
+    btn.disabled = true;
+  } else {
+    const modelType = (_progMode === 'm2') ? 'M2元模型' : 'M1模型';
+    btn.textContent = `💾 保存选中的 ${checked} / ${total} 项为${modelType}`;
+    btn.disabled = checked === 0;
+  }
 }
 
-function closeReviewPanel() {
-  document.getElementById('review-overlay').classList.add('hidden');
+async function closeReviewPanel() {
+  // If extraction still running, require confirmation (only once)
+  if (_currentTaskId) {
+    const ok = await showDialog({
+      type: 'warning',
+      title: '中止并关闭',
+      message: '提取仍在进行中，关闭将丢弃所有当前成果。确定继续？',
+      okText: '中止并关闭',
+      cancelText: '继续等待',
+      danger: true,
+    });
+    if (!ok) return;
+    // Skip cancelExtraction's own confirm — use internal cancel directly
+    await cancelExtractionNoConfirm();
+  }
+  document.getElementById('progress-overlay').classList.add('hidden');
   _reviewData = null;
+  hideProgress();
 }
 
 async function confirmReviewImport() {
   if (!_reviewData) return;
   const pkg = _reviewData.package;
+  const isM2 = !!_reviewData.is_m2;
 
   // Collect selected IDs
   const selectedIds = new Set();
@@ -1553,35 +4197,55 @@ async function confirmReviewImport() {
   btn.disabled = true;
   btn.textContent = '正在保存...';
 
-  // Use user-entered label
-  const userLabel = (document.getElementById('review-model-label')?.value || '').trim();
-  const finalLabel = userLabel || filteredPkg.label || `M1_${Date.now()}`;
+  const userLabel = (document.getElementById('wb-model-label')?.value || '').trim();
+  const defaultLabel = isM2 ? `M2_${Date.now()}` : `M1_${Date.now()}`;
+  const finalLabel = userLabel || filteredPkg.label || defaultLabel;
 
   try {
-    const res = await API.saveFromExtraction({
-      package: { ...filteredPkg, label: finalLabel },
-      name: filteredPkg.name || `M1_Model`,
-      label: finalLabel,
-      source_document_ids: _reviewData.source_document_ids || [],
-    });
+    let res;
+    if (isM2) {
+      // M2 branch — use dedicated M2 save endpoint
+      res = await API.saveFromM2Review({
+        package: { ...filteredPkg, label: finalLabel },
+        name: filteredPkg.name || 'M2MetaModel',
+        label: finalLabel,
+        source_m1_id: _reviewData.source_m1_id,
+        m1_class_mappings: _reviewData.m1_class_mappings || [],
+      });
+    } else {
+      res = await API.saveFromExtraction({
+        package: { ...filteredPkg, label: finalLabel },
+        name: filteredPkg.name || `M1_Model`,
+        label: finalLabel,
+        source_document_ids: _reviewData.source_document_ids || [],
+      });
+    }
 
-    // Refresh model list FIRST so picker shows new model
+    // Refresh model list
     const listRes = await API.listModels();
     state.allModels = listRes.models;
 
-    // Then load & select the new model
-    state.m1ModelId = res.model_id;
-    await loadModel(res.model_id, 'm1');
+    // Load the new model
+    if (isM2) {
+      state.m2ModelId = res.model_id;
+      await loadModel(res.model_id, 'm2');
+      // Also reload M1 (now has parent_class_name refs)
+      if (_reviewData.source_m1_id) {
+        await loadModel(_reviewData.source_m1_id, 'm1');
+      }
+    } else {
+      state.m1ModelId = res.model_id;
+      await loadModel(res.model_id, 'm1');
+    }
     renderModelPicker();
     closeReviewPanel();
 
-    // Show success notification
-    showToast(`✓ 新M1模型已保存: ${finalLabel}`);
+    showToast(`✓ ${isM2 ? 'M2元模型' : 'M1模型'}已保存: ${finalLabel}`);
 
-    // Switch to M1 tab
-    document.querySelector('.tab[data-tab="m1"]').click();
+    // Switch to appropriate tab
+    document.querySelector(`.tab[data-tab="${isM2 ? 'm2' : 'm1'}"]`).click();
   } catch (e) {
-    alert('保存失败: ' + e.message);
+    await showDialog({ type: 'error', title: '保存失败', message: e.message });
     btn.disabled = false;
     updateReviewConfirmBtn();
   }
@@ -1632,190 +4296,1236 @@ function renderM3() {
 }
 
 // ============================================================
-// Relationship Diagram (M3 → M2 → M1)
+// Relationship Graph (interactive canvas with pan/zoom/drag)
 // ============================================================
+// Replaces the old static top-down diagram. Key features:
+//   - Infinite virtual canvas via SVG viewport transform
+//   - Circular nodes (sphere gradient) sized by attribute count
+//   - Force-directed auto-layout with parent-pull for M1→M2
+//   - Mouse: drag empty space = pan, wheel = zoom at cursor, drag node = reposition
+//   - Hover node = rich tooltip with navigable parent/children links
+//   - Click node = select + highlight neighborhood (others dim)
+//   - Double-click node = open entity detail page (reuses existing flow)
+//   - Keyboard: F fit, 0 reset zoom, L re-layout, Esc clear selection, / focus search
+//   - Filter chips to toggle M1/M2/inherit/assoc visibility
+//   - Live search to center on matching node
+//   - Minimap with draggable viewport rect
 
+const Graph = {
+  // --- state ---
+  nodes: [],              // {id, layer, data, r, x, y, vx, vy, pinned, fixed}
+  edges: [],              // {id, kind, source, target, label, ...}
+  nodesById: new Map(),
+  selectedId: null,
+  hoveredId: null,
+  visible: { m2: true, m1: true, inherit: true, assoc: true },
+  searchQuery: '',
+  transform: { x: 0, y: 0, k: 1 },      // viewport: pan + scale
+  positionsByModel: {},                   // persist layouts per m1+m2 model id pair
+  layoutMode: 'hierarchical',             // 'hierarchical' | 'force'
+  _animRAF: null,
+  _drag: null,                            // active node-drag state
+  _pan: null,                             // active pan state
+  _el: {},                                // cached DOM handles
+  _layoutRunning: false,
+};
+
+// Layer colors
+const LAYER_COLORS = {
+  m2: '#a78bfa',
+  m1: '#5b8af5',
+};
+
+// -------- Entry point (called when user switches to diagram tab) --------
 function renderDiagram() {
-  const canvas = document.getElementById('diagram-canvas');
-  const m2 = state.m2Model;
-  const m1 = state.m1Model;
+  Graph._el.root      = document.getElementById('graph-root');
+  Graph._el.svg       = document.getElementById('graph-svg');
+  Graph._el.viewport  = document.getElementById('graph-viewport');
+  Graph._el.edgesG    = document.getElementById('graph-edges');
+  Graph._el.nodesG    = document.getElementById('graph-nodes');
+  Graph._el.tooltip   = document.getElementById('graph-tooltip');
+  Graph._el.empty     = document.getElementById('graph-empty');
+  Graph._el.minimap   = document.getElementById('graph-minimap-svg');
+  Graph._el.miniNodes = document.getElementById('graph-minimap-nodes');
+  Graph._el.miniView  = document.getElementById('graph-minimap-viewport');
+  Graph._el.selinfo   = document.getElementById('graph-selinfo');
+  Graph._el.search    = document.getElementById('graph-search');
+  Graph._el.zoomPct   = document.getElementById('graph-zoom-pct');
 
-  const m2Pkg = m2?.versions?.slice(-1)[0]?.package;
-  const m1Pkg = m1?.versions?.slice(-1)[0]?.package;
+  if (!Graph._initialized) {
+    graphSetupInteractions();
+    graphSetupToolbar();
+    graphSetupKeyboard();
+    Graph._initialized = true;
+  }
+
+  graphBuildFromState();
+
+  if (Graph.nodes.length === 0) {
+    graphShowEmpty();
+    return;
+  }
+  graphHideEmpty();
+
+  // Restore saved positions or run fresh layout
+  const key = graphModelKey();
+  const saved = Graph.positionsByModel[key];
+  if (saved && saved.length === Graph.nodes.length) {
+    for (const n of Graph.nodes) {
+      const p = saved.find(s => s.id === n.id);
+      if (p) { n.x = p.x; n.y = p.y; }
+    }
+    graphRender();
+    graphFitToView(true);
+  } else {
+    graphAutoLayout();
+  }
+}
+
+// -------- Build nodes/edges from current M1 + M2 state --------
+function graphBuildFromState() {
+  const m1Pkg = state.m1Model?.versions?.slice(-1)[0]?.package;
+  const m2Pkg = state.m2Model?.versions?.slice(-1)[0]?.package;
   const m1Classes = m1Pkg?.classes || [];
   const m2Classes = m2Pkg?.classes || [];
-  const m3Concepts = m3Data?.concepts || [];
 
-  // Build mapping: M1 class → M2 parent
-  const m1ToM2 = {};
-  for (const c of m1Classes) {
-    if (c.parent_class_name) m1ToM2[c.name] = c.parent_class_name;
-  }
+  Graph.nodes = [];
+  Graph.edges = [];
+  Graph.nodesById = new Map();
 
-  // Build mapping: M2 class → M3 concepts it uses
-  // Every M2 class is a "Class" with "Attributes" and possibly "Associations"
-  const m2UsesM3 = {};
+  // --- Nodes ---
+  const nodeSize = c => {
+    const n = (c.attributes?.length || 0);
+    // Base radius 18 + 1.2px per attribute, capped at 36
+    return Math.min(36, 18 + n * 1.2);
+  };
+
   for (const c of m2Classes) {
-    const used = new Set(['Class', 'Attribute']);
-    for (const a of (c.attributes || [])) {
-      if (a.data_type === 'Enum') used.add('Enumeration');
-      used.add('DataType');
+    const node = {
+      id: 'm2:' + c.id,
+      layer: 'm2',
+      data: c,
+      r: nodeSize(c) + 4,  // M2 slightly larger for visual hierarchy
+      x: 0, y: 0, vx: 0, vy: 0,
+      pinned: false,
+      abstract: !!c.is_abstract,
+    };
+    Graph.nodes.push(node);
+    Graph.nodesById.set(node.id, node);
+  }
+  for (const c of m1Classes) {
+    const node = {
+      id: 'm1:' + c.id,
+      layer: 'm1',
+      data: c,
+      r: nodeSize(c),
+      x: 0, y: 0, vx: 0, vy: 0,
+      pinned: false,
+      abstract: !!c.is_abstract,
+    };
+    Graph.nodes.push(node);
+    Graph.nodesById.set(node.id, node);
+  }
+
+  // --- Edges: M1 → M2 inheritance (match by parent_class_name) ---
+  const m2ByName = new Map(m2Classes.map(c => ['m2:' + c.id, c]));
+  const m2NameToId = new Map(m2Classes.map(c => [c.name, 'm2:' + c.id]));
+  for (const c of m1Classes) {
+    if (c.parent_class_name) {
+      const tgtId = m2NameToId.get(c.parent_class_name);
+      if (tgtId) {
+        Graph.edges.push({
+          id: `ih:m1:${c.id}->${tgtId}`,
+          kind: 'inherit',
+          source: 'm1:' + c.id,
+          target: tgtId,
+          label: '',
+        });
+      }
     }
-    m2UsesM3[c.name] = [...used];
   }
 
-  let html = '';
-
-  // ---- M3 Layer ----
-  html += `
-    <div class="diagram-layer" id="diagram-m3">
-      <div class="diagram-layer-header">
-        <span class="diagram-layer-badge badge-m3-layer">M3</span>
-        <span class="diagram-layer-title">元元模型 — 建模语言</span>
-        <span class="diagram-layer-desc">\u{1F512} 固定层，定义可用的建模概念</span>
-      </div>
-      <div class="diagram-boxes" id="m3-boxes">`;
-  for (const c of m3Concepts) {
-    html += `
-        <div class="diagram-box" data-id="${c.id}" data-name="${c.name}" style="border-color:${c.color}40">
-          <div class="diagram-box-name" style="color:${c.color}">${c.name}</div>
-          <div class="diagram-box-label">${c.label}</div>
-        </div>`;
+  // --- Edges: M1 intra-layer associations ---
+  const m1NameToId = new Map(m1Classes.map(c => [c.name, 'm1:' + c.id]));
+  for (const a of (m1Pkg?.associations || [])) {
+    const srcName = a.source?.class_name;
+    const tgtName = a.target?.class_name;
+    if (!srcName || !tgtName) continue;
+    const srcId = m1NameToId.get(srcName);
+    const tgtId = m1NameToId.get(tgtName);
+    if (!srcId || !tgtId || srcId === tgtId) continue;
+    Graph.edges.push({
+      id: `as:m1:${a.id || srcId + '>' + tgtId}`,
+      kind: a.association_type === 'composition' ? 'composition' : 'assoc',
+      source: srcId,
+      target: tgtId,
+      label: a.label || a.name || '',
+    });
   }
-  html += `</div></div>`;
 
-  // ---- Arrow M3→M2 ----
-  html += `
-    <div class="diagram-arrow-zone">
-      <div class="diagram-arrow">
-        <div class="diagram-arrow-line"></div>
-        <span class="diagram-arrow-text">\u2193 M2 使用 M3 的概念来定义通用类型</span>
-        <div class="diagram-arrow-line"></div>
-      </div>
-    </div>`;
-
-  // ---- M2 Layer ----
-  html += `
-    <div class="diagram-layer" id="diagram-m2">
-      <div class="diagram-layer-header">
-        <span class="diagram-layer-badge badge-m2-layer">M2</span>
-        <span class="diagram-layer-title">元模型 — 通用业务对象类型</span>
-        <span class="diagram-layer-desc">${m2Classes.length ? m2Classes.length + ' 个抽象类' : '待推导'}</span>
-      </div>
-      <div class="diagram-boxes" id="m2-boxes">`;
-  if (m2Classes.length) {
-    for (const c of m2Classes) {
-      const attrs = (c.attributes || []).slice(0, 6);
-      const attrsHtml = attrs.map(a =>
-        `<div class="attr-line"><span>${a.name}</span><span class="attr-type">${a.data_type}</span></div>`
-      ).join('') + (c.attributes?.length > 6 ? `<div class="attr-line" style="opacity:0.5">...${c.attributes.length - 6} more</div>` : '');
-      html += `
-        <div class="diagram-box" data-id="${c.id}" data-name="${c.name}" style="border-color:var(--purple)">
-          <div class="diagram-box-name" style="color:var(--purple)">${c.name}</div>
-          <div class="diagram-box-label">${c.label || ''} ${c.is_abstract ? '(abstract)' : ''}</div>
-          ${attrsHtml ? `<div class="diagram-box-attrs">${attrsHtml}</div>` : ''}
-        </div>`;
-    }
-  } else {
-    html += '<div class="diagram-empty">M2元模型待推导 — 先生成M1后点击"反推M2"</div>';
+  // --- Edges: M2 intra-layer associations ---
+  for (const a of (m2Pkg?.associations || [])) {
+    const srcName = a.source?.class_name;
+    const tgtName = a.target?.class_name;
+    if (!srcName || !tgtName) continue;
+    const srcId = Graph.nodesById.has('m2:' + (a.source?.class_ref || ''))
+      ? 'm2:' + a.source.class_ref
+      : [...m2NameToId.entries()].find(([n]) => n === srcName)?.[1];
+    const tgtId = Graph.nodesById.has('m2:' + (a.target?.class_ref || ''))
+      ? 'm2:' + a.target.class_ref
+      : [...m2NameToId.entries()].find(([n]) => n === tgtName)?.[1];
+    if (!srcId || !tgtId || srcId === tgtId) continue;
+    Graph.edges.push({
+      id: `as:m2:${a.id || srcId + '>' + tgtId}`,
+      kind: 'm2-assoc',
+      source: srcId,
+      target: tgtId,
+      label: a.label || a.name || '',
+    });
   }
-  html += `</div></div>`;
-
-  // ---- Arrow M2→M1 ----
-  html += `
-    <div class="diagram-arrow-zone">
-      <div class="diagram-arrow">
-        <div class="diagram-arrow-line"></div>
-        <span class="diagram-arrow-text">\u2193 M1 继承 M2 的通用属性，新增领域专属属性</span>
-        <div class="diagram-arrow-line"></div>
-      </div>
-    </div>`;
-
-  // ---- M1 Layer ----
-  html += `
-    <div class="diagram-layer" id="diagram-m1">
-      <div class="diagram-layer-header">
-        <span class="diagram-layer-badge badge-m1-layer">M1</span>
-        <span class="diagram-layer-title">模型 — 领域特定模板</span>
-        <span class="diagram-layer-desc">${m1Classes.length ? m1Classes.length + ' 个领域类' : '待提取'}</span>
-      </div>
-      <div class="diagram-boxes" id="m1-boxes">`;
-  if (m1Classes.length) {
-    for (const c of m1Classes) {
-      const ownAttrs = (c.attributes || []).filter(a => !a.is_inherited).slice(0, 5);
-      const inherited = (c.attributes || []).filter(a => a.is_inherited).length;
-      const attrsHtml = ownAttrs.map(a =>
-        `<div class="attr-line"><span>${a.name}</span><span class="attr-type">${a.data_type}${a.unit ? ' ('+a.unit+')' : ''}</span></div>`
-      ).join('') + (inherited ? `<div class="attr-line" style="opacity:0.4;font-style:italic">+${inherited} inherited</div>` : '');
-      const parentTag = c.parent_class_name ? ` extends ${c.parent_class_name}` : '';
-      html += `
-        <div class="diagram-box" data-id="${c.id}" data-name="${c.name}" data-parent="${c.parent_class_name || ''}" style="border-color:var(--accent)">
-          <div class="diagram-box-name" style="color:var(--accent)">${c.name}</div>
-          <div class="diagram-box-label">${c.label || ''}${parentTag}</div>
-          ${attrsHtml ? `<div class="diagram-box-attrs">${attrsHtml}</div>` : ''}
-        </div>`;
-    }
-  } else {
-    html += '<div class="diagram-empty">M1模型待提取 — 上传文档后点击"AI提取M1"</div>';
-  }
-  html += `</div></div>`;
-
-  canvas.innerHTML = html;
-
-  // ---- Draw SVG connection lines ----
-  requestAnimationFrame(() => drawConnectionLines());
 }
 
-function drawConnectionLines() {
-  const canvas = document.getElementById('diagram-canvas');
-  // Remove old SVG
-  const oldSvg = canvas.querySelector('.diagram-svg');
-  if (oldSvg) oldSvg.remove();
+function graphModelKey() {
+  return `${state.m1ModelId || ''}::${state.m2ModelId || ''}`;
+}
 
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.classList.add('diagram-svg');
-  svg.style.width = canvas.scrollWidth + 'px';
-  svg.style.height = canvas.scrollHeight + 'px';
+function graphSavePositions() {
+  Graph.positionsByModel[graphModelKey()] =
+    Graph.nodes.map(n => ({ id: n.id, x: n.x, y: n.y }));
+}
 
-  const canvasRect = canvas.getBoundingClientRect();
-  const scrollLeft = canvas.scrollLeft;
-  const scrollTop = canvas.scrollTop;
+// -------- Layout dispatcher --------
+function graphAutoLayout() {
+  if (Graph.nodes.length === 0) return;
+  cancelAnimationFrame(Graph._animRAF);
+  Graph._layoutRunning = false;
+  if (Graph.layoutMode === 'hierarchical') {
+    graphHierarchicalLayout();
+  } else {
+    graphForceLayout();
+  }
+}
 
-  // Draw M1→M2 inheritance lines
-  const m1Boxes = canvas.querySelectorAll('#m1-boxes .diagram-box');
-  const m2Boxes = canvas.querySelectorAll('#m2-boxes .diagram-box');
+// -------- Hierarchical (layered tree + grid packing) --------
+// Design:
+//   Row 0: all M2 classes in a horizontal row, each allocated width proportional
+//          to its subtree's horizontal footprint (so wide subtrees don't overflow).
+//   Row 1+: each M2's direct M1 children packed in a GRID below it (not a single
+//          row — wraps at `maxColsPerRow` to keep canvas aspect reasonable).
+//   Recursive: any class that has descendants (M1→M1) drills down another layer.
+//   Orphan M1 (no parent, or parent not in graph): packed into a dense grid to the
+//          right of all M2 subtrees.
+function graphHierarchicalLayout() {
+  const H = 110;                  // horizontal slot spacing
+  const V = 150;                  // vertical layer spacing
+  const maxColsPerRow = 8;        // cap how wide any single parent's child-band gets
+  const orphanMaxCols = 14;       // orphan grid width
+  const subtreeGap = 2;           // extra horizontal gap (in slots) between sibling subtrees
 
-  for (const m1Box of m1Boxes) {
-    const parentName = m1Box.dataset.parent;
-    if (!parentName) continue;
-    const m2Box = [...m2Boxes].find(b => b.dataset.name === parentName);
-    if (!m2Box) continue;
+  // Build adjacency (parent → children) by class name, then convert to node ids
+  const nameToNode = new Map();
+  for (const n of Graph.nodes) {
+    if (n.data?.name) nameToNode.set(n.data.name, n);
+  }
 
-    const r1 = m1Box.getBoundingClientRect();
-    const r2 = m2Box.getBoundingClientRect();
+  const childMap = new Map();            // parentId → childNode[]
+  const parentId = new Map();            // childId → parentId
+  for (const n of Graph.nodes) childMap.set(n.id, []);
 
-    const x1 = r1.left - canvasRect.left + scrollLeft + r1.width / 2;
-    const y1 = r1.top - canvasRect.top + scrollTop;
-    const x2 = r2.left - canvasRect.left + scrollLeft + r2.width / 2;
-    const y2 = r2.top - canvasRect.top + scrollTop + r2.height;
+  for (const n of Graph.nodes) {
+    const pname = n.data?.parent_class_name;
+    if (!pname) continue;
+    const p = nameToNode.get(pname);
+    if (p && p.id !== n.id) {
+      childMap.get(p.id).push(n);
+      parentId.set(n.id, p.id);
+    }
+  }
 
-    const midY = (y1 + y2) / 2;
+  // Compute slot dimensions for each subtree
+  // node._slotW: horizontal width in "slots" (1 slot = H pixels)
+  // node._slotH: vertical height in layers (used mainly for orphan spacing)
+  // node._rows:  2D array — each row is an array of child nodes (for rendering pass)
+  function computeSize(node) {
+    const kids = childMap.get(node.id);
+    if (!kids.length) { node._slotW = 1; node._slotH = 1; node._rows = []; return; }
+    for (const k of kids) computeSize(k);
+
+    // Decide grid width for this parent
+    const cols = Math.min(maxColsPerRow, Math.max(1, Math.ceil(Math.sqrt(kids.length * 1.5))));
+
+    // Pack kids into rows, row-by-row
+    const rows = [];
+    for (let i = 0; i < kids.length; i += cols) rows.push(kids.slice(i, i + cols));
+
+    // Subtree width = widest row (sum of child slotW + gaps for visual separation)
+    const rowWidths = rows.map(row => {
+      let w = 0;
+      for (const k of row) w += k._slotW;
+      // small visual gap between children in a row
+      w += Math.max(0, row.length - 1) * 0.3;
+      return w;
+    });
+    const subtreeWidth = Math.max(1, ...rowWidths);
+
+    // Subtree height: 1 (for this node) + each row contributes its max child slotH
+    let subtreeHeight = 1;
+    for (const row of rows) subtreeHeight += Math.max(...row.map(k => k._slotH));
+
+    node._slotW = subtreeWidth;
+    node._slotH = subtreeHeight;
+    node._rows = rows;
+  }
+
+  // Roots for hierarchical tree: everyone without a matched parent
+  const rootNodes = Graph.nodes.filter(n => !parentId.has(n.id));
+  const m2Roots = rootNodes.filter(n => n.layer === 'm2');
+  const orphanM1All = rootNodes.filter(n => n.layer === 'm1');
+
+  for (const r of rootNodes) computeSize(r);
+
+  // Split orphans: those with descendants become independent top-level subtrees
+  // (placed alongside M2 roots); pure leaves go into a dense grid on the right.
+  const orphanWithKids = orphanM1All.filter(n => (n._rows?.length || 0) > 0);
+  const orphanLeaves   = orphanM1All.filter(n => (n._rows?.length || 0) === 0);
+
+  // Top-level subtree roots (M2 + orphan-with-kids), M2 first for visual grouping
+  const topRoots = [...m2Roots, ...orphanWithKids];
+
+  // ---- Place top-level subtrees in a single horizontal band ----
+  let totalSlots = 0;
+  for (const r of topRoots) totalSlots += r._slotW + subtreeGap;
+  totalSlots = Math.max(0, totalSlots - subtreeGap);
+
+  let cursorSlot = -totalSlots / 2;
+  for (const r of topRoots) {
+    placeSubtree(r, (cursorSlot + (r._slotW - 1) / 2) * H, 0);
+    cursorSlot += r._slotW + subtreeGap;
+  }
+
+  // ---- Place orphan leaves in a dense grid to the right ----
+  if (orphanLeaves.length) {
+    // Choose column count: aim for a pleasant aspect ratio (slightly landscape)
+    const cols = Math.min(orphanMaxCols, Math.max(1, Math.ceil(Math.sqrt(orphanLeaves.length * 1.3))));
+    const startX = topRoots.length ? (cursorSlot + 2) * H : 0;  // gap after topRoots
+    const startY = 0;
+    orphanLeaves.forEach((n, i) => {
+      const row = Math.floor(i / cols);
+      const col = i % cols;
+      n.x = startX + col * H;
+      n.y = startY + row * V;
+    });
+  }
+
+  // Unpin all nodes (user drags are reset by caller when pressing re-layout button)
+  graphSavePositions();
+  graphRender();
+  graphFitToView(true);
+
+  // ---- Recursive tree placement ----
+  function placeSubtree(node, x, y) {
+    node.x = x;
+    node.y = y;
+    const rows = node._rows;
+    if (!rows || !rows.length) return;
+
+    let rowY = y + V;
+    for (const row of rows) {
+      // Row total width in slots
+      let rowSlotW = 0;
+      for (const k of row) rowSlotW += k._slotW;
+      rowSlotW += Math.max(0, row.length - 1) * 0.3;
+
+      // Starting X so row is centered under `node`
+      let cursorX = x - (rowSlotW - 1) * H / 2;
+      for (const child of row) {
+        const childCenterX = cursorX + (child._slotW - 1) * H / 2;
+        placeSubtree(child, childCenterX, rowY);
+        cursorX += (child._slotW + 0.3) * H;
+      }
+      // Row vertical size = max child subtree height
+      const rowHeight = Math.max(...row.map(k => k._slotH));
+      rowY += rowHeight * V;
+    }
+  }
+}
+
+// -------- Force-directed layout (kept as alternative) --------
+function graphForceLayout() {
+  const n = Graph.nodes.length;
+  if (n === 0) return;
+
+  // Initial positions: M2 in inner ring, M1 in outer ring, grouped by parent.
+  // Ring radius derived from "how much arc each node needs" so we don't start
+  // 170 nodes packed on top of each other.
+  const m2Nodes = Graph.nodes.filter(x => x.layer === 'm2');
+  const m1Nodes = Graph.nodes.filter(x => x.layer === 'm1');
+
+  // avg arc per node = avg diameter + pad
+  const avgR = Graph.nodes.length
+    ? Graph.nodes.reduce((s, n) => s + n.r, 0) / Graph.nodes.length
+    : 25;
+  const arcPerNode = 2 * avgR + COLLISION_PAD;
+
+  const m2Arc = m2Nodes.length * arcPerNode;
+  const m1Arc = m1Nodes.length * arcPerNode;
+  const baseR2 = Math.max(120, m2Arc / (2 * Math.PI) * 1.2);
+  const baseR1 = Math.max(baseR2 + 2 * arcPerNode + 40, m1Arc / (2 * Math.PI) * 1.2);
+
+  m2Nodes.forEach((n2, i) => {
+    const a = (i / Math.max(m2Nodes.length, 1)) * Math.PI * 2;
+    n2.x = Math.cos(a) * baseR2;
+    n2.y = Math.sin(a) * baseR2;
+  });
+  // M1: group near parent if it has one, else distribute on outer ring
+  const m1ByParent = new Map();
+  for (const n1 of m1Nodes) {
+    const p = n1.data.parent_class_name || '_orphan';
+    if (!m1ByParent.has(p)) m1ByParent.set(p, []);
+    m1ByParent.get(p).push(n1);
+  }
+  let angleOffset = 0;
+  const totalM1 = m1Nodes.length || 1;
+  for (const [parentName, group] of m1ByParent.entries()) {
+    const parentNode = m2Nodes.find(m => m.data.name === parentName);
+    const centerA = parentNode
+      ? Math.atan2(parentNode.y, parentNode.x)
+      : (angleOffset / totalM1) * Math.PI * 2;
+    const spread = (Math.PI * 2) * (group.length / totalM1) * 0.8;
+    group.forEach((n1, i) => {
+      const a = centerA + (i - (group.length - 1) / 2) / Math.max(group.length, 1) * spread;
+      const jitter = (Math.random() - 0.5) * 30;
+      n1.x = Math.cos(a) * (baseR1 + jitter);
+      n1.y = Math.sin(a) * (baseR1 + jitter);
+      angleOffset++;
+    });
+  }
+
+  // Simulation: repulsion + edge attraction + parent pull + center gravity
+  Graph._layoutRunning = true;
+  const ITER = 280;
+  const repulse = 9000;      // node-node repulsion strength
+  const attract = 0.025;     // edge attraction (Hooke)
+  const parentPull = 0.008;  // soft pull of M1 toward M2 parent
+  const gravity = 0.002;     // soft pull toward origin (prevents drift)
+  const damping = 0.85;
+
+  // Adjacency for faster edge iteration
+  const adjM2 = new Map();  // m1 node id → parent m2 node
+  for (const e of Graph.edges) {
+    if (e.kind === 'inherit') adjM2.set(e.source, Graph.nodesById.get(e.target));
+  }
+
+  function step() {
+    // Repulsion (O(n²) — fine for <500 nodes)
+    for (let i = 0; i < n; i++) {
+      const a = Graph.nodes[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = Graph.nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { d2 = 1; dx = Math.random() - 0.5; dy = Math.random() - 0.5; }
+        const d = Math.sqrt(d2);
+        // Soft-collision: strong push if within pad; hard separation happens
+        // in graphResolveCollisions(). The soft part gives smoother dynamics.
+        const minDist = a.r + b.r + COLLISION_PAD;
+        const f = (d < minDist ? repulse * 3 : repulse) / d2;
+        const fx = (dx / d) * f;
+        const fy = (dy / d) * f;
+        a.vx += fx; a.vy += fy;
+        b.vx -= fx; b.vy -= fy;
+      }
+    }
+    // Edge attraction
+    for (const e of Graph.edges) {
+      const a = Graph.nodesById.get(e.source);
+      const b = Graph.nodesById.get(e.target);
+      if (!a || !b) continue;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const f = attract;
+      a.vx += dx * f; a.vy += dy * f;
+      b.vx -= dx * f; b.vy -= dy * f;
+    }
+    // Parent pull (M1 toward M2 parent, softer than explicit edge)
+    for (const [childId, parentNode] of adjM2) {
+      const child = Graph.nodesById.get(childId);
+      if (!child) continue;
+      child.vx += (parentNode.x - child.x) * parentPull;
+      child.vy += (parentNode.y - child.y) * parentPull;
+    }
+    // Gravity + apply velocity
+    for (const node of Graph.nodes) {
+      if (node.pinned) { node.vx = node.vy = 0; continue; }
+      node.vx -= node.x * gravity;
+      node.vy -= node.y * gravity;
+      node.vx *= damping;
+      node.vy *= damping;
+      // Velocity clamp (prevents runaway)
+      const speed = Math.sqrt(node.vx * node.vx + node.vy * node.vy);
+      if (speed > 40) { node.vx = node.vx / speed * 40; node.vy = node.vy / speed * 40; }
+      node.x += node.vx;
+      node.y += node.vy;
+    }
+    // Hard collision resolution — guarantees no overlap at rest.
+    // After force integration, any two nodes closer than r_a+r_b+pad are pushed
+    // apart along their connecting vector. Multiple passes resolve chain collisions.
+    graphResolveCollisions(2);
+  }
+
+  let iter = 0;
+  const tick = () => {
+    for (let s = 0; s < 4; s++) { step(); iter++; if (iter >= ITER) break; }
+    graphRender();
+    if (iter < ITER && Graph._layoutRunning) {
+      Graph._animRAF = requestAnimationFrame(tick);
+    } else {
+      // Final polish: additional collision-only passes to guarantee clean result
+      // (by this point forces are tiny, but leftover overlaps can still exist at
+      // densely-connected hubs). Zero velocities so next frame doesn't re-overlap.
+      for (const node of Graph.nodes) { node.vx = 0; node.vy = 0; }
+      for (let p = 0; p < 12; p++) graphResolveCollisions(2);
+      Graph._layoutRunning = false;
+      graphRender();
+      graphSavePositions();
+      graphFitToView(true);
+    }
+  };
+  cancelAnimationFrame(Graph._animRAF);
+  tick();
+}
+
+// -------- Collision pad (desired gap between node EDGES) --------
+// Increase for more breathing room; decrease for denser packing.
+// Used by both hard collision resolution AND soft repulsion threshold.
+const COLLISION_PAD = 30;
+
+// -------- Hard collision resolution (position-based, spatial hashing) --------
+// O(n) via uniform spatial hash grid:
+//   - Cell size = 2*maxR + pad  (guarantees any colliding pair is in same or
+//     one of 8 adjacent cells)
+//   - Each node probes itself + 8 neighbor cells only
+//   - Dedup pairs via string id ordering (a.id < b.id)
+// `passes` resolves chain collisions where fixing A↔B creates A↔C.
+// Pinned nodes never move; free nodes absorb the full separation.
+function graphResolveCollisions(passes = 1) {
+  const nodes = Graph.nodes;
+  const n = nodes.length;
+  if (n < 2) return;
+
+  // Size each cell to cover the largest possible collision distance.
+  // Any two nodes that collide have centers within maxR_a + maxR_b + pad of each other,
+  // so they are guaranteed to share a cell or be in adjacent (±1) cells.
+  let maxR = 0;
+  for (const node of nodes) if (node.r > maxR) maxR = node.r;
+  const cellSize = 2 * maxR + COLLISION_PAD + 1;  // +1 safety margin for float rounding
+
+  for (let pass = 0; pass < passes; pass++) {
+    // Rebuild hash each pass (positions shifted between passes).
+    // Key is "cx,cy" as a string — simple and correct for any coordinate range
+    // (bitwise tricks break because JS ^ truncates to int32).
+    const hash = new Map();
+    for (const node of nodes) {
+      const cx = Math.floor(node.x / cellSize);
+      const cy = Math.floor(node.y / cellSize);
+      const key = cx + ',' + cy;
+      let list = hash.get(key);
+      if (!list) { list = []; hash.set(key, list); }
+      list.push(node);
+    }
+
+    // For each node, probe its cell + 8 neighbors
+    for (const a of nodes) {
+      const cx = Math.floor(a.x / cellSize);
+      const cy = Math.floor(a.y / cellSize);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const key = (cx + ox) + ',' + (cy + oy);
+          const bucket = hash.get(key);
+          if (!bucket) continue;
+          for (const b of bucket) {
+            // Dedupe: process each unordered pair once
+            if (a === b || a.id > b.id) continue;
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            const minDist = a.r + b.r + COLLISION_PAD;
+            const d2 = dx * dx + dy * dy;
+            if (d2 >= minDist * minDist) continue;
+            let d = Math.sqrt(d2);
+            if (d < 0.01) {
+              dx = Math.random() - 0.5;
+              dy = Math.random() - 0.5;
+              d = Math.sqrt(dx * dx + dy * dy) || 1;
+            }
+            const overlap = minDist - d;
+            const nx = dx / d, ny = dy / d;
+            if (a.pinned && b.pinned) continue;
+            if (a.pinned) {
+              b.x += nx * overlap; b.y += ny * overlap;
+            } else if (b.pinned) {
+              a.x -= nx * overlap; a.y -= ny * overlap;
+            } else {
+              const half = overlap / 2;
+              a.x -= nx * half; a.y -= ny * half;
+              b.x += nx * half; b.y += ny * half;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// -------- Render SVG (nodes + edges) --------
+function graphRender() {
+  const edgesG = Graph._el.edgesG;
+  const nodesG = Graph._el.nodesG;
+  edgesG.innerHTML = '';
+  nodesG.innerHTML = '';
+
+  // --- edges first (behind nodes) ---
+  for (const e of Graph.edges) {
+    const a = Graph.nodesById.get(e.source);
+    const b = Graph.nodesById.get(e.target);
+    if (!a || !b) continue;
+    if (!graphEdgeVisible(e, a, b)) continue;
+
+    const { x1, y1, x2, y2 } = graphEdgeEndpoints(a, b);
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('d', `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`);
-    path.classList.add('conn-line', 'active', 'm1-line');
-    svg.appendChild(path);
+    // Curved a little for visual clarity
+    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+    const curve = Math.min(40, len * 0.12);
+    const nx = -dy / len * curve, ny = dx / len * curve;
+    path.setAttribute('d', `M ${x1} ${y1} Q ${mx + nx} ${my + ny}, ${x2} ${y2}`);
+    path.setAttribute('class', `g-edge ${e.kind}`);
+    path.dataset.edgeId = e.id;
+    const markerId = {
+      inherit: 'gm-arrow-inherit',
+      assoc: 'gm-arrow-assoc',
+      composition: 'gm-diamond',
+      'm2-assoc': 'gm-arrow-m2assoc',
+    }[e.kind];
+    if (markerId) path.setAttribute('marker-end', `url(#${markerId})`);
+    if (graphEdgeHighlighted(e)) path.classList.add('highlighted');
+    if (graphEdgeDimmed(e)) path.classList.add('dimmed');
+    edgesG.appendChild(path);
 
-    // Arrow head
-    const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
-    const ax = x2, ay = y2;
-    arrow.setAttribute('points', `${ax},${ay} ${ax-4},${ay+8} ${ax+4},${ay+8}`);
-    arrow.setAttribute('fill', 'var(--accent)');
-    arrow.setAttribute('opacity', '0.8');
-    svg.appendChild(arrow);
+    // label on edges (hover-revealed)
+    if (e.label) {
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', mx + nx);
+      t.setAttribute('y', my + ny - 4);
+      t.setAttribute('class', 'g-edge-label');
+      t.textContent = e.label;
+      edgesG.appendChild(t);
+    }
   }
 
-  canvas.insertBefore(svg, canvas.firstChild);
+  // --- nodes ---
+  for (const n of Graph.nodes) {
+    if (!graphNodeVisible(n)) continue;
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', `g-node layer-${n.layer}${n.abstract ? ' is-abstract' : ''}`);
+    g.setAttribute('transform', `translate(${n.x}, ${n.y})`);
+    g.dataset.nodeId = n.id;
+    if (n.id === Graph.selectedId) g.classList.add('selected');
+    if (graphNodeDimmed(n)) g.classList.add('dimmed');
+    if (Graph._drag && Graph._drag.node === n) g.classList.add('dragging');
+
+    // Circle
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('r', n.r);
+    circle.setAttribute('class', 'g-node-circle');
+    g.appendChild(circle);
+
+    // Attribute-count badge (top-right)
+    const attrCount = n.data.attributes?.length || 0;
+    if (attrCount > 0) {
+      const bx = n.r * 0.7, by = -n.r * 0.7;
+      const br = 9;
+      const bb = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      bb.setAttribute('cx', bx); bb.setAttribute('cy', by);
+      bb.setAttribute('r', br);
+      bb.setAttribute('class', 'g-node-badge-bg');
+      g.appendChild(bb);
+      const bt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      bt.setAttribute('x', bx); bt.setAttribute('y', by);
+      bt.setAttribute('class', 'g-node-badge-text');
+      bt.textContent = attrCount > 99 ? '99+' : String(attrCount);
+      g.appendChild(bt);
+    }
+
+    // Label below
+    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    label.setAttribute('y', n.r + 14);
+    label.setAttribute('class', 'g-node-label');
+    const txt = n.data.label || n.data.name || '';
+    label.textContent = txt.length > 18 ? txt.substring(0, 17) + '…' : txt;
+    g.appendChild(label);
+
+    nodesG.appendChild(g);
+  }
+
+  graphUpdateTransform();
+  graphRenderMinimap();
 }
+
+// -------- Viewport transform --------
+function graphUpdateTransform() {
+  const { x, y, k } = Graph.transform;
+  Graph._el.viewport.setAttribute('transform', `translate(${x},${y}) scale(${k})`);
+  if (Graph._el.zoomPct) Graph._el.zoomPct.textContent = Math.round(k * 100) + '%';
+  graphRenderMinimapViewport();
+}
+
+// -------- Edge helpers --------
+function graphEdgeEndpoints(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+  const ux = dx / d, uy = dy / d;
+  return {
+    x1: a.x + ux * a.r,
+    y1: a.y + uy * a.r,
+    x2: b.x - ux * b.r,
+    y2: b.y - uy * b.r,
+  };
+}
+
+function graphEdgeVisible(e, a, b) {
+  if (!graphNodeVisible(a) || !graphNodeVisible(b)) return false;
+  if (e.kind === 'inherit' && !Graph.visible.inherit) return false;
+  if ((e.kind === 'assoc' || e.kind === 'composition' || e.kind === 'm2-assoc') && !Graph.visible.assoc) return false;
+  return true;
+}
+
+function graphEdgeHighlighted(e) {
+  const sel = Graph.selectedId || Graph.hoveredId;
+  if (!sel) return false;
+  return e.source === sel || e.target === sel;
+}
+
+function graphEdgeDimmed(e) {
+  const sel = Graph.selectedId;
+  if (!sel) return false;
+  return !(e.source === sel || e.target === sel);
+}
+
+function graphNodeVisible(n) {
+  if (n.layer === 'm2' && !Graph.visible.m2) return false;
+  if (n.layer === 'm1' && !Graph.visible.m1) return false;
+  if (Graph.searchQuery) {
+    const q = Graph.searchQuery.toLowerCase();
+    const hay = ((n.data.name || '') + ' ' + (n.data.label || '') + ' ' + (n.data.description || '')).toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+
+function graphNodeDimmed(n) {
+  const sel = Graph.selectedId;
+  if (!sel) return false;
+  if (n.id === sel) return false;
+  // Highlight direct neighbors
+  for (const e of Graph.edges) {
+    if (e.source === sel && e.target === n.id) return false;
+    if (e.target === sel && e.source === n.id) return false;
+  }
+  return true;
+}
+
+// -------- Empty state --------
+function graphShowEmpty() {
+  const e = Graph._el.empty;
+  const m1Count = state.m1Model?.versions?.slice(-1)[0]?.package?.classes?.length || 0;
+  const m2Count = state.m2Model?.versions?.slice(-1)[0]?.package?.classes?.length || 0;
+  let content;
+  if (m1Count === 0 && m2Count === 0) {
+    content = `<div class="ge-icon">🔭</div>
+      <div class="ge-title">还没有可视化的模型</div>
+      <div class="ge-hint">先上传业务文档 → 点击「AI提取M1」生成 M1 领域模型；之后可选择反推 M2 元模型。节点和关系会在这里交互展示。</div>`;
+  } else {
+    content = `<div class="ge-icon">📦</div>
+      <div class="ge-title">模型已加载，但暂无可见节点</div>
+      <div class="ge-hint">顶部筛选条可能全部关闭，或搜索没有匹配结果。试试点击 M1/M2 芯片重新开启。</div>`;
+  }
+  e.innerHTML = content;
+  e.classList.remove('hidden');
+}
+function graphHideEmpty() { Graph._el.empty.classList.add('hidden'); }
+
+// -------- Interactions: pan / zoom / drag --------
+function graphSetupInteractions() {
+  const svg = Graph._el.svg;
+
+  // Wheel zoom (center on cursor)
+  svg.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const sx = ev.clientX - rect.left;
+    const sy = ev.clientY - rect.top;
+    const factor = ev.deltaY < 0 ? 1.12 : 1 / 1.12;
+    graphZoomAtScreen(sx, sy, factor);
+  }, { passive: false });
+
+  // Mouse-down: start pan or node drag
+  svg.addEventListener('mousedown', ev => {
+    if (ev.button !== 0) return;
+    const nodeEl = ev.target.closest('.g-node');
+    if (nodeEl) {
+      const n = Graph.nodesById.get(nodeEl.dataset.nodeId);
+      if (!n) return;
+      Graph._drag = {
+        node: n,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        origX: n.x,
+        origY: n.y,
+        moved: false,
+      };
+      n.pinned = true;
+      svg.classList.add('dragging');
+      graphHideTooltip();
+    } else {
+      // Pan
+      Graph._pan = {
+        startX: ev.clientX,
+        startY: ev.clientY,
+        origX: Graph.transform.x,
+        origY: Graph.transform.y,
+      };
+      svg.classList.add('panning');
+    }
+  });
+
+  // Mouse-move: update pan/drag
+  window.addEventListener('mousemove', ev => {
+    if (Graph._drag) {
+      const d = Graph._drag;
+      const dx = (ev.clientX - d.startX) / Graph.transform.k;
+      const dy = (ev.clientY - d.startY) / Graph.transform.k;
+      d.node.x = d.origX + dx;
+      d.node.y = d.origY + dy;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) d.moved = true;
+      // Push stationary nodes out of the way as the dragged node sweeps through.
+      // Dragged node is pinned (set on mousedown), so resolution only moves others.
+      if (d.moved) graphResolveCollisions(1);
+      graphRender();
+    } else if (Graph._pan) {
+      const p = Graph._pan;
+      Graph.transform.x = p.origX + (ev.clientX - p.startX);
+      Graph.transform.y = p.origY + (ev.clientY - p.startY);
+      graphUpdateTransform();
+    } else {
+      // Hover tooltip
+      const nodeEl = ev.target.closest?.('.g-node');
+      if (nodeEl) {
+        const id = nodeEl.dataset.nodeId;
+        if (Graph.hoveredId !== id) {
+          Graph.hoveredId = id;
+          graphShowTooltip(id, ev.clientX, ev.clientY);
+        } else {
+          graphPositionTooltip(ev.clientX, ev.clientY);
+        }
+      } else {
+        if (Graph.hoveredId) {
+          Graph.hoveredId = null;
+          graphHideTooltip();
+        }
+      }
+    }
+  });
+
+  // Mouse-up: end pan/drag + click detection
+  window.addEventListener('mouseup', ev => {
+    if (Graph._drag) {
+      const d = Graph._drag;
+      Graph._el.svg.classList.remove('dragging');
+      if (!d.moved) {
+        // Treat as click on node
+        graphSelectNode(d.node.id === Graph.selectedId ? null : d.node.id);
+      } else {
+        // If dropped onto other nodes, push them away (drag target stays put —
+        // keep it pinned temporarily so resolution pushes only neighbors, then unpin)
+        const wasPinned = d.node.pinned;
+        d.node.pinned = true;
+        for (let p = 0; p < 6; p++) graphResolveCollisions(2);
+        d.node.pinned = wasPinned;
+        graphRender();
+        graphSavePositions();
+      }
+      Graph._drag = null;
+    }
+    if (Graph._pan) {
+      Graph._el.svg.classList.remove('panning');
+      Graph._pan = null;
+    }
+  });
+
+  // Double-click: on node = open detail; on empty = fit to view
+  svg.addEventListener('dblclick', ev => {
+    const nodeEl = ev.target.closest?.('.g-node');
+    if (nodeEl) {
+      const n = Graph.nodesById.get(nodeEl.dataset.nodeId);
+      if (n) graphOpenDetail(n);
+    } else {
+      graphFitToView(false);
+    }
+  });
+
+  // Click empty space deselects
+  svg.addEventListener('click', ev => {
+    const nodeEl = ev.target.closest?.('.g-node');
+    if (!nodeEl && Graph.selectedId) {
+      graphSelectNode(null);
+    }
+  });
+
+  // Minimap: click/drag to pan view
+  const mini = Graph._el.minimap;
+  mini.addEventListener('mousedown', ev => {
+    const rect = mini.getBoundingClientRect();
+    const onMove = e2 => {
+      const mx = e2.clientX - rect.left;
+      const my = e2.clientY - rect.top;
+      graphPanToMiniCoord(mx, my);
+    };
+    onMove(ev);
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+}
+
+function graphZoomAtScreen(sx, sy, factor) {
+  const newK = Math.max(0.15, Math.min(4, Graph.transform.k * factor));
+  // Translate so point under cursor stays under cursor
+  const wx = (sx - Graph.transform.x) / Graph.transform.k;
+  const wy = (sy - Graph.transform.y) / Graph.transform.k;
+  Graph.transform.k = newK;
+  Graph.transform.x = sx - wx * newK;
+  Graph.transform.y = sy - wy * newK;
+  graphUpdateTransform();
+}
+
+function graphZoomCenter(factor) {
+  const rect = Graph._el.svg.getBoundingClientRect();
+  graphZoomAtScreen(rect.width / 2, rect.height / 2, factor);
+}
+
+function graphFitToView(instant = false) {
+  if (!Graph.nodes.length) return;
+  const visibleNodes = Graph.nodes.filter(graphNodeVisible);
+  if (!visibleNodes.length) return;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of visibleNodes) {
+    minX = Math.min(minX, n.x - n.r - 30);
+    minY = Math.min(minY, n.y - n.r - 30);
+    maxX = Math.max(maxX, n.x + n.r + 30);
+    maxY = Math.max(maxY, n.y + n.r + 30);
+  }
+  const rect = Graph._el.svg.getBoundingClientRect();
+  const bw = maxX - minX;
+  const bh = maxY - minY;
+  const k = Math.min(rect.width / bw, rect.height / bh, 1.8);
+  Graph.transform.k = Math.max(0.2, k * 0.9);
+  Graph.transform.x = rect.width / 2 - (minX + bw / 2) * Graph.transform.k;
+  Graph.transform.y = rect.height / 2 - (minY + bh / 2) * Graph.transform.k;
+  graphUpdateTransform();
+}
+
+function graphResetZoom() {
+  const rect = Graph._el.svg.getBoundingClientRect();
+  Graph.transform.k = 1;
+  Graph.transform.x = rect.width / 2;
+  Graph.transform.y = rect.height / 2;
+  graphUpdateTransform();
+}
+
+// -------- Selection / neighborhood highlight --------
+function graphSelectNode(id) {
+  Graph.selectedId = id;
+  graphRender();
+  if (id) {
+    const n = Graph.nodesById.get(id);
+    const neigh = graphNeighbors(id);
+    Graph._el.selinfo.classList.remove('hidden');
+    Graph._el.selinfo.innerHTML = `
+      <strong>${escapeHtml(n.data.name || '')}</strong>
+      · ${n.layer.toUpperCase()}
+      · ${neigh.length} 个相邻节点
+      <button class="gs-clear" id="gs-clear-btn">✕ 取消</button>`;
+    Graph._el.selinfo.querySelector('#gs-clear-btn').onclick = () => graphSelectNode(null);
+  } else {
+    Graph._el.selinfo.classList.add('hidden');
+  }
+}
+
+function graphNeighbors(id) {
+  const set = new Set();
+  for (const e of Graph.edges) {
+    if (e.source === id) set.add(e.target);
+    if (e.target === id) set.add(e.source);
+  }
+  return [...set];
+}
+
+// -------- Tooltip --------
+function graphShowTooltip(id, screenX, screenY) {
+  const n = Graph.nodesById.get(id);
+  if (!n) return;
+  const tip = Graph._el.tooltip;
+  const cls = n.data;
+
+  const attrs = cls.attributes || [];
+  const ownAttrs = attrs.filter(a => !a.is_inherited).length;
+  const inherited = attrs.length - ownAttrs;
+
+  // Parent chain
+  const parentName = cls.parent_class_name;
+  let parentHtml = '';
+  if (parentName) {
+    const parentNode = [...Graph.nodesById.values()].find(x => x.data.name === parentName);
+    parentHtml = parentNode
+      ? `<span class="gt-link gt-link-m2" data-jump="${parentNode.id}">↑ ${escapeHtml(parentName)}</span>`
+      : `<span class="gt-link">↑ ${escapeHtml(parentName)}</span>`;
+  }
+
+  // Children (classes that extend this one)
+  const children = [...Graph.nodesById.values()].filter(x =>
+    x.data.parent_class_name === cls.name);
+
+  // Associations touching this node
+  const relatedEdges = Graph.edges.filter(e => e.source === id || e.target === id);
+  const inheritEdges = relatedEdges.filter(e => e.kind === 'inherit');
+  const assocEdges = relatedEdges.filter(e => e.kind !== 'inherit');
+
+  tip.innerHTML = `
+    <div class="gt-header">
+      <span class="gt-layer-badge ${n.layer}">${n.layer.toUpperCase()}</span>
+      <span class="gt-name">${escapeHtml(cls.name || '')}</span>
+    </div>
+    ${cls.label ? `<div class="gt-label">${escapeHtml(cls.label)}${cls.is_abstract ? ' (abstract)' : ''}</div>` : ''}
+    ${cls.description ? `<div class="gt-desc">${escapeHtml(cls.description)}</div>` : ''}
+    <div class="gt-stats">
+      <div class="gt-stat"><div class="gt-stat-num">${ownAttrs}</div><div class="gt-stat-label">自有属性</div></div>
+      ${inherited > 0 ? `<div class="gt-stat"><div class="gt-stat-num">${inherited}</div><div class="gt-stat-label">继承属性</div></div>` : ''}
+      <div class="gt-stat"><div class="gt-stat-num">${assocEdges.length}</div><div class="gt-stat-label">关联</div></div>
+      <div class="gt-stat"><div class="gt-stat-num">${children.length}</div><div class="gt-stat-label">子类</div></div>
+    </div>
+    ${parentHtml ? `<div class="gt-section"><div class="gt-section-title">父类</div>${parentHtml}</div>` : ''}
+    ${children.length ? `<div class="gt-section"><div class="gt-section-title">子类 (${children.length})</div><div class="gt-list">${
+      children.slice(0, 8).map(c => `<span class="gt-list-item" data-jump="${c.id}">${escapeHtml(c.data.name)}</span>`).join('')
+    }${children.length > 8 ? `<span class="gt-list-item" style="cursor:default">+${children.length - 8}</span>` : ''}</div></div>` : ''}
+    <div class="gt-footer">
+      <span class="gt-footer-hint">双击节点查看详情</span>
+      <span class="gt-footer-action" data-open="${id}">详情 →</span>
+    </div>`;
+
+  // Wire jump links
+  tip.querySelectorAll('[data-jump]').forEach(el => {
+    el.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const targetId = el.dataset.jump;
+      graphCenterOn(targetId);
+      graphSelectNode(targetId);
+      graphHideTooltip();
+    });
+  });
+  tip.querySelectorAll('[data-open]').forEach(el => {
+    el.addEventListener('click', ev => {
+      ev.stopPropagation();
+      graphOpenDetail(Graph.nodesById.get(el.dataset.open));
+    });
+  });
+
+  tip.classList.remove('hidden');
+  graphPositionTooltip(screenX, screenY);
+}
+
+function graphPositionTooltip(x, y) {
+  const tip = Graph._el.tooltip;
+  const rect = Graph._el.root.getBoundingClientRect();
+  const tipW = tip.offsetWidth;
+  const tipH = tip.offsetHeight;
+  let px = x - rect.left + 16;
+  let py = y - rect.top + 16;
+  if (px + tipW > rect.width - 10) px = x - rect.left - tipW - 16;
+  if (py + tipH > rect.height - 10) py = y - rect.top - tipH - 16;
+  if (px < 8) px = 8;
+  if (py < 8) py = 8;
+  tip.style.left = px + 'px';
+  tip.style.top  = py + 'px';
+}
+
+function graphHideTooltip() {
+  Graph._el.tooltip.classList.add('hidden');
+}
+
+function graphCenterOn(id) {
+  const n = Graph.nodesById.get(id);
+  if (!n) return;
+  const rect = Graph._el.svg.getBoundingClientRect();
+  Graph.transform.x = rect.width / 2 - n.x * Graph.transform.k;
+  Graph.transform.y = rect.height / 2 - n.y * Graph.transform.k;
+  graphUpdateTransform();
+}
+
+function graphOpenDetail(n) {
+  if (!n) return;
+  const layer = n.layer;
+  const model = layer === 'm2' ? state.m2Model : state.m1Model;
+  const pkg = model?.versions?.slice(-1)[0]?.package;
+  if (!pkg) return;
+  const cls = pkg.classes.find(c => c.id === n.data.id);
+  if (!cls) return;
+  openEntityDetailPage(cls, pkg.classes, pkg.enumerations || [], pkg.associations || [], layer);
+}
+
+// -------- Toolbar --------
+function graphSetupToolbar() {
+  document.getElementById('btn-graph-layout').addEventListener('click', () => {
+    // Unpin all, clear cached positions for this model, then re-layout from scratch
+    for (const n of Graph.nodes) n.pinned = false;
+    delete Graph.positionsByModel[graphModelKey()];
+    graphAutoLayout();
+  });
+
+  // Layout mode toggle buttons
+  document.querySelectorAll('.graph-layout-mode').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.mode;
+      if (Graph.layoutMode === mode) return;
+      Graph.layoutMode = mode;
+      document.querySelectorAll('.graph-layout-mode').forEach(b =>
+        b.classList.toggle('active', b.dataset.mode === mode));
+      // Clear cache and re-layout
+      for (const n of Graph.nodes) n.pinned = false;
+      delete Graph.positionsByModel[graphModelKey()];
+      graphAutoLayout();
+    });
+  });
+  document.getElementById('btn-graph-fit').addEventListener('click', () => graphFitToView(false));
+  document.getElementById('btn-graph-reset').addEventListener('click', () => graphResetZoom());
+  document.getElementById('btn-graph-zoom-in').addEventListener('click', () => graphZoomCenter(1.2));
+  document.getElementById('btn-graph-zoom-out').addEventListener('click', () => graphZoomCenter(1 / 1.2));
+
+  Graph._el.search.addEventListener('input', ev => {
+    Graph.searchQuery = ev.target.value.trim();
+    graphRender();
+  });
+  Graph._el.search.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') {
+      const match = Graph.nodes.find(graphNodeVisible);
+      if (match) graphCenterOn(match.id);
+    } else if (ev.key === 'Escape') {
+      ev.target.value = '';
+      Graph.searchQuery = '';
+      graphRender();
+    }
+  });
+
+  document.querySelectorAll('.graph-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const k = chip.dataset.layer || chip.dataset.edge;
+      Graph.visible[k] = !Graph.visible[k];
+      chip.classList.toggle('active', Graph.visible[k]);
+      graphRender();
+    });
+  });
+}
+
+// -------- Keyboard shortcuts --------
+function graphSetupKeyboard() {
+  document.addEventListener('keydown', ev => {
+    // Only when diagram tab is active and no input is focused
+    const diagramActive = document.querySelector('#diagram-view.active, #diagram-view.tab-content.active');
+    if (!diagramActive || document.activeElement?.tagName === 'INPUT') return;
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+
+    switch (ev.key.toLowerCase()) {
+      case 'f':  ev.preventDefault(); graphFitToView(false); break;
+      case '0':  ev.preventDefault(); graphResetZoom(); break;
+      case 'l':  ev.preventDefault(); for (const n of Graph.nodes) n.pinned = false; graphAutoLayout(); break;
+      case '/':  ev.preventDefault(); Graph._el.search?.focus(); break;
+      case 'escape': ev.preventDefault(); graphSelectNode(null); break;
+    }
+  });
+}
+
+// -------- Minimap --------
+function graphRenderMinimap() {
+  const mini = Graph._el.minimap;
+  const miniNodes = Graph._el.miniNodes;
+  miniNodes.innerHTML = '';
+  if (!Graph.nodes.length) return;
+
+  // Compute bounds of all nodes
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of Graph.nodes) {
+    minX = Math.min(minX, n.x - n.r); minY = Math.min(minY, n.y - n.r);
+    maxX = Math.max(maxX, n.x + n.r); maxY = Math.max(maxY, n.y + n.r);
+  }
+  const pad = 20;
+  minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+  const bw = Math.max(1, maxX - minX);
+  const bh = Math.max(1, maxY - minY);
+  const miniRect = mini.getBoundingClientRect();
+  const scale = Math.min(miniRect.width / bw, miniRect.height / bh);
+  const offsetX = (miniRect.width - bw * scale) / 2 - minX * scale;
+  const offsetY = (miniRect.height - bh * scale) / 2 - minY * scale;
+
+  // Store for minimap interactions
+  Graph._miniGeom = { scale, offsetX, offsetY, minX, minY, bw, bh };
+
+  for (const n of Graph.nodes) {
+    if (!graphNodeVisible(n)) continue;
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('cx', n.x * scale + offsetX);
+    c.setAttribute('cy', n.y * scale + offsetY);
+    c.setAttribute('r', Math.max(1.5, n.r * scale));
+    c.setAttribute('fill', LAYER_COLORS[n.layer]);
+    c.setAttribute('opacity', '0.7');
+    c.setAttribute('class', 'g-mini-node');
+    miniNodes.appendChild(c);
+  }
+  graphRenderMinimapViewport();
+}
+
+function graphRenderMinimapViewport() {
+  if (!Graph._miniGeom) return;
+  const { scale, offsetX, offsetY } = Graph._miniGeom;
+  const svgRect = Graph._el.svg.getBoundingClientRect();
+  // World-space visible region = inverse of current transform applied to (0,0) and (w,h)
+  const k = Graph.transform.k;
+  const wx1 = (0 - Graph.transform.x) / k;
+  const wy1 = (0 - Graph.transform.y) / k;
+  const wx2 = (svgRect.width - Graph.transform.x) / k;
+  const wy2 = (svgRect.height - Graph.transform.y) / k;
+  const r = Graph._el.miniView;
+  r.setAttribute('x', wx1 * scale + offsetX);
+  r.setAttribute('y', wy1 * scale + offsetY);
+  r.setAttribute('width',  (wx2 - wx1) * scale);
+  r.setAttribute('height', (wy2 - wy1) * scale);
+}
+
+function graphPanToMiniCoord(mx, my) {
+  if (!Graph._miniGeom) return;
+  const { scale, offsetX, offsetY } = Graph._miniGeom;
+  // world coord under mini click
+  const wx = (mx - offsetX) / scale;
+  const wy = (my - offsetY) / scale;
+  const svgRect = Graph._el.svg.getBoundingClientRect();
+  Graph.transform.x = svgRect.width / 2 - wx * Graph.transform.k;
+  Graph.transform.y = svgRect.height / 2 - wy * Graph.transform.k;
+  graphUpdateTransform();
+}
+
+
 
 // ============================================================
 // LLM Settings
@@ -1959,6 +5669,7 @@ function editLLMProvider(p) {
   document.getElementById('llm-maxtokens').value = p.max_tokens ?? 4096;
   document.getElementById('llm-topp').value = p.top_p ?? 1;
   document.getElementById('llm-timeout').value = p.timeout ?? 120;
+  document.getElementById('llm-batchchars').value = p.batch_max_chars ?? 8000;
   document.getElementById('llm-notes').value = p.notes || '';
 
   // Trigger provider change to fill suggestions
@@ -1983,6 +5694,7 @@ function clearLLMForm() {
   document.getElementById('llm-maxtokens').value = '4096';
   document.getElementById('llm-topp').value = '1';
   document.getElementById('llm-timeout').value = '120';
+  document.getElementById('llm-batchchars').value = '8000';
   document.getElementById('llm-notes').value = '';
   hideTestResult();
 }
@@ -1999,6 +5711,8 @@ function collectLLMForm() {
     max_tokens: parseInt(document.getElementById('llm-maxtokens').value) || 4096,
     top_p: parseFloat(document.getElementById('llm-topp').value) || 1,
     timeout: parseInt(document.getElementById('llm-timeout').value) || 120,
+    batch_max_chars: Math.max(2000, Math.min(40000,
+      parseInt(document.getElementById('llm-batchchars').value) || 8000)),
     notes: document.getElementById('llm-notes').value.trim() || null,
     is_active: false,
   };
@@ -2006,9 +5720,9 @@ function collectLLMForm() {
 
 async function saveLLMProvider() {
   const data = collectLLMForm();
-  if (!data.name) { alert('请输入配置名称'); return; }
-  if (!data.provider) { alert('请选择服务商'); return; }
-  if (!data.model) { alert('请输入模型名称'); return; }
+  if (!data.name) { await showDialog({ type: 'warning', title: '配置不完整', message: '请输入配置名称' }); return; }
+  if (!data.provider) { await showDialog({ type: 'warning', title: '配置不完整', message: '请选择服务商' }); return; }
+  if (!data.model) { await showDialog({ type: 'warning', title: '配置不完整', message: '请输入模型名称' }); return; }
 
   try {
     if (llmEditingId) {
@@ -2018,22 +5732,26 @@ async function saveLLMProvider() {
       llmEditingId = res.id;
     }
     await refreshLLMList();
-    // Re-select
     const updated = llmProviders.find(p => p.id === llmEditingId);
     if (updated) editLLMProvider(updated);
-  } catch (e) { alert('保存失败: ' + e.message); }
+  } catch (e) { await showDialog({ type: 'error', title: '保存失败', message: e.message }); }
 }
 
 async function deleteLLMProvider() {
   if (!llmEditingId) return;
-  if (!confirm('确定删除此配置？')) return;
+  const ok = await showDialog({
+    type: 'danger', title: '删除LLM配置',
+    message: '确定删除此 LLM 配置吗？此操作无法恢复。',
+    okText: '删除', danger: true,
+  });
+  if (!ok) return;
   try {
     await API.deleteLLMProvider(llmEditingId);
     llmEditingId = null;
     document.getElementById('llm-form').classList.add('hidden');
     document.getElementById('llm-form-empty').classList.remove('hidden');
     await refreshLLMList();
-  } catch (e) { alert('删除失败: ' + e.message); }
+  } catch (e) { showDialog({ type: 'error', title: '删除失败', message: e.message }); }
 }
 
 async function testLLMProvider() {
@@ -2142,34 +5860,120 @@ async function loadLLMStats() {
 let _progressMinimized = false;
 let _currentTaskId = null;  // Track current extraction task for cancel
 
+function setupEntityDetailPage() {
+  document.getElementById('btn-ed-close').addEventListener('click', () => {
+    document.getElementById('entity-detail-overlay').classList.add('hidden');
+    _detailHistory.length = 0;  // clear history
+  });
+  // "返回" crumb
+  document.addEventListener('click', e => {
+    if (e.target.classList && e.target.classList.contains('ed-crumb') && e.target.dataset.action === 'back') {
+      _detailHistory.pop();  // remove current
+      const prev = _detailHistory.pop();  // get previous
+      if (prev) {
+        const m = prev.layer === 'm2' ? state.m2Model : state.m1Model;
+        const pkg = m?.versions?.slice(-1)[0]?.package;
+        const cls = pkg?.classes?.find(c => c.id === prev.clsId);
+        if (cls) openEntityDetailPage(cls, pkg.classes, pkg.enumerations || [], pkg.associations || [], prev.layer, { fromBack: true });
+      } else {
+        document.getElementById('entity-detail-overlay').classList.add('hidden');
+      }
+    }
+  });
+}
+
 function setupProgressMinimize() {
   document.getElementById('btn-progress-minimize').addEventListener('click', minimizeProgress);
   document.getElementById('progress-badge').addEventListener('click', e => {
-    // Don't restore if clicking the cancel button
     if (e.target.id === 'btn-badge-cancel') return;
     restoreProgress();
   });
   document.getElementById('btn-progress-cancel').addEventListener('click', cancelExtraction);
   document.getElementById('btn-badge-cancel').addEventListener('click', cancelExtraction);
+  document.getElementById('btn-progress-start').addEventListener('click', startExtractionTask);
+  document.getElementById('btn-progress-pause').addEventListener('click', pauseExtractionTask);
+  document.getElementById('btn-progress-resume').addEventListener('click', resumeExtractionTask);
+}
+
+function updateProgressControlButtons(state) {
+  // state: 'ready' | 'running' | 'paused' | 'done'
+  const start = document.getElementById('btn-progress-start');
+  const pause = document.getElementById('btn-progress-pause');
+  const resume = document.getElementById('btn-progress-resume');
+  const cancel = document.getElementById('btn-progress-cancel');
+  // Hide all first
+  [start, pause, resume, cancel].forEach(b => b && b.classList.add('hidden'));
+  if (state === 'ready') {
+    start.classList.remove('hidden');
+    cancel.classList.remove('hidden');
+  } else if (state === 'running') {
+    pause.classList.remove('hidden');
+    cancel.classList.remove('hidden');
+  } else if (state === 'paused') {
+    resume.classList.remove('hidden');
+    cancel.classList.remove('hidden');
+  }
+  // 'done' hides all
+}
+
+async function startExtractionTask() {
+  if (!_currentTaskId) return;
+  try {
+    // Activate timer, logging, tips, LIVE badge — all UI side-effects of starting
+    onExtractionActuallyStarted();
+    await API.startTask(_currentTaskId);
+    updateProgressControlButtons('running');
+  } catch (e) {
+    showToast('启动失败: ' + e.message, 'error');
+  }
+}
+
+async function pauseExtractionTask() {
+  if (!_currentTaskId) return;
+  try {
+    await API.pauseTask(_currentTaskId);
+    updateProgressControlButtons('paused');
+    addLog('info', '⏸ 已请求暂停');
+  } catch (e) {
+    showToast('暂停失败: ' + e.message, 'error');
+  }
+}
+
+async function resumeExtractionTask() {
+  if (!_currentTaskId) return;
+  try {
+    await API.resumeTask(_currentTaskId);
+    updateProgressControlButtons('running');
+    addLog('step', '▶ 继续执行');
+  } catch (e) {
+    showToast('恢复失败: ' + e.message, 'error');
+  }
+}
+
+async function cancelExtractionNoConfirm() {
+  if (!_currentTaskId) return;
+  _pollAborted = true;
+  try {
+    await API.cancelTask(_currentTaskId);
+  } catch (e) { console.error('Cancel failed:', e); }
+  _currentTaskId = null;
+  hideProgress();
 }
 
 async function cancelExtraction() {
   if (!_currentTaskId) return;
-  if (!confirm('确定要中止当前提取任务吗？已完成的部分将丢失。')) return;
-
-  // 1. Abort the frontend polling loop immediately
-  _pollAborted = true;
-
-  // 2. Tell backend to cancel the async task
-  try {
-    await API.cancelTask(_currentTaskId);
-  } catch (e) {
-    console.error('Cancel failed:', e);
-  }
-
-  // 3. Clean up frontend state
-  _currentTaskId = null;
-  hideProgress();
+  const isM2 = (_progMode === 'm2');
+  const taskWord = isM2 ? '推导' : '提取';
+  const ok = await showDialog({
+    type: 'warning',
+    title: '中止任务',
+    message: `确定要中止当前${taskWord}任务吗？\n\n已完成的部分会保留在成果区，但无法继续处理剩余批次。`,
+    okText: '确定中止',
+    cancelText: '继续执行',
+    danger: true,
+  });
+  if (!ok) return;
+  await cancelExtractionNoConfirm();
 }
 
 function minimizeProgress() {

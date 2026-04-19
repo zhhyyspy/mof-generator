@@ -50,12 +50,23 @@ export const API = {
   },
 
   // Derivation: M1 → M2
-  async startM2Derivation(modelId) {
-    return (await request(`/extraction/derive-m2/${modelId}`, { method: 'POST' })).json();
+  async startM2Derivation(modelId, classIds = null) {
+    const body = classIds ? { class_ids: classIds } : {};
+    return (await request(`/extraction/derive-m2/${modelId}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })).json();
   },
 
   async pollTask(taskId) { return (await request(`/extraction/status/${taskId}`)).json(); },
   async cancelTask(taskId) { return (await request(`/extraction/cancel/${taskId}`, { method: 'POST' })).json(); },
+  async startTask(taskId) { return (await request(`/extraction/start/${taskId}`, { method: 'POST' })).json(); },
+  async pauseTask(taskId) { return (await request(`/extraction/pause/${taskId}`, { method: 'POST' })).json(); },
+  async resumeTask(taskId) { return (await request(`/extraction/resume/${taskId}`, { method: 'POST' })).json(); },
+  async retryFailed(taskId, batchIds = null) {
+    const body = batchIds ? { batch_ids: batchIds } : {};
+    return (await request(`/extraction/retry-failed/${taskId}`, { method: 'POST', body: JSON.stringify(body) })).json();
+  },
 
   async refine(modelId, message) {
     return (await request('/extraction/refine', {
@@ -73,6 +84,9 @@ export const API = {
   async deleteModel(id) { return (await request(`/models/${id}`, { method: 'DELETE' })).json(); },
   async saveFromExtraction(data) {
     return (await request('/models/from-extraction', { method: 'POST', body: JSON.stringify(data) })).json();
+  },
+  async saveFromM2Review(data) {
+    return (await request('/models/save-m2', { method: 'POST', body: JSON.stringify(data) })).json();
   },
 
   // Classes
@@ -117,6 +131,12 @@ export const API = {
   async validateModel(modelId) {
     return (await request(`/models/${modelId}/validate`, { method: 'POST' })).json();
   },
+  async validateMOF(m1Id, m2Id) {
+    return (await request(`/models/validate-mof`, {
+      method: 'POST',
+      body: JSON.stringify({ m1_id: m1Id, m2_id: m2Id }),
+    })).json();
+  },
   async exportModel(modelId, format) {
     const res = await request('/export/', {
       method: 'POST',
@@ -124,8 +144,33 @@ export const API = {
     });
     return res.text();
   },
+  async exportReviewPackage(m1Id, m2Id) {
+    // Returns a Blob (zip) plus suggested filename from Content-Disposition.
+    const res = await request('/export/review-package', {
+      method: 'POST',
+      body: JSON.stringify({ m1_id: m1Id, m2_id: m2Id }),
+    });
+    const blob = await res.blob();
+    // Extract filename from header (RFC 5987 utf-8 variant preferred)
+    const cd = res.headers.get('Content-Disposition') || '';
+    let filename = 'review_package.zip';
+    const utf8Match = cd.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+      try { filename = decodeURIComponent(utf8Match[1]); } catch {}
+    } else {
+      const asciiMatch = cd.match(/filename="([^"]+)"/i);
+      if (asciiMatch) filename = asciiMatch[1];
+    }
+    return { blob, filename };
+  },
   async createVersion(modelId, changelog) {
     return (await request(`/models/${modelId}/versions`, { method: 'POST', body: JSON.stringify({ changelog }) })).json();
+  },
+  async listVersions(modelId) {
+    return (await request(`/models/${modelId}/versions`)).json();
+  },
+  async switchVersion(modelId, version) {
+    return (await request(`/models/${modelId}/versions/${version}/activate`, { method: 'POST' })).json();
   },
 
   // M3

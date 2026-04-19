@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MOF M1 Model Generator — AI辅助建模工具</title>
-  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/style.css?v=20260419a">
 </head>
 <body>
   <div id="app">
@@ -20,6 +20,7 @@
             <option value="">(无模型)</option>
           </select>
           <span id="model-count-badge" class="model-count-badge hidden">0</span>
+          <button id="btn-model-delete" class="btn-icon-sm" title="删除当前模型" disabled>&#128465;</button>
         </div>
         <button id="btn-extract-m1" class="btn btn-primary" disabled>
           <span class="icon">&#9881;</span> AI提取M1
@@ -66,8 +67,9 @@
           </div>
           <div class="editor-actions">
             <div class="view-toggle" id="view-toggle-bar">
-              <button id="btn-view-hierarchy" class="view-btn active" data-mode="hierarchy" title="层级视图 (按继承+组合嵌套)">层级</button>
-              <button id="btn-view-flat" class="view-btn" data-mode="flat" title="平铺视图">平铺</button>
+              <button id="btn-view-cards" class="view-btn active" data-mode="cards" title="卡片视图 (紧凑浏览)">卡片</button>
+              <button id="btn-view-hierarchy" class="view-btn" data-mode="hierarchy" title="层级视图 (按继承+组合嵌套)">层级</button>
+              <button id="btn-view-flat" class="view-btn" data-mode="flat" title="平铺视图 (完整展开)">平铺</button>
             </div>
             <span class="toolbar-sep"></span>
             <button id="btn-add-class" class="btn-sm" disabled>+ 类</button>
@@ -75,10 +77,110 @@
             <button id="btn-add-assoc" class="btn-sm" disabled>+ 关联</button>
           </div>
         </div>
-        <!-- Relationship Diagram -->
+        <!-- Relationship Diagram (interactive graph canvas) -->
         <div id="diagram-view" class="tab-content" data-tab="diagram">
-          <div id="diagram-canvas" class="diagram-canvas">
-            <!-- Rendered by JS: SVG lines + HTML boxes for M3/M2/M1 -->
+          <div id="graph-root" class="graph-root">
+            <!-- Floating toolbar -->
+            <div class="graph-toolbar">
+              <div class="graph-toolbar-group">
+                <input type="text" id="graph-search" class="graph-search" placeholder="&#128269; 搜索类名..." />
+              </div>
+              <div class="graph-toolbar-group">
+                <button class="graph-chip active" data-layer="m2" title="显示/隐藏 M2 节点">
+                  <span class="chip-dot chip-m2"></span> M2
+                </button>
+                <button class="graph-chip active" data-layer="m1" title="显示/隐藏 M1 节点">
+                  <span class="chip-dot chip-m1"></span> M1
+                </button>
+                <button class="graph-chip active" data-edge="inherit" title="显示/隐藏 继承关系">
+                  <span class="chip-line chip-inherit"></span> 继承
+                </button>
+                <button class="graph-chip active" data-edge="assoc" title="显示/隐藏 关联关系">
+                  <span class="chip-line chip-assoc"></span> 关联
+                </button>
+              </div>
+              <div class="graph-toolbar-group graph-toolbar-right">
+                <div class="graph-layout-switch" title="选择布局算法">
+                  <button class="graph-layout-mode active" data-mode="hierarchical" title="分层布局: M2 在上, M1 在下按父类网格排列 (适合 50+ 节点)">&#8625; 分层</button>
+                  <button class="graph-layout-mode" data-mode="force" title="力导向布局: 自然聚类, 适合节点较少时">&#9881; 力导向</button>
+                </div>
+                <button id="btn-graph-layout" class="graph-btn" title="按当前算法重新布局 (L)">
+                  <span>&#8634;</span> 重算
+                </button>
+                <button id="btn-graph-fit" class="graph-btn" title="适应画布 (F)">
+                  <span>&#9636;</span> 适应
+                </button>
+                <button id="btn-graph-reset" class="graph-btn" title="100% 缩放 (0)">100%</button>
+                <div class="graph-zoom-ctl">
+                  <button id="btn-graph-zoom-out" class="graph-btn-icon" title="缩小">&minus;</button>
+                  <span id="graph-zoom-pct" class="graph-zoom-pct">100%</span>
+                  <button id="btn-graph-zoom-in" class="graph-btn-icon" title="放大">+</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- SVG canvas (pan/zoom target) -->
+            <svg id="graph-svg" class="graph-svg" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <!-- Arrow markers -->
+                <marker id="gm-arrow-inherit" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+                  <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#a78bfa"/>
+                </marker>
+                <marker id="gm-arrow-assoc" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#4ade80"/>
+                </marker>
+                <marker id="gm-arrow-m2assoc" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#a78bfa"/>
+                </marker>
+                <marker id="gm-diamond" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+                  <path d="M 0 5 L 5 0 L 10 5 L 5 10 z" fill="#fb923c"/>
+                </marker>
+                <!-- Node gradients -->
+                <radialGradient id="gg-m2" cx="35%" cy="30%" r="70%">
+                  <stop offset="0%" stop-color="#d7c7ff"/>
+                  <stop offset="100%" stop-color="#7c5af3"/>
+                </radialGradient>
+                <radialGradient id="gg-m1" cx="35%" cy="30%" r="70%">
+                  <stop offset="0%" stop-color="#aecbff"/>
+                  <stop offset="100%" stop-color="#3b6cd4"/>
+                </radialGradient>
+                <filter id="gf-glow" x="-50%" y="-50%" width="200%" height="200%">
+                  <feGaussianBlur stdDeviation="4" result="blur"/>
+                  <feMerge>
+                    <feMergeNode in="blur"/>
+                    <feMergeNode in="SourceGraphic"/>
+                  </feMerge>
+                </filter>
+              </defs>
+              <!-- Dot-grid background (doesn't transform with pan; redrawn on each render) -->
+              <rect id="graph-bg" class="graph-bg" x="0" y="0" width="100%" height="100%" fill="url(#graph-bg-pattern)"/>
+              <pattern id="graph-bg-pattern" x="0" y="0" width="24" height="24" patternUnits="userSpaceOnUse">
+                <circle cx="1" cy="1" r="1" fill="rgba(255,255,255,0.04)"/>
+              </pattern>
+              <!-- Transformable viewport: all content goes inside this g -->
+              <g id="graph-viewport">
+                <g id="graph-edges"></g>
+                <g id="graph-nodes"></g>
+              </g>
+            </svg>
+
+            <!-- Hover tooltip -->
+            <div id="graph-tooltip" class="graph-tooltip hidden"></div>
+
+            <!-- Minimap -->
+            <div id="graph-minimap" class="graph-minimap">
+              <svg id="graph-minimap-svg" class="graph-minimap-svg" xmlns="http://www.w3.org/2000/svg">
+                <g id="graph-minimap-nodes"></g>
+                <rect id="graph-minimap-viewport" class="graph-minimap-viewport" fill="none"/>
+              </svg>
+              <div class="graph-minimap-label">缩略图</div>
+            </div>
+
+            <!-- Empty state overlay -->
+            <div id="graph-empty" class="graph-empty hidden"></div>
+
+            <!-- Selection info panel (bottom-left) -->
+            <div id="graph-selinfo" class="graph-selinfo hidden"></div>
           </div>
         </div>
         <!-- M1 tree -->
@@ -116,65 +218,155 @@
       </aside>
     </main>
 
-    <!-- Progress overlay -->
+    <!-- Extraction Workbench (two-zone: work + results) -->
     <div id="progress-overlay" class="overlay hidden">
-      <div class="progress-panel">
+      <div class="workbench">
         <!-- Header -->
-        <div class="prog-header">
+        <div class="wb-header">
           <div class="prog-icon-pulse"></div>
-          <div>
-            <h3 id="progress-title">AI正在分析文档...</h3>
-            <p class="prog-subtitle" id="progress-subtitle">基于MOF元模型体系提取领域模型</p>
+          <div class="wb-header-text">
+            <h3 id="progress-title">AI提取工作台</h3>
+            <p class="prog-subtitle" id="progress-subtitle">实时提取，成果随时保存</p>
           </div>
           <span class="prog-timer" id="progress-timer">00:00</span>
-          <button id="btn-progress-cancel" class="btn-icon prog-cancel" title="中止提取">&#9632;</button>
+          <div class="prog-control-btns">
+            <button id="btn-progress-start" class="btn btn-primary prog-start" title="开始执行">▶ 开始</button>
+            <button id="btn-progress-pause" class="btn-icon prog-pause hidden" title="暂停">⏸</button>
+            <button id="btn-progress-resume" class="btn btn-primary prog-resume hidden" title="继续">▶ 继续</button>
+            <button id="btn-progress-cancel" class="btn-icon prog-cancel hidden" title="中止">&#9632;</button>
+          </div>
           <button id="btn-progress-minimize" class="btn-icon prog-minimize" title="最小化到后台">&#9660;</button>
         </div>
 
-        <!-- Progress bar -->
-        <div class="progress-bar">
-          <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
-        </div>
-        <div class="prog-pct-row">
+        <!-- Progress bar (shared) -->
+        <div class="wb-progress-row">
+          <div class="progress-bar">
+            <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+          </div>
           <span id="progress-pct">0%</span>
           <span id="progress-message" class="prog-current-step">准备中...</span>
         </div>
 
-        <!-- Document checklist -->
-        <div class="prog-docs" id="progress-docs">
-          <!-- Document status items injected by JS -->
-        </div>
+        <!-- Two-zone body -->
+        <div class="wb-body">
+          <!-- Left zone: Work (process) -->
+          <div class="wb-zone wb-work">
+            <div class="wb-zone-header">
+              <span class="wb-zone-title">📋 工作区 · 提取过程</span>
+            </div>
+            <div class="wb-zone-content">
+              <!-- Pipeline steps -->
+              <div class="wb-section">
+                <div class="wb-section-title">步骤流水线</div>
+                <div class="prog-steps" id="progress-steps"></div>
+              </div>
 
-        <!-- Pipeline steps -->
-        <div class="prog-steps" id="progress-steps"></div>
+              <!-- Document checklist -->
+              <div class="wb-section" id="progress-docs-wrap">
+                <div class="wb-section-title">文档状态</div>
+                <div class="prog-docs" id="progress-docs"></div>
+              </div>
 
-        <!-- Parallel subtasks -->
-        <div class="prog-parallel" id="progress-parallel"></div>
+              <!-- Parallel subtasks -->
+              <div class="wb-section" id="progress-parallel-wrap">
+                <div class="wb-section-title">并行任务</div>
+                <div class="prog-parallel" id="progress-parallel"></div>
+              </div>
 
-        <!-- Activity log -->
-        <div class="prog-log-header">
-          <span>处理日志</span>
-          <span class="prog-log-dots"><span>.</span><span>.</span><span>.</span></span>
-        </div>
-        <div class="prog-log" id="progress-log">
-          <!-- Log lines injected by JS -->
-        </div>
+              <!-- Activity log -->
+              <div class="wb-section">
+                <div class="wb-section-title">
+                  处理日志
+                  <span class="prog-log-dots"><span>.</span><span>.</span><span>.</span></span>
+                </div>
+                <div class="prog-log" id="progress-log"></div>
+              </div>
 
-        <!-- LLM Conversation Stream -->
-        <details class="prog-conv-panel" id="progress-conv-panel">
-          <summary class="prog-conv-title">
-            &#128172; LLM对话流
-            <span class="prog-conv-count" id="conv-count">0</span>
-          </summary>
-          <div class="prog-conv-stream" id="conv-stream">
-            <div class="prog-conv-empty">等待LLM调用...</div>
+              <!-- LLM Conversation Stream -->
+              <details class="wb-section prog-conv-panel" id="progress-conv-panel">
+                <summary class="wb-section-title prog-conv-title">
+                  💬 LLM对话流 <span class="prog-conv-count" id="conv-count">0</span>
+                </summary>
+                <div class="prog-conv-stream" id="conv-stream">
+                  <div class="prog-conv-empty">等待LLM调用...</div>
+                </div>
+              </details>
+
+              <!-- Tips -->
+              <div class="prog-tip" id="progress-tip">
+                <span class="prog-tip-icon">💡</span>
+                <span id="progress-tip-text">MOF体系将数据模型分为M3→M2→M1→M0四层，每层各有明确职责。</span>
+              </div>
+            </div>
           </div>
-        </details>
 
-        <!-- Tips -->
-        <div class="prog-tip" id="progress-tip">
-          <span class="prog-tip-icon">&#128161;</span>
-          <span id="progress-tip-text">MOF体系将数据模型分为M3→M2→M1→M0四层，每层各有明确职责。</span>
+          <!-- Right zone: Results (live, always-savable) -->
+          <div class="wb-zone wb-results">
+            <div class="wb-zone-header">
+              <span class="wb-zone-title">📦 成果区 · 实时梳理</span>
+              <span class="wb-live-badge" id="wb-live-badge">● LIVE</span>
+            </div>
+            <div class="wb-zone-content">
+              <!-- Stats cards -->
+              <div class="wb-stats" id="wb-stats">
+                <div class="wb-stat-card stat-classes">
+                  <div class="wb-stat-num" id="wb-stat-classes">0</div>
+                  <div class="wb-stat-label">类</div>
+                </div>
+                <div class="wb-stat-card stat-attrs">
+                  <div class="wb-stat-num" id="wb-stat-attrs">0</div>
+                  <div class="wb-stat-label">属性</div>
+                </div>
+                <div class="wb-stat-card stat-assocs">
+                  <div class="wb-stat-num" id="wb-stat-assocs">0</div>
+                  <div class="wb-stat-label">关联</div>
+                </div>
+                <div class="wb-stat-card stat-enums">
+                  <div class="wb-stat-num" id="wb-stat-enums">0</div>
+                  <div class="wb-stat-label">枚举</div>
+                </div>
+              </div>
+
+              <!-- Model label input -->
+              <div class="wb-section">
+                <div class="wb-section-title">M1模型名称</div>
+                <input type="text" id="wb-model-label" class="wb-model-input"
+                       placeholder="提取到内容后再命名保存...">
+              </div>
+
+              <!-- Failed batches -->
+              <div id="wb-failed-section" class="wb-section hidden">
+                <div class="wb-section-title">
+                  <span class="wb-failed-indicator">⚠ 失败批次 <span id="failed-count">0</span></span>
+                  <button id="btn-retry-all" class="btn-sm btn-retry-all">↻ 重试全部</button>
+                </div>
+                <div id="review-failed-list" class="review-failed-list"></div>
+              </div>
+
+              <!-- Live entities with checkboxes -->
+              <div class="wb-section wb-entities-section">
+                <div class="wb-section-title">
+                  <span>可导入的实体</span>
+                  <span class="wb-select-actions">
+                    <button id="btn-review-all" class="btn-sm">全选</button>
+                    <button id="btn-review-none" class="btn-sm">全不选</button>
+                  </span>
+                </div>
+                <div id="review-entities" class="review-entities wb-entities">
+                  <div class="empty-state">等待提取结果...</div>
+                </div>
+              </div>
+
+              <!-- Confidence notes (compact) -->
+              <div id="review-notes" class="review-notes hidden"></div>
+            </div>
+
+            <!-- Sticky footer with save button -->
+            <div class="wb-actions">
+              <button id="btn-review-cancel" class="btn">取消</button>
+              <button id="btn-review-confirm" class="btn btn-primary" disabled>尚无可保存的内容</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -190,16 +382,57 @@
     <!-- Export modal -->
     <div id="export-modal" class="overlay hidden">
       <div class="modal-card">
-        <h3>导出模型</h3>
-        <div class="export-layer-select">
-          <label><input type="radio" name="export-layer" value="m1" checked> M1 模型</label>
-          <label><input type="radio" name="export-layer" value="m2"> M2 元模型</label>
+        <h3>导出</h3>
+
+        <!-- Mode tabs -->
+        <div class="export-mode-tabs">
+          <button class="export-mode-tab active" data-mode="raw">原始数据</button>
+          <button class="export-mode-tab" data-mode="review">&#128196; 审查包 (业务人员评审)</button>
         </div>
-        <div class="export-options">
-          <label><input type="radio" name="export-fmt" value="json" checked> JSON</label>
-          <label><input type="radio" name="export-fmt" value="yaml"> YAML</label>
-          <label><input type="radio" name="export-fmt" value="mof_text"> MOF Text</label>
+
+        <!-- Mode: raw -->
+        <div class="export-mode-section" data-mode="raw">
+          <p class="export-hint">导出结构化数据文件，供系统集成或技术分析。</p>
+          <div class="export-layer-select">
+            <label><input type="radio" name="export-layer" value="m1" checked> M1 模型</label>
+            <label><input type="radio" name="export-layer" value="m2"> M2 元模型</label>
+          </div>
+          <div class="export-options">
+            <label><input type="radio" name="export-fmt" value="json" checked> JSON</label>
+            <label><input type="radio" name="export-fmt" value="yaml"> YAML</label>
+            <label><input type="radio" name="export-fmt" value="mof_text"> MOF Text</label>
+          </div>
         </div>
+
+        <!-- Mode: review package -->
+        <div class="export-mode-section hidden" data-mode="review">
+          <p class="export-hint">
+            生成一份给业务人员审查的完整交付包 (.zip)，包含:
+          </p>
+          <ul class="export-review-list">
+            <li>📄 <b>审查报告.docx</b> — 叙述式报告，含嵌入图</li>
+            <li>📊 <b>审查意见表.xlsx</b> — 结构化反馈表 (5 个工作表)</li>
+            <li>🎨 <b>审查图集.drawio</b> — 可编辑关系图 (多页, draw.io 打开)</li>
+            <li>🖼 <b>图片快照/*.svg</b> — 静态图, 浏览器/Word 直接看</li>
+            <li>📦 附件_源数据.json + 使用说明.md</li>
+          </ul>
+          <div class="export-review-check">
+            <div class="export-review-item">
+              <span class="export-review-label">M1 模型:</span>
+              <span id="review-m1-name" class="export-review-val">—</span>
+            </div>
+            <div class="export-review-item">
+              <span class="export-review-label">M2 元模型:</span>
+              <span id="review-m2-name" class="export-review-val">—</span>
+            </div>
+            <label class="export-review-include">
+              <input type="checkbox" id="review-include-m2" checked>
+              包含 M2 元模型 (推荐; 用于层级图和整体抽象视图)
+            </label>
+          </div>
+          <div class="export-review-status" id="review-status"></div>
+        </div>
+
         <div class="modal-actions">
           <button id="btn-export-confirm" class="btn btn-primary">导出</button>
           <button id="btn-export-cancel" class="btn">取消</button>
@@ -208,10 +441,223 @@
       </div>
     </div>
 
+    <!-- Review-package generation progress (staged animated) -->
+    <div id="export-progress-overlay" class="overlay hidden">
+      <div class="export-progress-card">
+        <div class="export-progress-header">
+          <span class="export-progress-spinner" id="export-progress-spinner">&#128230;</span>
+          <div>
+            <h3 class="export-progress-title" id="export-progress-title">正在生成审查包</h3>
+            <p class="export-progress-sub" id="export-progress-sub">M1 &middot; M2 &middot; Word &middot; Excel &middot; PDF &middot; Drawio &middot; SVG</p>
+          </div>
+        </div>
+
+        <div class="export-progress-bar-wrap">
+          <div class="export-progress-bar" id="export-progress-fill" style="width: 0%"></div>
+        </div>
+
+        <div class="export-progress-meta">
+          <span class="export-progress-pct" id="export-progress-pct">0%</span>
+          <span class="export-progress-elapsed" id="export-progress-elapsed">00:00</span>
+        </div>
+
+        <div class="export-progress-stages" id="export-progress-stages"></div>
+
+        <div class="export-progress-hint">
+          <span id="export-progress-message">准备中...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Unified Dialog System (confirm/alert/prompt) -->
+    <div id="app-dialog" class="overlay hidden app-dialog-overlay">
+      <div class="app-dialog-card">
+        <div class="app-dialog-header">
+          <span class="app-dialog-icon" id="app-dialog-icon">❓</span>
+          <h3 class="app-dialog-title" id="app-dialog-title">提示</h3>
+        </div>
+        <div class="app-dialog-message" id="app-dialog-message"></div>
+        <div class="app-dialog-input-wrap" id="app-dialog-input-wrap" style="display:none">
+          <input type="text" id="app-dialog-input" class="app-dialog-input" />
+        </div>
+        <div class="app-dialog-actions">
+          <button id="app-dialog-cancel" class="btn">取消</button>
+          <button id="app-dialog-ok" class="btn btn-primary">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Entity Detail Overlay -->
+    <div id="entity-detail-overlay" class="overlay hidden">
+      <div class="entity-detail">
+        <div class="ed-header">
+          <div class="ed-breadcrumb" id="ed-breadcrumb">
+            <span class="ed-crumb" data-action="back">← 返回</span>
+            <span class="ed-crumb-sep">›</span>
+            <span class="ed-crumb-layer" id="ed-layer"></span>
+            <span class="ed-crumb-sep">›</span>
+            <span class="ed-crumb-current" id="ed-current-name"></span>
+          </div>
+          <button id="btn-ed-close" class="btn-icon">&times;</button>
+        </div>
+        <div class="ed-body" id="ed-body">
+          <!-- Populated by openEntityDetailPage -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Entity Edit Modal (full CRUD for class + attrs + outgoing assocs) -->
+    <div id="entity-edit-overlay" class="overlay hidden">
+      <div class="ee-modal">
+        <div class="ee-header">
+          <div class="ee-header-left">
+            <span class="ee-badge" id="ee-layer-badge">M1</span>
+            <h3 class="ee-title">编辑实体</h3>
+            <span class="ee-subtitle" id="ee-subtitle">&middot;</span>
+          </div>
+          <button id="btn-ee-close" class="btn-icon" title="关闭">&times;</button>
+        </div>
+        <div class="ee-body">
+          <div class="ee-form-area" id="ee-form-area">
+            <!-- Rendered by EntityEdit.render() -->
+          </div>
+          <aside class="ee-changes-sidebar">
+            <div class="ee-changes-title">
+              <span>&#9201; 实时变更概览</span>
+            </div>
+            <div id="ee-change-summary" class="ee-change-summary">
+              <div class="ee-change-empty">暂无修改</div>
+            </div>
+            <div id="ee-cascade-hint" class="ee-cascade-hint"></div>
+            <div class="ee-sidebar-actions">
+              <button id="btn-ee-preview" class="btn btn-primary" disabled>&#128065; 预览变更</button>
+              <button id="btn-ee-cancel" class="btn">取消</button>
+            </div>
+            <div class="ee-help">
+              <p><strong>说明</strong></p>
+              <ul>
+                <li>继承属性只读，需到父类修改</li>
+                <li>入向关联只读，需到来源类修改</li>
+                <li>改名会自动同步子类父类引用和关联的类名</li>
+                <li>预览界面会展示所有变更 + 级联影响</li>
+              </ul>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <!-- Entity Change Preview Modal -->
+    <div id="entity-preview-overlay" class="overlay hidden">
+      <div class="ep-modal">
+        <div class="ep-header">
+          <h3>&#10003; 确认变更</h3>
+          <button id="btn-ep-close" class="btn-icon" title="关闭">&times;</button>
+        </div>
+        <div class="ep-body" id="ep-body">
+          <!-- Rendered by EntityEdit.renderPreview() -->
+        </div>
+        <div class="ep-actions">
+          <button id="btn-ep-back" class="btn">&larr; 返回编辑</button>
+          <button id="btn-ep-commit" class="btn btn-primary">&#10003; 确认保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Version modal -->
+    <div id="version-modal" class="overlay hidden">
+      <div class="modal-card modal-wide">
+        <div class="modal-header">
+          <h3>📄 版本管理</h3>
+          <button id="btn-version-close" class="btn-icon">&times;</button>
+        </div>
+        <div class="version-info">
+          <span>模型: <strong id="version-model-name"></strong></span>
+          <span>当前版本: <strong id="version-current" class="ver-current"></strong></span>
+        </div>
+        <div class="version-new-row">
+          <input type="text" id="version-changelog" placeholder="填写本次变更说明 (可选)..." />
+          <button id="btn-version-create" class="btn btn-primary">💾 创建新版本快照</button>
+        </div>
+        <div class="version-list-wrap">
+          <div class="version-list-title">历史版本</div>
+          <div id="version-list" class="version-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- M2 Scope Selector modal (choose which M1 classes to abstract) -->
+    <div id="m2-scope-modal" class="overlay hidden">
+      <div class="modal-card modal-wide m2-scope-card">
+        <div class="modal-header">
+          <h3>&#8679; 反推M2 &middot; 选择参与抽象的M1范围</h3>
+          <button id="btn-m2-scope-close" class="btn-icon">&times;</button>
+        </div>
+        <div class="m2-scope-intro">
+          <p>从 <strong id="m2-scope-source">—</strong> 中勾选参与抽象的M1类。AI会分析这些类的<b>共性属性</b>与<b>继承关系</b>，抽象出通用M2元模型。</p>
+          <p class="m2-scope-tip">
+            <span class="tip-icon">💡</span>
+            <span>建议选择同一业务域的相关类（如所有设备 / 所有文档 / 所有项目），避免跨领域混合导致抽象失焦。至少需要 2 个类。</span>
+          </p>
+        </div>
+        <div class="m2-scope-toolbar">
+          <input id="m2-scope-search" type="text" placeholder="&#128269; 搜索类名 / 描述..." class="m2-scope-search-input">
+          <div class="m2-scope-filter-chips">
+            <button class="m2-scope-chip active" data-filter="all" title="全部">全部</button>
+            <button class="m2-scope-chip" data-filter="root" title="根类 (无父类)">根类</button>
+            <button class="m2-scope-chip" data-filter="inherit" title="继承类 (有父类)">继承类</button>
+            <button class="m2-scope-chip" data-filter="large" title="属性多 (>=5)">大类</button>
+          </div>
+          <div class="m2-scope-actions">
+            <button id="btn-m2-scope-all" class="btn-sm">全选</button>
+            <button id="btn-m2-scope-none" class="btn-sm">全不选</button>
+            <button id="btn-m2-scope-invert" class="btn-sm">反选</button>
+          </div>
+        </div>
+        <div class="m2-scope-summary">
+          <span class="m2-scope-count" id="m2-scope-count">已选 0 / 0</span>
+          <span class="m2-scope-breakdown" id="m2-scope-breakdown">—</span>
+        </div>
+        <div id="m2-scope-list" class="m2-scope-list">
+          <!-- Filled by renderM2ScopeList -->
+        </div>
+        <div class="modal-actions">
+          <button id="btn-m2-scope-cancel" class="btn">取消</button>
+          <button id="btn-m2-scope-start" class="btn btn-accent2" disabled>&#9654; 开始推导M2</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Validation modal -->
     <div id="validation-modal" class="overlay hidden">
-      <div class="modal-card">
-        <h3 id="validation-title">验证结果</h3>
+      <div class="modal-card modal-wide">
+        <div class="modal-header">
+          <h3 id="validation-title">✓ MOF规范验证</h3>
+          <button id="btn-validation-x" class="btn-icon">&times;</button>
+        </div>
+
+        <!-- Mode selector -->
+        <div class="validation-mode-row">
+          <label class="validation-mode-label">验证方式:</label>
+          <select id="validation-mode" class="model-picker">
+            <option value="local">本地规范检查 (M3语法)</option>
+            <option value="llm">AI智能MOF校验 (继承关系+最佳实践)</option>
+          </select>
+        </div>
+
+        <!-- LLM mode: model pickers -->
+        <div id="validation-llm-pickers" class="validation-llm-pickers hidden">
+          <div class="val-picker-row">
+            <label>M1 模型:</label>
+            <select id="val-m1-picker" class="model-picker"></select>
+          </div>
+          <div class="val-picker-row">
+            <label>M2 元模型:</label>
+            <select id="val-m2-picker" class="model-picker"></select>
+          </div>
+          <button id="btn-run-llm-validate" class="btn btn-primary">🔍 开始AI校验</button>
+        </div>
+
         <div id="validation-content"></div>
         <div class="modal-actions">
           <button id="btn-validation-close" class="btn">关闭</button>
@@ -301,6 +747,13 @@
                 </div>
               </div>
               <div class="insp-field">
+                <label>
+                  单批字符上限
+                  <span class="field-hint" title="提取任务单次AI调用发送的文档字符上限。跨批次的上下文关联由系统自动传递（不会因分批而丢失）。&#10;· 云端大模型 (128K+ ctx): 20000&#10;· 本地模型 / 小上下文 / 中文分词低效的模型: 4000-8000&#10;· 若遇到 'context length exceeded' 错误，请降低此值">(?)</span>
+                </label>
+                <input type="number" id="llm-batchchars" value="8000" min="2000" max="40000" step="1000">
+              </div>
+              <div class="insp-field">
                 <label>备注</label>
                 <input type="text" id="llm-notes" placeholder="可选备注...">
               </div>
@@ -317,53 +770,7 @@
     </div>
 
     <!-- Extraction Review Panel -->
-    <div id="review-overlay" class="overlay hidden">
-      <div class="review-panel">
-        <!-- Header -->
-        <div class="review-header">
-          <h3><span class="review-icon">&#10004;</span> M1模型提取完成</h3>
-          <button id="btn-review-close" class="btn-icon">&times;</button>
-        </div>
-
-        <!-- Model name input (prominent) -->
-        <div class="review-naming">
-          <label>新M1模型名称 (将创建为独立M1，与已有M1平行存在)</label>
-          <input type="text" id="review-model-label" placeholder="例如: 抽水蓄能机组台账 v1.0" />
-        </div>
-
-        <!-- Stats cards -->
-        <div class="review-stats" id="review-stats"></div>
-
-        <!-- Process summary -->
-        <details class="review-process" open>
-          <summary>&#128203; 推导过程</summary>
-          <ul id="review-process-list"></ul>
-        </details>
-
-        <!-- Confidence notes -->
-        <div id="review-notes" class="review-notes hidden"></div>
-
-        <!-- Selectable entity list -->
-        <div class="review-select-header">
-          <span>&#9745; 选择要导入的实体</span>
-          <div class="review-select-actions">
-            <button id="btn-review-all" class="btn-sm">全选</button>
-            <button id="btn-review-none" class="btn-sm">全不选</button>
-          </div>
-        </div>
-        <div class="review-entities" id="review-entities">
-          <!-- Rendered by JS: classes, enumerations, associations with checkboxes -->
-        </div>
-
-        <!-- Action bar -->
-        <div class="review-actions">
-          <button id="btn-review-cancel" class="btn">取消丢弃</button>
-          <button id="btn-review-confirm" class="btn btn-primary">确认导入选中项</button>
-        </div>
-      </div>
-    </div>
-
-  <script type="module" src="/js/api.js"></script>
-  <script type="module" src="/js/app.js"></script>
+  <script type="module" src="/js/api.js?v=20260419a"></script>
+  <script type="module" src="/js/app.js?v=20260419a"></script>
 </body>
 </html>
