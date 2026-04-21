@@ -16,9 +16,45 @@ from typing import Callable, Optional
 from backend.models.m3_schema import (
     Package, MOFClass, Attribute, Enumeration, EnumLiteral,
     Association, AssociationEnd, Multiplicity, Constraint,
-    ComplexType, PrimitiveDataType,
+    ComplexType, PrimitiveDataType, StructuralPattern,
 )
 from backend.services.llm_client import get_active_client, LLMClient
+
+
+def _build_attributes_from_raw(attr_dicts: list) -> list[Attribute]:
+    """Convert a list of raw attribute dicts (from LLM output) into Attribute objects.
+
+    Used by M2 materialization for both flat classes and per-level MetaClasses in a
+    StructuralPattern. Normalizes data_type (falling back to String for unknown),
+    multiplicity (handling missing fields), and carries through unit/description.
+    """
+    out: list[Attribute] = []
+    for a in attr_dicts:
+        if not isinstance(a, dict):
+            continue
+        name = (a.get("name") or "").strip()
+        if not name:
+            continue
+        dt = a.get("data_type", "String")
+        try:
+            PrimitiveDataType(dt)
+        except ValueError:
+            dt = "String"
+        mult = a.get("multiplicity", {}) or {}
+        out.append(Attribute(
+            id=str(uuid.uuid4()),
+            name=name,
+            label=a.get("label", "") or None,
+            description=a.get("description") or None,
+            data_type=dt,
+            unit=a.get("unit") or None,
+            enum_ref=a.get("enum_ref") or None,
+            multiplicity=Multiplicity(
+                lower=mult.get("lower", 1) if isinstance(mult, dict) else 1,
+                upper=mult.get("upper", 1) if isinstance(mult, dict) else 1,
+            ),
+        ))
+    return out
 
 
 SYSTEM_PROMPT = """You are a data modeling expert specializing in MOF (Meta-Object Facility) methodology for industrial asset management, particularly in the Chinese energy sector (pumped storage, electrochemical storage, conventional hydropower).
@@ -966,156 +1002,181 @@ class AIExtractor:
             self._ask = _orig_ask
 
         # ================================================================
-        # Build final M2 Package (Pydantic objects)
+        # Build final M2 Package (V3.0: 元类 vs 元结构 dual representation)
         # ================================================================
-        # For classes with detected hierarchy (_hierarchy.has_hierarchy==True):
-        #   1. Generate a dedicated Enumeration (<ClassName>Level) with the level names
-        #   2. Add a `level` Attribute (Enum, 1..1, required) to the class
-        #   3. Ensure parent + children self-associations exist
-        # Level info is also exported in m1_class_mappings so save-m2 can backfill M1.
+        # Per methodology V3.0, M2 now has two output shapes per theme:
+        #
+        #   (A) 元类 FlatClass (hierarchy NOT detected):
+        #       → Keep one flat MOFClass with the shared attributes
+        #
+        #   (B) 元结构 StructuralClass (hierarchy detected):
+        #       → Split into N MetaClasses (one per level), each with its own
+        #         per-level attribute subset (carved from the shared attrs)
+        #       → Create N-1 ordered hierarchy Associations (source=上层, target=下层)
+        #       → Register a StructuralPattern on the Package metadata with
+        #         root_class_id + participating_class_ids + constraints
+        #
+        # m1_class_mappings is extended to carry the specific target MetaClass
+        # name for each M1 (based on level assignment). save-m2 uses this to
+        # backfill each M1 class's parent_class_name correctly.
 
+        m2_classes: list[MOFClass] = []
+        m2_assocs: list[Association] = []
         m2_enumerations: list[Enumeration] = []
-        # Build per-class level enum first so we can attach enum_ref in the attribute
-        class_level_enum_id: dict[str, str] = {}  # class_name -> enum id
+        m2_structural_patterns: list[StructuralPattern] = []
+
+        # For m1_class_mappings redirection: original theme name → target M2 class name per M1
+        # (for flat: all M1 point to the single M2 class. for structural: each M1 → its level's class)
+        theme_to_target_by_m1: dict[tuple[str, str], str] = {}   # (theme_name, m1_name) → target_m2_class_name
+
         for c_raw in m2_classes_raw:
+            theme_name = c_raw.get("name", "")
+            theme_label = c_raw.get("label", theme_name)
+            theme_desc = c_raw.get("description", "") or ""
             h = c_raw.get("_hierarchy") or {}
+
+            # ---------- Flat (元类) — unchanged from pre-V3.0 ----------
             if not h.get("has_hierarchy"):
-                continue
-            levels = h.get("levels") or []
-            if not levels:
-                continue
-            cname = c_raw.get("name", "")
-            clabel = c_raw.get("label", cname)
-            enum = Enumeration(
-                id=str(uuid.uuid4()),
-                name=f"{cname}Level",
-                label=f"{clabel}层级",
-                description=f"{clabel} 的层级角色 (动态发现)",
-                literals=[
-                    EnumLiteral(
-                        id=str(uuid.uuid4()),
-                        name=L,              # use the Chinese/English level name directly
-                        label=L,
-                        value=str(i + 1),    # ordered; top=1
-                    )
-                    for i, L in enumerate(levels)
-                ],
-            )
-            m2_enumerations.append(enum)
-            class_level_enum_id[cname] = enum.id
-
-        m2_classes = []
-        for c_raw in m2_classes_raw:
-            attrs = []
-            for a in c_raw.get("attributes", []) or []:
-                dt = a.get("data_type", "String")
-                try:
-                    PrimitiveDataType(dt)
-                except ValueError:
-                    dt = "String"
-                mult = a.get("multiplicity", {}) or {}
-                attrs.append(Attribute(
-                    id=str(uuid.uuid4()), name=a.get("name", ""),
-                    label=a.get("label", ""), description=a.get("description"),
-                    data_type=dt, unit=a.get("unit"),
-                    multiplicity=Multiplicity(
-                        lower=mult.get("lower", 1), upper=mult.get("upper", 1),
-                    ),
-                ))
-
-            # If this class has a hierarchy, add the `level` enum attribute
-            cname = c_raw.get("name", "")
-            level_enum_id = class_level_enum_id.get(cname)
-            if level_enum_id:
-                attrs.append(Attribute(
+                attrs = _build_attributes_from_raw(c_raw.get("attributes", []) or [])
+                flat_cls = MOFClass(
                     id=str(uuid.uuid4()),
-                    name="level",
-                    label="层级",
-                    description="在业务包含结构中的层级角色 (动态发现, 实例必填)",
-                    data_type=PrimitiveDataType.ENUM,
-                    enum_ref=level_enum_id,
-                    multiplicity=Multiplicity(lower=1, upper=1),
-                ))
-
-            m2_classes.append(MOFClass(
-                id=str(uuid.uuid4()),
-                name=cname,
-                label=c_raw.get("label", ""),
-                description=c_raw.get("description"),
-                is_abstract=True,
-                attributes=attrs,
-            ))
-
-        class_id_map = {c.name: c.id for c in m2_classes}
-
-        # Build M2 self-associations
-        m2_assocs = []
-
-        def _add_assoc(cls_id, cls_name, name, label, src_mult, tgt_mult, assoc_type, desc=None):
-            m2_assocs.append(Association(
-                id=str(uuid.uuid4()),
-                name=name, label=label, description=desc,
-                source=AssociationEnd(
-                    class_ref=cls_id, class_name=cls_name,
-                    multiplicity=Multiplicity(
-                        lower=src_mult.get("lower", 0),
-                        upper=src_mult.get("upper", 1),
-                    ),
-                ),
-                target=AssociationEnd(
-                    class_ref=cls_id, class_name=cls_name,
-                    multiplicity=Multiplicity(
-                        lower=tgt_mult.get("lower", 0),
-                        upper=tgt_mult.get("upper", -1),
-                    ),
-                ),
-                association_type=assoc_type,
-            ))
-
-        for c_raw in m2_classes_raw:
-            cls_name = c_raw.get("name", "")
-            cls_id = class_id_map.get(cls_name, "")
-            if not cls_id:
+                    name=theme_name,
+                    label=theme_label,
+                    description=theme_desc or None,
+                    is_abstract=True,
+                    attributes=attrs,
+                )
+                m2_classes.append(flat_cls)
+                # All M1s of this theme → this flat class (unchanged mapping)
+                for m in m1_mappings_raw:
+                    if m.get("m2_parent_name") == theme_name:
+                        theme_to_target_by_m1[(theme_name, m.get("m1_class_name", ""))] = theme_name
                 continue
 
-            # Original LLM-suggested self associations (Phase 2 output)
-            for sa in (c_raw.get("self_associations") or []):
-                src_mult = sa.get("source_multiplicity") or {"lower": 1, "upper": 1}
-                tgt_mult = sa.get("target_multiplicity") or {"lower": 0, "upper": -1}
-                assoc_type = sa.get("association_type", "composition")
-                if assoc_type not in ("association", "aggregation", "composition"):
-                    assoc_type = "composition"
-                _add_assoc(
-                    cls_id, cls_name,
-                    sa.get("name", ""), sa.get("label", ""),
-                    src_mult, tgt_mult, assoc_type, sa.get("description"),
+            # ---------- Structural (元结构) — V3.0 multi-class pattern ----------
+            levels_def = h.get("levels") or []
+            if len(levels_def) < 2:
+                # Defensive: if hierarchy was declared but levels missing, degrade to flat
+                attrs = _build_attributes_from_raw(c_raw.get("attributes", []) or [])
+                fallback_cls = MOFClass(
+                    id=str(uuid.uuid4()),
+                    name=theme_name, label=theme_label,
+                    description=theme_desc or None, is_abstract=True, attributes=attrs,
                 )
+                m2_classes.append(fallback_cls)
+                for m in m1_mappings_raw:
+                    if m.get("m2_parent_name") == theme_name:
+                        theme_to_target_by_m1[(theme_name, m.get("m1_class_name", ""))] = theme_name
+                continue
 
-            # Hierarchy self-associations — parent/children using aggregation (loose),
-            # per user decision ("允许灵活挂载"). Skip if user's suggested self-assocs
-            # already cover parent/children semantics.
-            h = c_raw.get("_hierarchy") or {}
-            if h.get("has_hierarchy"):
-                existing_names = {a.name for a in m2_assocs if a.source.class_ref == cls_id}
-                role = h.get("self_association_role", "contains")
-                parent_name = f"{role}Parent"
-                children_name = f"{role}Children"
-                if parent_name not in existing_names:
-                    _add_assoc(
-                        cls_id, cls_name, parent_name, "上级节点",
-                        {"lower": 0, "upper": 1},  # one or zero parents
-                        {"lower": 0, "upper": 1},
-                        "aggregation",
-                        "层级结构中的直接上级节点 (根节点可为空)",
-                    )
-                if children_name not in existing_names:
-                    _add_assoc(
-                        cls_id, cls_name, children_name, "下级节点",
-                        {"lower": 0, "upper": 1},
-                        {"lower": 0, "upper": -1},
-                        "aggregation",
-                        "层级结构中的直接下级节点 (可跨层挂载)",
-                    )
+            # Allocate new StructuralPattern id
+            pattern_id = str(uuid.uuid4())
+
+            # Build one MOFClass per level, with that level's carved attribute subset
+            level_class_ids: list[str] = []   # ordered root → leaf
+            level_name_to_class_id: dict[str, str] = {}
+            level_name_to_class_name: dict[str, str] = {}
+            for idx, lvl_def in enumerate(levels_def):
+                lvl_name = lvl_def.get("level_name", "")
+                mc_name = lvl_def.get("class_name", "")
+                mc_label = lvl_def.get("class_label", lvl_name)
+                mc_desc = lvl_def.get("description", "") or None
+                role = "root" if idx == 0 else ("leaf" if idx == len(levels_def) - 1 else "intermediate")
+
+                # Build per-level attributes — strip server-side to valid data types
+                attrs = _build_attributes_from_raw(lvl_def.get("attributes", []) or [])
+
+                mc_id = str(uuid.uuid4())
+                level_class_ids.append(mc_id)
+                level_name_to_class_id[lvl_name] = mc_id
+                level_name_to_class_name[lvl_name] = mc_name
+
+                m2_classes.append(MOFClass(
+                    id=mc_id,
+                    name=mc_name,
+                    label=mc_label,
+                    description=mc_desc,
+                    is_abstract=True,
+                    attributes=attrs,
+                    meta_structure_id=pattern_id,
+                    meta_structure_role=role,
+                    meta_structure_level=idx + 1,  # 1-indexed
+                ))
+
+            # Build the N-1 ordered hierarchy Associations
+            hierarchy_assoc_ids: list[str] = []
+            for i, assoc_def in enumerate(h.get("hierarchy_associations") or []):
+                src_lvl = assoc_def.get("source_level", "")
+                tgt_lvl = assoc_def.get("target_level", "")
+                src_id = level_name_to_class_id.get(src_lvl)
+                tgt_id = level_name_to_class_id.get(tgt_lvl)
+                src_name = level_name_to_class_name.get(src_lvl, src_lvl)
+                tgt_name = level_name_to_class_name.get(tgt_lvl, tgt_lvl)
+                if not src_id or not tgt_id:
+                    continue
+                tgt_mult = assoc_def.get("target_multiplicity") or {"lower": 0, "upper": -1}
+                a_type = assoc_def.get("association_type") or "aggregation"
+                if a_type not in ("association", "aggregation", "composition"):
+                    a_type = "aggregation"
+                assoc_id = str(uuid.uuid4())
+                hierarchy_assoc_ids.append(assoc_id)
+                m2_assocs.append(Association(
+                    id=assoc_id,
+                    name=assoc_def.get("name", f"contains{tgt_name}"),
+                    label=assoc_def.get("label", f"包含{tgt_lvl}"),
+                    description=assoc_def.get("description") or None,
+                    source=AssociationEnd(
+                        class_ref=src_id, class_name=src_name,
+                        multiplicity=Multiplicity(lower=1, upper=1),
+                    ),
+                    target=AssociationEnd(
+                        class_ref=tgt_id, class_name=tgt_name,
+                        multiplicity=Multiplicity(
+                            lower=tgt_mult.get("lower", 0),
+                            upper=tgt_mult.get("upper", -1),
+                        ),
+                    ),
+                    association_type=a_type,
+                    is_hierarchy=True,
+                    hierarchy_order=i + 1,
+                ))
+
+            # Register the StructuralPattern metadata
+            root_lvl_name = h.get("root_level_name") or levels_def[0].get("level_name", "")
+            root_class_id = level_name_to_class_id.get(root_lvl_name) or level_class_ids[0]
+            m2_structural_patterns.append(StructuralPattern(
+                id=pattern_id,
+                name=theme_name,
+                label=theme_label,
+                description=theme_desc or None,
+                participating_class_ids=level_class_ids,
+                hierarchy_association_ids=hierarchy_assoc_ids,
+                root_class_id=root_class_id,
+                level_names=[L.get("level_name", "") for L in levels_def],
+                constraints=["no_cycle", "no_cross_level", "no_reverse", "root_fixed"],
+                recommended_assoc_type="aggregation",
+            ))
+
+            # Redirect each M1 (originally mapped to theme_name) to its specific level's class
+            for assignment in (h.get("m1_level_assignments") or []):
+                m1n = assignment.get("m1_class_name", "")
+                lvl = assignment.get("level", "")
+                target_cname = level_name_to_class_name.get(lvl)
+                if m1n and target_cname:
+                    theme_to_target_by_m1[(theme_name, m1n)] = target_cname
+
+        # ---- Redirect m1_class_mappings so each M1 points to its specific target class ----
+        m1_mappings_final: list[dict] = []
+        for m in m1_mappings_raw:
+            theme = m.get("m2_parent_name", "")
+            m1n = m.get("m1_class_name", "")
+            target = theme_to_target_by_m1.get((theme, m1n), theme)
+            entry = {
+                "m1_class_name": m1n,
+                "m2_parent_name": target,
+                "m2_theme_name": theme,  # remember which structural theme for back-navigation
+            }
+            m1_mappings_final.append(entry)
 
         m2_package = Package(
             id=str(uuid.uuid4()),
@@ -1124,47 +1185,9 @@ class AIExtractor:
             classes=m2_classes,
             enumerations=m2_enumerations,
             associations=m2_assocs,
+            structural_patterns=m2_structural_patterns,
+            publish_status="draft",  # can transition to published via explicit API
         )
-
-        # ------- Extend m1_class_mappings with level info for save-m2 backfill -------
-        # Mapping schema (existing): {m1_class_name, m2_parent_name}
-        # Extended:                  + level (str) + m2_level_enum_id (str)
-        m1_mappings_final: list[dict] = []
-        # Lookup: m2_class_name → its level info (from _hierarchy if present)
-        level_info_by_m2: dict[str, dict] = {}
-        for c_raw in m2_classes_raw:
-            h = c_raw.get("_hierarchy") or {}
-            if not h.get("has_hierarchy"):
-                continue
-            cname = c_raw.get("name", "")
-            enum_id = class_level_enum_id.get(cname)
-            if not enum_id:
-                continue
-            # map m1 class → level for this M2
-            per_assign = {
-                a.get("m1_class_name"): a.get("level", "whole_tree")
-                for a in (h.get("m1_level_assignments") or [])
-                if a.get("m1_class_name")
-            }
-            level_info_by_m2[cname] = {
-                "enum_id": enum_id,
-                "levels": h.get("levels", []),
-                "assignments": per_assign,
-            }
-
-        for m in m1_mappings_raw:
-            m1_name = m.get("m1_class_name", "")
-            m2_name = m.get("m2_parent_name", "")
-            out = {"m1_class_name": m1_name, "m2_parent_name": m2_name}
-            info = level_info_by_m2.get(m2_name)
-            if info:
-                lvl = info["assignments"].get(m1_name)
-                if lvl and lvl != "whole_tree":
-                    out["level"] = lvl
-                    out["m2_level_enum_id"] = info["enum_id"]
-                elif lvl == "whole_tree":
-                    out["level"] = "whole_tree"
-            m1_mappings_final.append(out)
 
         # Emit partial for UI
         if partial_result_callback:
@@ -1744,12 +1767,44 @@ M1 类列表 (共 {len(skeleton)} 个, 仅骨架信息):
         m2_cls: dict,
         member_m1_classes: list[dict],
     ) -> dict:
-        """Single LLM call: does this M2 base class have a containment hierarchy?
-        Returns {has_hierarchy, levels, m1_level_assignments, self_association_role}.
+        """Single LLM call — design the metastructure (V3.0) for this M2 theme.
+
+        Per methodology V3.0, a StructuralClass is NOT "one class with self-assoc"
+        but a PATTERN of multiple MetaClasses + ordered hierarchy Associations.
+        This method asks the LLM to either:
+          a) Declare it has no hierarchy (it's a FlatClass / 元类)  —  return has_hierarchy=false
+          b) Design a full metastructure: N MetaClasses (each with its OWN attribute
+             subset carved from the original shared attrs) + N-1 ordered hierarchy
+             Associations + root class + per-M1 level assignment.
+
+        Returns a dict with either:
+          {has_hierarchy: False, rationale: str}
+          or
+          {
+            has_hierarchy: True,
+            levels: [{level_name, class_name, class_label, description, attributes: [...]}, ...],
+            hierarchy_associations: [{source_level, target_level, name, label, mult}, ...],
+            m1_level_assignments: [{m1_class_name, level}, ...],
+            root_level_name: str,
+            rationale: str,
+          }
         """
         cls_name = m2_cls.get("name", "")
         cls_label = m2_cls.get("label", cls_name)
         cls_desc = m2_cls.get("description", "") or ""
+
+        # All shared attributes discovered in Phase 2 — these need to be
+        # redistributed across the N level MetaClasses in a structural design.
+        shared_attrs = m2_cls.get("attributes", []) or []
+        shared_attrs_compact = [
+            {
+                "name": a.get("name", ""),
+                "label": a.get("label", ""),
+                "data_type": a.get("data_type", "String"),
+                "unit": a.get("unit", ""),
+            }
+            for a in shared_attrs
+        ]
 
         # Build compact member info (including hierarchy_hints from M1 extraction)
         member_info = []
@@ -1760,7 +1815,7 @@ M1 类列表 (共 {len(skeleton)} 个, 仅骨架信息):
                 "name": cname,
                 "label": c.get("label", "") or "",
                 "description": (c.get("description") or "")[:80],
-                "attrs": [a.get("name", "") for a in (c.get("attributes") or [])][:12],
+                "attrs": [a.get("name", "") for a in (c.get("attributes") or [])][:15],
             }
             h = c.get("hierarchy_hint")
             if h and isinstance(h, dict):
@@ -1775,131 +1830,276 @@ M1 类列表 (共 {len(skeleton)} 个, 仅骨架信息):
 
         members_json = json.dumps(member_info, ensure_ascii=False)
         hints_json = json.dumps(hint_samples, ensure_ascii=False) if hint_samples else "[]"
+        shared_attrs_json = json.dumps(shared_attrs_compact, ensure_ascii=False)
 
-        prompt = f"""你是 MOF 元建模专家。为 M2 基类 "{cls_label}" ({cls_name}) 探测是否存在多层容器结构。
+        prompt = f"""你是 MOF 元建模专家。方法论 V3.0 要求：对有层级结构的业务主题, M2 应表达为【元结构 StructuralClass】, 即多个独立的 MetaClass + 有序层级关联, 而不是一个含自关联的单类。
+
+任务: 为 M2 主题 "{cls_label}" ({cls_name}) 做结构化设计。
 
 业务背景:
-- 类名: {cls_name}
-- 标签: {cls_label}
+- 主题名: {cls_name}  (label: {cls_label})
 - 描述: {cls_desc[:200]}
-- 成员数: {len(member_m1_classes)} 个 M1 类
+- 包含 {len(member_m1_classes)} 个 M1 成员类
+- Phase 2 暂汇总的共性属性集: {len(shared_attrs)} 个 (需在 N 个 MetaClass 间重新分配)
 
-⚠️ 判定规则 (核心):
-1. 层级必须是【纵向结构角色 / 包含关系】, 不是【横向专业类型】
-   ✅ 好: [设施, 功能分组, 设备, 部件]  ← 上层包含下层
-   ✅ 好: [工程项目, 任务, 子任务]      ← 上层分解出下层
-   ✅ 好: [单位, 部门, 岗位]            ← 上层管理下层
-   ❌ 差: [机电, 水工, 闸门]           ← 这是专业分类, 不是层级
-   ❌ 差: [抽水蓄能, 电化学]           ← 这是电站类型, 不是层级
+⚠️ 决策规则:
 
-2. 判定是否有层级, 需要看:
-   - M1 成员名字里是否出现典型的层级语义 (电站/机组/部件 这类)
-   - M1 属性里是否有 "上级系统""父节点""所属..." 等容器线索
-   - 文档领域常识 (设备资产管理确有 设施→设备→部件 的分层)
+(1) 首先决定该主题是【元类】还是【元结构】:
 
-3. 层级数量: 一般 2-5 层合理, 超过 6 层往往是过度细分
+  ✅ 元结构 (StructuralClass) 的判据 — 需要**纵向包含关系**:
+     - [设施, 功能分组, 设备, 部件]  ← 上层实际包含下层
+     - [工程项目, 任务, 子任务]      ← 上层可分解出下层
+     - [法人, 部门, 岗位, 人员]      ← 组织的上下级
 
-4. 如果这个主题没有明显层级嵌套 (如 会务资料、专家意见), 直接返回 has_hierarchy=false
+  ❌ 不是元结构:
+     - [机电, 水工, 闸门]           ← 横向专业分类, 非包含关系
+     - [抽水蓄能, 电化学, 常规水电]   ← 电站类型, 非层级
+     - 会务资料 / 专家意见 / 标准报告   ← 扁平业务对象
 
-5. 每个 M1 类指定一个 level, 或标记 "whole_tree" (该类模板本身覆盖多层)
-6. 同一个 level 可以分配多个 M1 成员 (如"设备"层有机电设备+建筑设备+闸门设备)
+  判据看四个线索: M1 成员名的层级语义 / M1 属性里的"上级""所属"暗示 / 行业常识 / hierarchy_hint
+
+(2) 若判为元类 → 返回 has_hierarchy=false, rationale 说明为什么
+
+(3) 若判为元结构 → **设计完整元结构**:
+    a. 确定层级序列 (2-6 层, 从根到叶), 每层一个 MetaClass
+    b. 给每个 MetaClass 取 PascalCase 英文名 + 中文 label (例: 设施=Facility)
+    c. **把 Phase 2 的共性属性集按层级重新分配** — 每个属性只属于一层 MetaClass:
+       - "地理坐标"属于设施级, 不属于部件级
+       - "投运日期""运行状态"属于设备级
+       - "规格参数""材质"属于部件级
+       - 如果某属性所有层都应有 (如 id/name/code), 放到【根层级】
+    d. 生成 N-1 条有序层级关联 (source=上层, target=下层, multiplicity=0..*)
+    e. 标注根节点 (根层级的 class_name)
+    f. 给每个 M1 成员类分配一个具体 level (不再有 whole_tree 概念, 每个 M1 必须落在具体层)
+
+(4) **绝对禁止**:
+    - 把专业类型 (机电/水工/闸门) 识别为层级
+    - 超过 6 层的过度分解
+    - 用 Entity/Object/Item/Thing/Element/Data 做层级名
+    - 允许 M1 不归任何一层 (全树模板的场景在 V3.0 中应改为绑定到根层级)
 
 返回严格 JSON (无 markdown):
+
+▼ 若是元结构:
 {{
   "has_hierarchy": true,
-  "levels": ["设施", "功能分组", "设备", "部件"],
+  "levels": [
+    {{
+      "level_name": "设施",
+      "class_name": "Facility",
+      "class_label": "设施",
+      "description": "业务资产管理的顶层节点",
+      "attributes": [
+        {{"name": "facilityCode", "label": "设施编码", "data_type": "String", "multiplicity": {{"lower": 1, "upper": 1}}}},
+        {{"name": "facilityName", "label": "设施名称", "data_type": "String"}},
+        {{"name": "geoCoordinate", "label": "地理坐标", "data_type": "String"}}
+      ]
+    }},
+    {{
+      "level_name": "功能分组",
+      "class_name": "FunctionalGroup",
+      "class_label": "功能分组",
+      "description": "同一功能的设备分组",
+      "attributes": [
+        {{"name": "groupCode", "label": "分组编码", "data_type": "String"}},
+        {{"name": "groupType", "label": "分组类型", "data_type": "Enum"}}
+      ]
+    }},
+    {{
+      "level_name": "设备",
+      "class_name": "Equipment",
+      "class_label": "设备",
+      "description": "可独立运维的设备实体",
+      "attributes": [
+        {{"name": "equipmentCode", "label": "设备编码", "data_type": "String"}},
+        {{"name": "commissionDate", "label": "投运日期", "data_type": "Date"}},
+        {{"name": "operatingStatus", "label": "运行状态", "data_type": "Enum"}}
+      ]
+    }},
+    {{
+      "level_name": "部件",
+      "class_name": "Component",
+      "class_label": "部件",
+      "description": "设备的组成部分",
+      "attributes": [
+        {{"name": "componentCode", "label": "部件编码", "data_type": "String"}},
+        {{"name": "specification", "label": "规格参数", "data_type": "String"}}
+      ]
+    }}
+  ],
+  "hierarchy_associations": [
+    {{"source_level": "设施", "target_level": "功能分组", "name": "containsFunctionalGroup", "label": "包含功能分组", "target_multiplicity": {{"lower": 0, "upper": -1}}, "association_type": "aggregation"}},
+    {{"source_level": "功能分组", "target_level": "设备", "name": "containsEquipment", "label": "包含设备", "target_multiplicity": {{"lower": 0, "upper": -1}}, "association_type": "aggregation"}},
+    {{"source_level": "设备", "target_level": "部件", "name": "containsComponent", "label": "包含部件", "target_multiplicity": {{"lower": 0, "upper": -1}}, "association_type": "aggregation"}}
+  ],
+  "root_level_name": "设施",
   "m1_level_assignments": [
     {{"m1_class_name": "PumpedStorageStation", "level": "设施"}},
     {{"m1_class_name": "GeneratorUnitSystem", "level": "功能分组"}},
     {{"m1_class_name": "HydroTurbine", "level": "设备"}},
-    {{"m1_class_name": "TurbineBlade", "level": "部件"}},
-    {{"m1_class_name": "PumpedStorageElectricalLedger", "level": "whole_tree"}}
+    {{"m1_class_name": "TurbineBlade", "level": "部件"}}
   ],
-  "self_association_role": "contains",
-  "rationale": "该主题在业务上有 电站→系统→设备→部件 的标准分层"
+  "rationale": "该主题在业务上有标准的 电站→系统→设备→部件 分层, 属于元结构"
 }}
 
-若无层级, 返回:
-{{"has_hierarchy": false, "rationale": "仅为业务资料, 无容器层级"}}
+▼ 若不是元结构 (元类):
+{{
+  "has_hierarchy": false,
+  "rationale": "该主题是扁平业务对象, 无纵向包含关系"
+}}
 
-该 M2 基类的 M1 成员 ({len(member_info)} 个):
+---
+
+Phase 2 已汇总的共性属性集 (需要在设计中重新分配到各层级):
+{shared_attrs_json}
+
+该 M2 主题的 M1 成员 ({len(member_info)} 个, 含属性名列表):
 {members_json}
 
-M1 提取时的层级线索 (仅供参考, 可能不准):
+M1 提取时的层级线索 (仅供参考):
 {hints_json}"""
 
         result = await self._ask(prompt, max_tokens=self.DEFAULT_MAX_TOKENS)
 
         # ----- Validate / sanitize -----
         if not isinstance(result, dict):
-            return {"has_hierarchy": False}
+            return {"has_hierarchy": False, "rationale": "AI 返回格式无效"}
 
         has_h = bool(result.get("has_hierarchy"))
         if not has_h:
             return {"has_hierarchy": False, "rationale": result.get("rationale", "")}
 
-        levels = result.get("levels") or []
-        if not isinstance(levels, list):
-            levels = []
-        # Clean level names: strings, stripped, unique preserving order
-        cleaned_levels: list[str] = []
-        seen = set()
-        for L in levels:
-            if not isinstance(L, str):
-                continue
-            Lc = L.strip()
-            if not Lc or Lc in seen:
-                continue
-            # Reject forbidden generic names
-            if Lc.lower() in ("entity", "object", "item", "thing", "element", "data"):
-                continue
-            cleaned_levels.append(Lc)
-            seen.add(Lc)
+        raw_levels = result.get("levels") or []
+        if not isinstance(raw_levels, list) or len(raw_levels) < 2:
+            return {"has_hierarchy": False, "rationale": "探测到的层级不足 2 层, 视为元类"}
 
-        # Bound: 2-8 levels is sane
+        # --- Clean levels: unique level_name, valid class_name, strip forbidden names ---
+        forbidden = {"entity", "object", "item", "thing", "element", "data"}
+        cleaned_levels: list[dict] = []
+        seen_level_names: set[str] = set()
+        seen_class_names: set[str] = set()
+        for lvl in raw_levels[:8]:  # cap 8
+            if not isinstance(lvl, dict):
+                continue
+            ln = (lvl.get("level_name") or "").strip()
+            cn = (lvl.get("class_name") or "").strip()
+            cl = (lvl.get("class_label") or ln or "").strip()
+            if not ln or not cn or ln in seen_level_names or cn in seen_class_names:
+                continue
+            if ln.lower() in forbidden or cn.lower() in forbidden:
+                continue
+            # Sanitize attributes
+            attrs_list = []
+            for a in (lvl.get("attributes") or []):
+                if not isinstance(a, dict):
+                    continue
+                an = (a.get("name") or "").strip()
+                if not an:
+                    continue
+                mult = a.get("multiplicity") or {}
+                attrs_list.append({
+                    "name": an,
+                    "label": a.get("label") or an,
+                    "data_type": a.get("data_type") or "String",
+                    "unit": a.get("unit") or None,
+                    "enum_name": a.get("enum_name") or None,
+                    "multiplicity": {
+                        "lower": mult.get("lower", 1) if isinstance(mult, dict) else 1,
+                        "upper": mult.get("upper", 1) if isinstance(mult, dict) else 1,
+                    },
+                })
+            cleaned_levels.append({
+                "level_name": ln,
+                "class_name": cn,
+                "class_label": cl,
+                "description": (lvl.get("description") or "").strip(),
+                "attributes": attrs_list,
+            })
+            seen_level_names.add(ln)
+            seen_class_names.add(cn)
+
         if len(cleaned_levels) < 2:
-            return {
-                "has_hierarchy": False,
-                "rationale": f"探测到的层级不足 ({len(cleaned_levels)}), 忽略",
-            }
-        if len(cleaned_levels) > 8:
-            cleaned_levels = cleaned_levels[:8]
+            return {"has_hierarchy": False, "rationale": "清洗后层级不足 2 层, 视为元类"}
 
-        # Clean mappings
+        # --- Clean hierarchy_associations: must form ordered chain (N-1 edges) ---
+        raw_assocs = result.get("hierarchy_associations") or []
+        level_name_order = [L["level_name"] for L in cleaned_levels]
+        cleaned_assocs: list[dict] = []
+        for i in range(len(level_name_order) - 1):
+            src_name = level_name_order[i]
+            tgt_name = level_name_order[i + 1]
+            # Find matching from AI output, or synthesize
+            found = None
+            for a in raw_assocs:
+                if not isinstance(a, dict):
+                    continue
+                if (a.get("source_level") == src_name) and (a.get("target_level") == tgt_name):
+                    found = a
+                    break
+            if found:
+                tgt_mult = found.get("target_multiplicity") or {"lower": 0, "upper": -1}
+                cleaned_assocs.append({
+                    "source_level": src_name,
+                    "target_level": tgt_name,
+                    "name": (found.get("name") or f"contains{tgt_name}").strip(),
+                    "label": (found.get("label") or f"包含{tgt_name}").strip(),
+                    "description": (found.get("description") or "").strip(),
+                    "target_multiplicity": {
+                        "lower": tgt_mult.get("lower", 0),
+                        "upper": tgt_mult.get("upper", -1),
+                    },
+                    "association_type": (found.get("association_type") or "aggregation"),
+                })
+            else:
+                # Synthesize — ensure the chain is complete even if AI missed an edge
+                cleaned_assocs.append({
+                    "source_level": src_name,
+                    "target_level": tgt_name,
+                    "name": f"contains{cleaned_levels[i+1]['class_name']}",
+                    "label": f"包含{cleaned_levels[i+1]['class_label']}",
+                    "description": "",
+                    "target_multiplicity": {"lower": 0, "upper": -1},
+                    "association_type": "aggregation",
+                })
+
+        # --- Root level: prefer AI's choice, fall back to first level ---
+        root_name = (result.get("root_level_name") or "").strip()
+        if root_name not in seen_level_names:
+            root_name = cleaned_levels[0]["level_name"]
+
+        # --- M1 level assignments: every M1 must map to a valid level ---
         member_names = {c.get("name", "") for c in member_m1_classes}
         raw_assignments = result.get("m1_level_assignments") or []
-        clean_assignments: list[dict] = []
-        whole_tree_names: set[str] = set()
-        level_assigned: dict[str, str] = {}
+        assigned_lookup: dict[str, str] = {}
         for a in raw_assignments:
             if not isinstance(a, dict):
                 continue
             n = (a.get("m1_class_name") or "").strip()
             L = (a.get("level") or "").strip()
-            if n not in member_names or not L:
+            if n not in member_names:
                 continue
+            # Accept either legacy "whole_tree" mapped to root, or exact level name
             if L == "whole_tree":
-                whole_tree_names.add(n)
-                clean_assignments.append({"m1_class_name": n, "level": "whole_tree"})
-            elif L in seen:
-                level_assigned[n] = L
-                clean_assignments.append({"m1_class_name": n, "level": L})
-
-        # Any M1 member not assigned falls back to "whole_tree" (safe default)
+                assigned_lookup[n] = root_name
+            elif L in seen_level_names:
+                assigned_lookup[n] = L
+        # Any unassigned M1 → root (safest default, user can fix post-hoc)
         for n in member_names:
-            if n not in level_assigned and n not in whole_tree_names:
-                clean_assignments.append({"m1_class_name": n, "level": "whole_tree"})
+            if n not in assigned_lookup:
+                assigned_lookup[n] = root_name
 
-        role = (result.get("self_association_role") or "").strip() or "contains"
-        # Sanitize role to identifier-safe
-        role = "".join(ch for ch in role if ch.isalnum()) or "contains"
+        clean_assignments = [
+            {"m1_class_name": n, "level": lvl}
+            for n, lvl in assigned_lookup.items()
+        ]
 
         return {
             "has_hierarchy": True,
             "levels": cleaned_levels,
+            "hierarchy_associations": cleaned_assocs,
+            "root_level_name": root_name,
             "m1_level_assignments": clean_assignments,
-            "self_association_role": role,
-            "rationale": result.get("rationale", ""),
+            "rationale": (result.get("rationale") or "").strip(),
         }
 
     # ==================================================================

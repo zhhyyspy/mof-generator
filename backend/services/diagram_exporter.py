@@ -897,22 +897,60 @@ def _count_children_by_m2(mappings: list) -> dict:
 
 
 def _has_hierarchy_map(m2_pkg: dict) -> dict:
-    """Returns {m2_name: bool} by checking if the M2 class has a 'level' enum attr."""
+    """Returns {m2_name: bool}.
+
+    V3.0: class participates in any StructuralPattern → True.
+    Legacy: class has a 'level' enum attribute → True.
+    """
     out = {}
+    # V3.0: collect all participating class IDs across all patterns
+    sp_participating = set()
+    for sp in (m2_pkg.get("structural_patterns") or []):
+        for cid in (sp.get("participating_class_ids") or []):
+            sp_participating.add(cid)
     enum_ids = {e.get("id") for e in (m2_pkg.get("enumerations") or [])}
     for c in (m2_pkg.get("classes") or []):
         has = False
-        for a in (c.get("attributes") or []):
-            if a.get("name") == "level" and a.get("enum_ref") in enum_ids:
-                has = True
-                break
+        if c.get("id") in sp_participating:
+            has = True
+        else:
+            for a in (c.get("attributes") or []):
+                if a.get("name") == "level" and a.get("enum_ref") in enum_ids:
+                    has = True
+                    break
         out[c.get("name", "")] = has
     return out
 
 
 def _hierarchy_levels(m2_pkg: dict, m2_name: str) -> list:
-    """Returns the level literals (ordered) for a given M2 class name, or []."""
-    # Find the class's level enum_ref
+    """Returns ordered level labels for a given M2 class name.
+
+    V3.0: if the class is in a StructuralPattern, return the pattern's level_names.
+    Legacy: if the class has a 'level' enum, return its literal labels.
+    """
+    # V3.0: look up the pattern containing this class
+    target_cls = None
+    for c in (m2_pkg.get("classes") or []):
+        if c.get("name") == m2_name:
+            target_cls = c
+            break
+    if target_cls:
+        for sp in (m2_pkg.get("structural_patterns") or []):
+            if target_cls.get("id") in (sp.get("participating_class_ids") or []):
+                level_names = sp.get("level_names") or []
+                if level_names:
+                    return list(level_names)
+                # Fallback: derive from participating classes' meta_structure_level
+                class_by_id = {c.get("id"): c for c in (m2_pkg.get("classes") or [])}
+                lvls = []
+                for cid in (sp.get("participating_class_ids") or []):
+                    pc = class_by_id.get(cid)
+                    if pc and pc.get("meta_structure_level"):
+                        lvls.append(pc["meta_structure_level"])
+                if lvls:
+                    return lvls
+                break
+    # Legacy: find the class's level enum_ref
     enum_id = None
     for c in (m2_pkg.get("classes") or []):
         if c.get("name") != m2_name:

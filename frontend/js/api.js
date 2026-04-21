@@ -173,6 +173,17 @@ export const API = {
     return (await request(`/models/${modelId}/versions/${version}/activate`, { method: 'POST' })).json();
   },
 
+  // Publish lifecycle (V3.0 methodology § 2.4)
+  async getPublishStatus(modelId) {
+    return (await request(`/models/${modelId}/publish-status`)).json();
+  },
+  async setPublishStatus(modelId, targetStatus, publishedBy = '') {
+    return (await request(`/models/${modelId}/publish-status`, {
+      method: 'POST',
+      body: JSON.stringify({ target_status: targetStatus, published_by: publishedBy }),
+    })).json();
+  },
+
   // M3
   async getM3() { return (await request('/m2-templates/m3')).json(); },
 
@@ -199,4 +210,60 @@ export const API = {
   },
   async getLLMStats() { return (await request('/llm/stats')).json(); },
   async clearLLMStats() { return (await request('/llm/stats', { method: 'DELETE' })).json(); },
+
+  // ---- Complete Model Package (.mofpkg.zip) V1.0 ----
+  /** Export a complete package; returns { blob, filename }. */
+  async exportPackage(m1Id, options = {}) {
+    const body = {
+      m1_id: m1Id,
+      include_m2: options.includeM2 !== false,
+      include_all_versions: !!options.includeAllVersions,
+      include_documents: !!options.includeDocuments,
+      include_llm_providers: !!options.includeLLM,
+      note: options.note || '',
+      exported_by: options.exportedBy || '',
+    };
+    const res = await request('/package/export', {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    const blob = await res.blob();
+    // Extract filename from RFC 5987 UTF-8 Content-Disposition
+    const cd = res.headers.get('Content-Disposition') || '';
+    let filename = 'model_package.mofpkg.zip';
+    const utf8Match = cd.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+      try { filename = decodeURIComponent(utf8Match[1]); } catch {}
+    } else {
+      const asciiMatch = cd.match(/filename="([^"]+)"/i);
+      if (asciiMatch) filename = asciiMatch[1];
+    }
+    return { blob, filename };
+  },
+  /** Dry-run: parse manifest + list conflicts. */
+  async previewImportPackage(file) {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${BASE}/package/preview`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  /** Actual import; options = { strategy, import_documents, import_llm }. */
+  async importPackage(file, options = {}) {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('options', JSON.stringify({
+      strategy: options.strategy || 'rename',
+      import_documents: options.importDocuments !== false,
+      import_llm: !!options.importLLM,
+    }));
+    const res = await fetch(`${BASE}/package/import`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
 };

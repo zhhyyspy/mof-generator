@@ -159,6 +159,11 @@ class Association(BaseModel):
     source: AssociationEnd
     target: AssociationEnd
     association_type: str = "association"  # association | composition | aggregation
+    # Methodology V3.0: when this association is a hierarchy edge inside a
+    # StructuralClass pattern, mark it and record its position in the ordered chain
+    # (1-indexed, from root → leaf). Hierarchy associations count N-1 for N levels.
+    is_hierarchy: bool = False
+    hierarchy_order: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +184,45 @@ class MOFClass(BaseModel):
     # Not user-editable; purely a side-channel between extract_m1 and derive_m2.
     # Schema: {"theme_hint": str, "level_hint": str, "parent_name_hint": str}
     hierarchy_hint: Optional[dict] = None
+    # Methodology V3.0: if this class participates in a StructuralClass pattern,
+    # record which pattern and its role.
+    # meta_structure_id  → StructuralPattern.id it belongs to
+    # meta_structure_role → "root" | "intermediate" | "leaf"
+    # meta_structure_level → 1-indexed depth in the pattern (root=1)
+    meta_structure_id: Optional[str] = None
+    meta_structure_role: Optional[str] = None
+    meta_structure_level: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# StructuralPattern — V3.0 元结构 (methodology key concept)
+# ---------------------------------------------------------------------------
+# A StructuralPattern describes how a group of M2 MetaClasses combines into a
+# hierarchical containment tree. It is NOT a class itself — it's pattern metadata
+# that references participating classes + ordered hierarchy associations.
+#
+# This is the correct representation of 元结构 per methodology V3.0:
+#   - participating_class_ids: N MetaClass ids (each with its own attribute set)
+#   - hierarchy_association_ids: N-1 ordered Association ids forming the chain
+#   - root_class_id: which participating class is the tree root
+#   - level_names: human-readable labels for each level (ordered root → leaf)
+#   - constraints: OCL-style rules (no_cycle / no_cross_level / root_fixed / etc.)
+
+class StructuralPattern(BaseModel):
+    id: str = Field(default_factory=_uid)
+    name: str               # e.g. "EquipmentLedger"  — English PascalCase
+    label: Optional[str] = None  # e.g. "设备台账"
+    description: Optional[str] = None
+    participating_class_ids: list[str] = Field(default_factory=list)
+    hierarchy_association_ids: list[str] = Field(default_factory=list)
+    root_class_id: Optional[str] = None
+    level_names: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=lambda: [
+        "no_cycle", "no_cross_level", "no_reverse", "root_fixed",
+    ])
+    # Recommended composition type for the hierarchy edges. Methodology uses
+    # "composition" for strict ownership or "aggregation" for looser containment.
+    recommended_assoc_type: str = "aggregation"
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +239,11 @@ class Package(BaseModel):
     enumerations: list[Enumeration] = Field(default_factory=list)
     associations: list[Association] = Field(default_factory=list)
     sub_packages: list[Package] = Field(default_factory=list)
+    # Methodology V3.0: one M2 Package may contain multiple StructuralPatterns
+    # (one per hierarchical business theme). Flat classes (元类) don't need an entry.
+    structural_patterns: list[StructuralPattern] = Field(default_factory=list)
+    # M1 Package publish lifecycle (V3.0 § 2.4): draft | review | published | deprecated
+    # Only "published" packages can be referenced by downstream Object Centers.
+    publish_status: str = "draft"
+    published_at: Optional[str] = None   # ISO timestamp, set when transitioning to "published"
+    published_by: Optional[str] = None

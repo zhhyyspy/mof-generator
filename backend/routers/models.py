@@ -100,13 +100,16 @@ async def save_m2_from_review(data: dict):
     store.save_model(m2_model)
 
     # Update M1 to reference this M2 (and mark inherited attributes)
+    # V3.0 methodology: each M1 class points to a SPECIFIC M2 MetaClass (not a
+    # single "theme" class with a level enum). m1_class_mappings now contains:
+    #   {m1_class_name, m2_parent_name, m2_theme_name}
+    # where m2_parent_name is the specific level MetaClass (e.g. "Facility") and
+    # m2_theme_name is the outer structural theme (e.g. "EquipmentLedger") for
+    # back-navigation. For flat (元类) themes, both names are the same.
     m1_model = store.get_model(source_m1_id)
     if m1_model:
         m1_model.m2_template_id = m2_id
 
-        # Build a per-M1-class lookup from class_mappings (includes level info from
-        # Phase 2.5 hierarchy detection, if present):
-        # { m1_class_name: {"m2_parent_name": str, "level": str | None, "m2_level_enum_id": str | None} }
         m1_mapping_lookup: dict[str, dict] = {}
         for m in class_mappings:
             n = m.get("m1_class_name")
@@ -114,14 +117,11 @@ async def save_m2_from_review(data: dict):
                 continue
             m1_mapping_lookup[n] = {
                 "m2_parent_name": m.get("m2_parent_name"),
-                "level": m.get("level"),
-                "m2_level_enum_id": m.get("m2_level_enum_id"),
+                "m2_theme_name": m.get("m2_theme_name") or m.get("m2_parent_name"),
             }
 
         pkg_m1 = m1_model.versions[-1].package
         m2_class_ids = {c.name: c.id for c in pkg.classes}
-        # For each M2 class, record its (attr_name -> attr_obj) map so we can copy
-        # inherited attrs faithfully on M1 side (incl. the level enum attr).
         m2_attrs_by_class: dict[str, dict] = {
             c.name: {a.name: a for a in c.attributes} for c in pkg.classes
         }
@@ -132,60 +132,22 @@ async def save_m2_from_review(data: dict):
                 continue
 
             parent_name = info["m2_parent_name"]
-            if not parent_name:
+            if not parent_name or parent_name not in m2_class_ids:
                 continue
 
             cls.parent_class_name = parent_name
             cls.parent_class_ref = m2_class_ids.get(parent_name)
 
-            m2_attrs = m2_attrs_by_class.get(parent_name, {})
-            m2_attr_names = set(m2_attrs.keys())
-
-            # Mark M1 attributes that share a name with M2 attributes as inherited
-            existing_m1_attr_names = set()
+            # Mark M1 attributes that share a name with the M2 class's attrs as inherited
+            # Inheritance is now strictly by name-match with the SPECIFIC level MetaClass
+            # the M1 belongs to (not an aggregate "theme" class).
+            m2_attr_names = set(m2_attrs_by_class.get(parent_name, {}).keys())
             for attr in cls.attributes:
-                existing_m1_attr_names.add(attr.name)
                 if attr.name in m2_attr_names:
                     attr.is_inherited = True
 
-            # ----- Backfill the `level` attribute when M2 has a hierarchy -----
-            # If Phase 2.5 detected a hierarchy for this M2 class, M2 now has a
-            # `level` enum attribute. Propagate it to the M1 child, with a default
-            # value set to the assigned level (unless whole_tree).
-            assigned_level = info.get("level")
-            m2_level_attr = m2_attrs.get("level")
-            if m2_level_attr is not None:
-                # Respect any existing `level` attr the user may have already edited
-                existing_level = next(
-                    (a for a in cls.attributes if a.name == "level"), None
-                )
-                if existing_level is not None:
-                    existing_level.is_inherited = True
-                    existing_level.enum_ref = m2_level_attr.enum_ref
-                    existing_level.data_type = m2_level_attr.data_type
-                    # Only overwrite default if not previously set by user
-                    if assigned_level and assigned_level != "whole_tree" and not existing_level.default_value:
-                        existing_level.default_value = assigned_level
-                else:
-                    # Append as inherited — use same structure as the M2 attribute
-                    new_attr = Attribute(
-                        name="level",
-                        label=m2_level_attr.label or "层级",
-                        description=m2_level_attr.description,
-                        data_type=m2_level_attr.data_type,
-                        enum_ref=m2_level_attr.enum_ref,
-                        multiplicity=Multiplicity(
-                            lower=m2_level_attr.multiplicity.lower,
-                            upper=m2_level_attr.multiplicity.upper,
-                        ),
-                        default_value=(
-                            assigned_level
-                            if assigned_level and assigned_level != "whole_tree"
-                            else None
-                        ),
-                        is_inherited=True,
-                    )
-                    cls.attributes.append(new_attr)
+        # M1 package publish status: transitioning to "published" happens via explicit
+        # API call. save-m2 just wires up the M1→M2 inheritance, doesn't auto-publish.
 
         store.save_model(m1_model)
 
@@ -573,3 +535,83 @@ async def switch_to_version(model_id: str, version: str):
     model.versions = [v for v in model.versions if v.version != version] + [matched]
     store.save_model(model)
     return {"status": "switched", "current_version": version}
+
+
+# ---- M1/M2 Package publish lifecycle (V3.0 § 2.4) ----
+# Methodology requires M1/M2 Packages to have an explicit publish status so
+# downstream Object Centers can differentiate "in-progress edits" from "official
+# versions safe to reference". States: draft → review → published → deprecated.
+
+_VALID_STATUSES = ("draft", "review", "published", "deprecated")
+_ALLOWED_TRANSITIONS = {
+    "draft":      ("review", "published"),        # skip-review also allowed (small team)
+    "review":     ("draft", "published"),         # back to draft or promote
+    "published":  ("deprecated",),                # published is immutable, only deprecate
+    "deprecated": (),                             # terminal
+}
+
+
+@router.post("/{model_id}/publish-status")
+async def set_publish_status(model_id: str, data: dict):
+    """Transition the package's publish_status to a new state.
+
+    Request body: {"target_status": "review|published|deprecated|draft",
+                   "published_by": "optional user identifier"}
+    """
+    model = _get_model_or_404(model_id)
+    target = (data or {}).get("target_status", "").strip()
+
+    if target not in _VALID_STATUSES:
+        raise HTTPException(
+            400,
+            f"target_status 必须是 {_VALID_STATUSES} 之一",
+        )
+
+    if not model.versions:
+        raise HTTPException(400, "模型没有版本, 无法设置发布状态")
+
+    pkg = model.versions[-1].package
+    current = getattr(pkg, "publish_status", None) or "draft"
+
+    if target == current:
+        return {"status": "noop", "publish_status": current}
+
+    # Validate transition
+    allowed = _ALLOWED_TRANSITIONS.get(current, ())
+    if target not in allowed:
+        raise HTTPException(
+            400,
+            f"不允许从 '{current}' 直接转到 '{target}'。"
+            f"允许的转换: {current} → {allowed}",
+        )
+
+    pkg.publish_status = target
+    if target == "published":
+        pkg.published_at = datetime.now().isoformat()
+        pkg.published_by = (data or {}).get("published_by", "system")
+    # If reverting from published (only via deprecated), keep the published_at record
+
+    store.save_model(model)
+    return {
+        "status": "updated",
+        "publish_status": target,
+        "published_at": pkg.published_at,
+        "published_by": pkg.published_by,
+    }
+
+
+@router.get("/{model_id}/publish-status")
+async def get_publish_status(model_id: str):
+    """Return the current publish status of the model's latest version Package."""
+    model = _get_model_or_404(model_id)
+    if not model.versions:
+        return {"publish_status": "draft", "published_at": None, "published_by": None}
+    pkg = model.versions[-1].package
+    return {
+        "publish_status": getattr(pkg, "publish_status", None) or "draft",
+        "published_at": getattr(pkg, "published_at", None),
+        "published_by": getattr(pkg, "published_by", None),
+        "allowed_transitions": list(_ALLOWED_TRANSITIONS.get(
+            getattr(pkg, "publish_status", None) or "draft", ()
+        )),
+    }

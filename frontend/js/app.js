@@ -330,10 +330,12 @@ function setupToolbar() {
   document.getElementById('btn-export-cancel').addEventListener('click', () => {
     document.getElementById('export-modal').classList.add('hidden');
   });
-  // Export mode tab switching (raw vs review package)
+  // Export mode tab switching (raw vs review package vs complete package)
   document.querySelectorAll('.export-mode-tab').forEach(tab => {
     tab.addEventListener('click', () => switchExportMode(tab.dataset.mode));
   });
+  // Wire complete-package Import modal (V3.0 .mofpkg.zip)
+  wireImportPackageModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -1202,14 +1204,642 @@ async function loadExistingModels() {
     const m2s = res.models.filter(m => m.id.startsWith('m2_'));
     if (m1s.length) {
       state.m1ModelId = m1s[0].id;  // Most recent M1
+      // Load the M2 that matches this M1 *first* (by `m2_${m1Id}` convention),
+      // so when we render the M1 tree below, state.m2Model is already populated
+      // and the V3.0 metastructure panel can appear on first paint.
+      const matchingM2 = `m2_${m1s[0].id}`;
+      const hasMatch = m2s.some(m => m.id === matchingM2);
+      if (hasMatch) {
+        state.m2ModelId = matchingM2;
+        await loadModel(matchingM2, 'm2');
+      } else if (m2s.length) {
+        // No direct match — fall back to most-recent M2 so M2 tab isn't empty
+        state.m2ModelId = m2s[0].id;
+        await loadModel(m2s[0].id, 'm2');
+      }
       await loadModel(m1s[0].id, 'm1');
-    }
-    if (m2s.length) {
+    } else if (m2s.length) {
+      // No M1 at all, still show the most recent M2
       state.m2ModelId = m2s[0].id;
       await loadModel(m2s[0].id, 'm2');
     }
     renderModelPicker();
   } catch (e) { console.error('Load models failed:', e); }
+}
+
+/**
+ * Publish-status switch dialog (V3.0 § 2.4).
+ * Fetches allowed transitions from backend, shows a small inline modal,
+ * calls setPublishStatus, then refreshes the model.
+ */
+async function openPublishStatusDialog(layer, modelId, currentStatus) {
+  if (!modelId) { showToast('模型未保存,无法切换发布状态', 'error'); return; }
+  const STATUS_META = {
+    draft:      { label: '🟡 草稿',     desc: '可随意编辑。下一步: 提交评审或直接发布。' },
+    review:     { label: '🟠 评审中',   desc: '组织内部评审中。可回退草稿或正式发布。' },
+    published:  { label: '🟢 已发布',   desc: '冻结发布版本。只可变更为"已废弃"。' },
+    deprecated: { label: '⚫ 已废弃',   desc: '模型已停用 (终态)。不能再切换。' },
+  };
+  let resp;
+  try {
+    resp = await API.getPublishStatus(modelId);
+  } catch (e) {
+    showToast('获取发布状态失败: ' + e.message, 'error');
+    return;
+  }
+  const allowed = resp.allowed_transitions || [];
+  // Remove any existing dialog
+  const existing = document.getElementById('publish-status-dialog');
+  if (existing) existing.remove();
+
+  const ovl = document.createElement('div');
+  ovl.id = 'publish-status-dialog';
+  ovl.className = 'publish-dialog-overlay';
+  const curMeta = STATUS_META[currentStatus] || { label: currentStatus, desc: '' };
+  const btnsHtml = allowed.length
+    ? allowed.map(s => {
+        const m = STATUS_META[s] || { label: s, desc: '' };
+        return `<button type="button" class="publish-option status-${s}" data-target="${s}">
+          <span class="publish-option-label">${m.label}</span>
+          <span class="publish-option-desc">${m.desc}</span>
+        </button>`;
+      }).join('')
+    : '<div class="publish-no-options">当前状态无可用转换 (终态)</div>';
+
+  ovl.innerHTML = `
+    <div class="publish-dialog">
+      <div class="publish-dialog-header">
+        <span>切换发布状态</span>
+        <button type="button" class="publish-dialog-close" aria-label="关闭">×</button>
+      </div>
+      <div class="publish-dialog-body">
+        <div class="publish-current">
+          <span class="publish-current-label">当前:</span>
+          <span class="tree-dashboard-status status-${currentStatus}">${curMeta.label}</span>
+          <div class="publish-current-desc">${curMeta.desc}</div>
+        </div>
+        <div class="publish-options-title">可切换为:</div>
+        <div class="publish-options">${btnsHtml}</div>
+        <div class="publish-dialog-hint">
+          ${layer === 'm1' ? 'M1 Package 发布后将作为正式版本冻结,供 M0 实例引用。' : 'M2 元模型发布后,下游 M1 可稳定绑定。'}
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(ovl);
+
+  const close = () => ovl.remove();
+  ovl.querySelector('.publish-dialog-close').addEventListener('click', close);
+  ovl.addEventListener('click', (e) => { if (e.target === ovl) close(); });
+
+  ovl.querySelectorAll('.publish-option').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const target = btn.dataset.target;
+      if (!window.confirm(`确认将发布状态切换为 "${(STATUS_META[target]||{}).label||target}" ?`)) return;
+      btn.disabled = true; btn.textContent = '处理中...';
+      try {
+        await API.setPublishStatus(modelId, target, '');
+        showToast(`发布状态已切换为 ${(STATUS_META[target]||{}).label||target}`, 'success');
+        close();
+        // Reload the model to pick up new status, then re-render
+        if (typeof loadModel === 'function') {
+          await loadModel(modelId, layer);
+        } else {
+          renderTree(layer);
+        }
+      } catch (e) {
+        showToast('切换失败: ' + e.message, 'error');
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+/**
+ * Render the V3.0 元结构 inspector panel for M2 packages.
+ * Shows each structural pattern: level chain (L1→L2→L3), root, participating classes,
+ * hierarchy associations. Supports in-place rename of pattern label and level names,
+ * persists via PUT /models/{id} with the updated package.
+ */
+function renderMetaStructurePanel(modelId, pkg, patterns) {
+  const panel = document.createElement('div');
+  panel.className = 'meta-structure-panel';
+  const classesById = {};
+  (pkg.classes || []).forEach(c => { classesById[c.id] = c; });
+  const assocsById = {};
+  (pkg.associations || []).forEach(a => { assocsById[a.id] = a; });
+
+  const patternCards = patterns.map(sp => {
+    // Resolve level chain (ordered by hierarchy_order via sp.hierarchy_association_ids).
+    const participating = (sp.participating_class_ids || []).map(id => classesById[id]).filter(Boolean);
+    const rootCls = classesById[sp.root_class_id];
+    const hierarchyEdges = (sp.hierarchy_association_ids || [])
+      .map(id => assocsById[id]).filter(Boolean)
+      .sort((a, b) => (a.hierarchy_order || 0) - (b.hierarchy_order || 0));
+    const levelNames = sp.level_names && sp.level_names.length
+      ? sp.level_names
+      : participating.map((c, i) => c.meta_structure_level || `L${i + 1}`);
+
+    // Walk the level chain starting from root
+    const chain = [];
+    if (rootCls) chain.push(rootCls);
+    let cur = rootCls;
+    const seen = new Set(cur ? [cur.id] : []);
+    let safety = 0;
+    while (cur && safety++ < 20) {
+      const outEdge = hierarchyEdges.find(e => e.source?.class_ref === cur.id);
+      if (!outEdge) break;
+      const nxt = classesById[outEdge.target?.class_ref];
+      if (!nxt || seen.has(nxt.id)) break;
+      chain.push(nxt);
+      seen.add(nxt.id);
+      cur = nxt;
+    }
+    // Any participating classes not in the chain (dangling) — show them separately
+    const chainIds = new Set(chain.map(c => c.id));
+    const dangling = participating.filter(c => !chainIds.has(c.id));
+
+    const chainHtml = chain.map((c, i) => {
+      const levelName = levelNames[i] || `L${i + 1}`;
+      const isRoot = i === 0;
+      const isLeaf = i === chain.length - 1 && chain.length > 1;
+      const roleCls = isRoot ? 'ms-role-root' : isLeaf ? 'ms-role-leaf' : 'ms-role-middle';
+      return `
+        <div class="ms-level-chip ${roleCls}" data-class-id="${c.id}" title="点击在树中定位">
+          <span class="ms-level-tag">${escapeHtml(levelName)}</span>
+          <span class="ms-level-cls">${escapeHtml(c.label || c.name)}</span>
+          <span class="ms-level-attrs">${(c.attributes || []).length} 属性</span>
+        </div>
+      `;
+    }).join('<span class="ms-level-sep">→</span>');
+
+    const constraintsHtml = (sp.constraints || []).map(c => `<span class="ms-constraint-tag">${escapeHtml(c)}</span>`).join('');
+    const danglingHtml = dangling.length
+      ? `<div class="ms-dangling">⚠️ 未在链上的参与类: ${dangling.map(c => escapeHtml(c.label || c.name)).join(', ')}</div>`
+      : '';
+
+    return `
+      <div class="ms-card" data-pattern-id="${sp.id}">
+        <div class="ms-card-header">
+          <span class="ms-card-icon">🏗️</span>
+          <input class="ms-card-title" type="text" value="${escapeHtml(sp.label || sp.name)}" data-field="label" />
+          <span class="ms-card-count">${participating.length} 个 MetaClass · ${hierarchyEdges.length} 条层级边</span>
+          <button type="button" class="ms-card-save" data-action="save-pattern">💾 保存</button>
+        </div>
+        ${sp.description ? `<div class="ms-card-desc">${escapeHtml(sp.description)}</div>` : ''}
+        <div class="ms-level-chain">${chainHtml || '<span class="ms-empty">链为空</span>'}</div>
+        ${danglingHtml}
+        <div class="ms-card-footer">
+          <div class="ms-constraints">
+            <span class="ms-footer-label">约束:</span>
+            ${constraintsHtml || '<span class="ms-empty">无</span>'}
+          </div>
+          ${sp.recommended_assoc_type ? `<div class="ms-recommend">推荐关联类型: <code>${escapeHtml(sp.recommended_assoc_type)}</code></div>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="ms-panel-header">
+      <span class="ms-panel-title">🏗️ V3.0 元结构 (Structural Patterns)</span>
+      <span class="ms-panel-count">${patterns.length} 个元结构</span>
+      <button type="button" class="ms-panel-toggle" data-action="toggle">收起 ▲</button>
+    </div>
+    <div class="ms-panel-body">
+      <div class="ms-panel-hint">
+        元结构 = 多个 MetaClass + N-1 条层级关联构成的可复用结构模板。
+        可重命名元结构标签 (点击标题→修改→点击 💾 保存)。
+      </div>
+      <div class="ms-cards">${patternCards}</div>
+    </div>
+  `;
+
+  // Toggle collapse
+  const toggleBtn = panel.querySelector('[data-action="toggle"]');
+  const body = panel.querySelector('.ms-panel-body');
+  toggleBtn.addEventListener('click', () => {
+    const collapsed = body.classList.toggle('collapsed');
+    toggleBtn.textContent = collapsed ? '展开 ▼' : '收起 ▲';
+  });
+
+  // Click level chip → scroll to that class in the tree
+  panel.querySelectorAll('.ms-level-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const cid = chip.dataset.classId;
+      const target = document.querySelector(`#model-tree-m2 [data-id="${cid}"][data-type="class"]`);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('flash-highlight');
+        setTimeout(() => target.classList.remove('flash-highlight'), 1400);
+      } else {
+        showToast('未在树中找到该类卡片', 'error');
+      }
+    });
+  });
+
+  // Save pattern label
+  panel.querySelectorAll('[data-action="save-pattern"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const card = btn.closest('.ms-card');
+      const patternId = card.dataset.patternId;
+      const newLabel = card.querySelector('[data-field="label"]').value.trim();
+      if (!newLabel) { showToast('名称不能为空', 'error'); return; }
+      btn.disabled = true; btn.textContent = '保存中...';
+      try {
+        // Deep clone pkg, update pattern, send full package back via PUT /models/{id}
+        const pkgCopy = JSON.parse(JSON.stringify(pkg));
+        const sp = (pkgCopy.structural_patterns || []).find(p => p.id === patternId);
+        if (sp) sp.label = newLabel;
+        await API.updateModel(modelId, { package: pkgCopy });
+        showToast('元结构名称已保存', 'success');
+        // Reload to pick up persisted state
+        if (typeof loadModel === 'function') {
+          await loadModel(modelId, 'm2');
+        }
+      } catch (e) {
+        showToast('保存失败: ' + e.message, 'error');
+        btn.disabled = false; btn.textContent = '💾 保存';
+      }
+    });
+  });
+
+  return panel;
+}
+
+/**
+ * Build a map from M1 class id → {level, levelName, m2ClassId, m2ClassName, patternLabel}.
+ * M1 class is considered "at level N" if its parent_class_name matches a MetaClass
+ * that participates in any StructuralPattern. Returns empty map when M2 has no patterns.
+ */
+function computeM1LevelMap(m1Pkg, m2Pkg) {
+  const result = {};
+  if (!m2Pkg || !(m2Pkg.structural_patterns || []).length) return result;
+  // Build M2 name → { level, levelName, id, patternLabel }
+  const m2LevelByName = {};
+  const m2ClassById = {};
+  (m2Pkg.classes || []).forEach(c => { m2ClassById[c.id] = c; });
+  for (const sp of m2Pkg.structural_patterns) {
+    const levelNames = sp.level_names || [];
+    for (const cid of (sp.participating_class_ids || [])) {
+      const mc = m2ClassById[cid];
+      if (!mc) continue;
+      const lvl = mc.meta_structure_level || null;
+      const levelName = (lvl && levelNames[lvl - 1]) || (lvl ? `L${lvl}` : '');
+      m2LevelByName[mc.name] = {
+        level: lvl,
+        levelName,
+        m2ClassId: mc.id,
+        m2ClassName: mc.name,
+        m2ClassLabel: mc.label || mc.name,
+        patternLabel: sp.label || sp.name,
+        role: mc.meta_structure_role || null,
+      };
+    }
+  }
+  for (const c of (m1Pkg.classes || [])) {
+    const parent = c.parent_class_name;
+    if (parent && m2LevelByName[parent]) {
+      result[c.id] = m2LevelByName[parent];
+    }
+  }
+  return result;
+}
+
+/**
+ * Render the M1-side metastructure panel as a LAYERED TREE GRAPH.
+ *
+ * - Each column = one M2 metastructure level (L1, L2, …)
+ * - Each node = one M1 class, placed in its parent-element's column
+ * - Each edge = one M1 composition association (is_hierarchy=false, assoc_type=composition|aggregation)
+ *     · cross-level edges: straight bezier from node-right to node-left
+ *     · same-level edges:  curved bezier looping down within the same column
+ * - If an M1 class has no level (parent not in metastructure), it goes to a
+ *   trailing "游离" column — shown only when any exist.
+ *
+ * Layout algorithm (pumped-storage scale: ≤ ~40 nodes works fine):
+ *   1. Build node list grouped by column (level).
+ *   2. DFS from each root (nodes with no in-edges) depth-first;
+ *      assign Y by `walkSubtree` pattern so children cluster under their parent.
+ *   3. Nodes not reached by DFS get stacked at end of their column.
+ *
+ * Node dims fixed 160×56; column pitch 200px; vertical gap 14px.
+ */
+function renderM1MetaStructurePanel(m1Pkg, m2Pkg) {
+  if (!m2Pkg || !(m2Pkg.structural_patterns || []).length) return null;
+  const patterns = m2Pkg.structural_patterns;
+  const m2ClassById = {};
+  (m2Pkg.classes || []).forEach(c => { m2ClassById[c.id] = c; });
+
+  // ---- 1. M2 levels ----
+  const levelEntries = [];
+  for (const sp of patterns) {
+    const levelNames = sp.level_names || [];
+    const participants = (sp.participating_class_ids || [])
+      .map(id => m2ClassById[id]).filter(Boolean)
+      .sort((a, b) => (a.meta_structure_level || 0) - (b.meta_structure_level || 0));
+    for (const mc of participants) {
+      const lvl = mc.meta_structure_level || levelEntries.length + 1;
+      levelEntries.push({
+        patternId: sp.id, patternLabel: sp.label || sp.name,
+        level: lvl, levelName: levelNames[lvl - 1] || `L${lvl}`,
+        m2Class: mc,
+      });
+    }
+  }
+  const levelByName = {};
+  const m2LabelByName = {};
+  for (const e of levelEntries) {
+    levelByName[e.m2Class.name] = e.level;
+    m2LabelByName[e.m2Class.name] = e.m2Class.label || e.m2Class.name;
+  }
+
+  // ---- 2. Build node + edge list ----
+  const nodes = (m1Pkg.classes || []).map(c => ({
+    id: c.id, name: c.name, label: c.label || c.name,
+    description: c.description || '',
+    level: levelByName[c.parent_class_name] || 0,   // 0 = floating
+    metaLabel: m2LabelByName[c.parent_class_name] || '(未挂载)',
+    parentClassName: c.parent_class_name || '',
+    cls: c,
+  }));
+  const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+  const edges = [];
+  for (const a of (m1Pkg.associations || [])) {
+    if (a.is_hierarchy) continue;   // only composition-style M1 relations
+    const src = nodeById[a.source?.class_ref];
+    const tgt = nodeById[a.target?.class_ref];
+    if (!src || !tgt) continue;
+    edges.push({
+      id: a.id, source: src, target: tgt,
+      name: a.name, label: a.label || a.name,
+    });
+  }
+
+  // ---- 3. Grouped by level ----
+  const maxLevel = Math.max(0, ...levelEntries.map(e => e.level));
+  const colsByLevel = {};
+  for (let L = 1; L <= maxLevel; L++) colsByLevel[L] = [];
+  colsByLevel[0] = [];   // floating
+  for (const n of nodes) colsByLevel[n.level].push(n);
+
+  // ---- 4. DFS-based Y assignment ----
+  const NODE_W = 160, NODE_H = 56;
+  const COL_GAP = 44;         // horizontal padding between columns
+  const COL_PITCH = NODE_W + COL_GAP;
+  const V_GAP = 14;
+  const ROW_H = NODE_H + V_GAP;
+
+  const outEdges = {};   // nodeId -> [target nodes]
+  const inEdges = {};    // nodeId -> [source nodes]
+  for (const n of nodes) { outEdges[n.id] = []; inEdges[n.id] = []; }
+  for (const e of edges) { outEdges[e.source.id].push(e.target); inEdges[e.target.id].push(e.source); }
+
+  const pos = {};   // nodeId -> {col, y}
+
+  // Layered BFS with parent-Y pull.
+  // Pass 1: For each column L=1..maxLevel, process all col=L nodes in an order
+  //         that preserves parent-child adjacency, assigning each node
+  //         y = max(cursor, average of already-placed parents' Y).
+  // Pass 2: Same-column parent-child chains (e.g. L2 机组区域 → L2 抽蓄机组):
+  //         handle as a second sub-pass within each column AFTER cross-level
+  //         placement — insert the child immediately after its parent.
+  //
+  // This gives each child of a parent a Y close to the parent's Y, while
+  // still preventing overlaps via `cursor`.
+
+  function avgParentY(n, samColOnly) {
+    const parents = inEdges[n.id].filter(p => samColOnly ? p.level === n.level : p.level < n.level);
+    const ys = parents.map(p => pos[p.id]?.y).filter(v => v !== undefined);
+    return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : -1;
+  }
+
+  // Place floating col (0) and col 1 straight top-down
+  for (const col of [0, 1]) {
+    let cursor = 0;
+    for (const n of colsByLevel[col]) {
+      pos[n.id] = { col, y: cursor };
+      cursor += ROW_H;
+    }
+  }
+
+  // For col 2..maxLevel, do two sub-passes:
+  //   sub1: place nodes whose parents are all in earlier columns (cross-level children)
+  //         ordered by parent's Y, then fall back to first-appearance.
+  //   sub2: place nodes that have at least one same-column parent (nested siblings),
+  //         inserting each immediately after its parent.
+  for (let L = 2; L <= maxLevel; L++) {
+    const list = colsByLevel[L] || [];
+
+    // Categorize
+    const crossOnly = list.filter(n => inEdges[n.id].every(p => p.level < L));
+    const withSameCol = list.filter(n => inEdges[n.id].some(p => p.level === L));
+
+    // Sub1: sort by parent Y (nodes with no parent land at top)
+    crossOnly.sort((a, b) => {
+      const ya = avgParentY(a, false);
+      const yb = avgParentY(b, false);
+      if (ya < 0 && yb < 0) return list.indexOf(a) - list.indexOf(b);
+      if (ya < 0) return -1;
+      if (yb < 0) return 1;
+      return ya - yb;
+    });
+    let cursor = 0;
+    for (const n of crossOnly) {
+      const want = avgParentY(n, false);
+      const y = Math.max(cursor, want < 0 ? 0 : want);
+      pos[n.id] = { col: L, y };
+      cursor = y + ROW_H;
+    }
+
+    // Sub2: insert same-col children right after their parent, shifting everyone
+    //       after that parent down by ROW_H.
+    for (const n of withSameCol) {
+      if (pos[n.id]) continue; // safety
+      const parents = inEdges[n.id].filter(p => p.level === L && pos[p.id]);
+      if (!parents.length) {
+        // no same-col parent placed yet — fallback to end of column
+        pos[n.id] = { col: L, y: cursor };
+        cursor += ROW_H;
+        continue;
+      }
+      // Place right below the lowest of its same-col parents
+      const parentY = Math.max(...parents.map(p => pos[p.id].y));
+      const insertY = parentY + ROW_H;
+      // Push down everyone in col L whose y >= insertY
+      for (const other of list) {
+        if (!pos[other.id]) continue;
+        if (pos[other.id].y >= insertY) pos[other.id].y += ROW_H;
+      }
+      pos[n.id] = { col: L, y: insertY };
+      cursor = Math.max(cursor, insertY + ROW_H);
+    }
+  }
+
+  // Safety: anyone unplaced (cycles?) gets stacked at end of their column
+  for (const n of nodes) {
+    if (pos[n.id]) continue;
+    const list = colsByLevel[n.level] || [];
+    const maxY = list.reduce((m, o) => Math.max(m, (pos[o.id]?.y ?? -ROW_H) + ROW_H), 0);
+    pos[n.id] = { col: n.level, y: maxY };
+  }
+
+  // ---- 5. Compute dimensions ----
+  const hasFloating = (colsByLevel[0] || []).length > 0;
+  const totalCols = maxLevel + (hasFloating ? 1 : 0);
+  const HEADER_H = 46;
+  const PAD = 20;
+  let maxY = 0;
+  for (const n of nodes) if (pos[n.id]) maxY = Math.max(maxY, pos[n.id].y + NODE_H);
+  const canvasW = totalCols * COL_PITCH + PAD * 2 - COL_GAP;
+  const canvasH = HEADER_H + maxY + PAD;
+
+  // x() for a given col (col=0 => floating, render at end)
+  function colX(col) {
+    if (col === 0) return maxLevel * COL_PITCH + PAD;  // after last level
+    return (col - 1) * COL_PITCH + PAD;
+  }
+
+  // ---- 6. Build SVG + node HTML ----
+  const escapeAttr = s => (s == null ? '' : String(s)).replace(/"/g, '&quot;');
+  const LEVEL_COLOR = { 1: 'var(--ms-l1)', 2: 'var(--ms-l2)', 3: 'var(--ms-l3)', 4: 'var(--ms-l4)', 5: 'var(--ms-l5)', 0: 'var(--ms-floating)' };
+
+  const headerRects = [];
+  for (const e of levelEntries) {
+    headerRects.push(`
+      <div class="ms-tree-colhead" style="left:${colX(e.level)}px; width:${NODE_W}px;" data-level="${e.level}">
+        <div class="ms-tree-colhead-level" style="color:${LEVEL_COLOR[e.level]}">${escapeHtml(e.levelName)}</div>
+        <div class="ms-tree-colhead-class" title="M2 MetaClass: ${escapeAttr(e.m2Class.name)}">
+          ${escapeHtml(e.m2Class.label || e.m2Class.name)}
+        </div>
+      </div>`);
+  }
+  if (hasFloating) {
+    headerRects.push(`
+      <div class="ms-tree-colhead ms-tree-colhead-floating" style="left:${colX(0)}px; width:${NODE_W}px;">
+        <div class="ms-tree-colhead-level" style="color:${LEVEL_COLOR[0]}">游离</div>
+        <div class="ms-tree-colhead-class">未挂载 M2</div>
+      </div>`);
+  }
+
+  const nodeCards = nodes.map(n => {
+    const p = pos[n.id]; if (!p) return '';
+    const x = colX(p.col);
+    const y = HEADER_H + p.y;
+    const lvl = n.level || 0;
+    return `
+      <div class="ms-tree-node" data-m1-id="${n.id}" data-level="${lvl}"
+           style="left:${x}px; top:${y}px; width:${NODE_W}px; height:${NODE_H}px;"
+           title="${escapeAttr(n.label + ' · ' + n.name + '\n元类: ' + n.metaLabel + (n.description ? '\n\n' + n.description.slice(0, 100) : ''))}">
+        <div class="ms-tree-node-head">
+          <span class="ms-tree-node-label">${escapeHtml(n.label)}</span>
+          <span class="ms-tree-node-chip" style="background:${LEVEL_COLOR[lvl]}">L${lvl || '?'}</span>
+        </div>
+        <div class="ms-tree-node-code">${escapeHtml(n.name)}</div>
+      </div>`;
+  }).join('');
+
+  // Edges: cross-level = forward bezier (right→left), same-level = vertical (bottom→top).
+  const edgeSvg = edges.map(e => {
+    const ps = pos[e.source.id]; const pt = pos[e.target.id];
+    if (!ps || !pt) return '';
+    const sameCol = ps.col === pt.col;
+    // source column color for edge
+    const color = LEVEL_COLOR[e.source.level] || 'var(--text-dim)';
+    let path, x1, y1, x2, y2;
+    if (sameCol) {
+      // Top-to-bottom vertical: exit source bottom-center → enter target top-center.
+      // Slight S-curve in case target isn't directly under source.
+      x1 = colX(ps.col) + NODE_W / 2;
+      y1 = HEADER_H + ps.y + NODE_H;       // source bottom
+      x2 = colX(pt.col) + NODE_W / 2;
+      y2 = HEADER_H + pt.y;                // target top
+      const cpY = (y1 + y2) / 2;
+      path = `M${x1},${y1} C${x1},${cpY} ${x2},${cpY} ${x2},${y2}`;
+    } else {
+      // Cross-level forward bezier: source right edge → target left edge.
+      x1 = colX(ps.col) + NODE_W;
+      y1 = HEADER_H + ps.y + NODE_H / 2;
+      x2 = colX(pt.col);
+      y2 = HEADER_H + pt.y + NODE_H / 2;
+      const cpX = x1 + (x2 - x1) * 0.5;
+      path = `M${x1},${y1} C${cpX},${y1} ${cpX},${y2} ${x2},${y2}`;
+    }
+    return `<path class="ms-tree-edge" d="${path}" stroke="${color}" data-edge-id="${e.id}"
+             data-src-id="${e.source.id}" data-tgt-id="${e.target.id}"
+             marker-end="url(#ms-arrow)">
+              <title>${escapeAttr(e.label)}: ${escapeAttr(e.source.label)} → ${escapeAttr(e.target.label)}</title>
+            </path>`;
+  }).join('');
+
+  // Summary
+  const totalM1 = nodes.length;
+  const bound = nodes.filter(n => n.level > 0).length;
+  const floatingCount = nodes.length - bound;
+  const coveredLevels = new Set(nodes.filter(n => n.level > 0).map(n => n.level)).size;
+
+  const panel = document.createElement('div');
+  panel.className = 'meta-structure-panel meta-structure-panel-m1';
+  panel.innerHTML = `
+    <div class="ms-panel-header">
+      <span class="ms-panel-title">🏗️ M1 在元结构中的分布 · 组合关系树</span>
+      <span class="ms-panel-count">
+        ${bound}/${totalM1} 个类已挂载 · 覆盖 ${coveredLevels}/${maxLevel} 层级 · ${edges.length} 条 composition
+        ${floatingCount ? ` · ⚠ ${floatingCount} 个游离` : ''}
+        · 源自 <em>${escapeHtml(patterns[0].label || patterns[0].name)}</em>
+      </span>
+      <button type="button" class="ms-panel-toggle" data-action="toggle">收起 ▲</button>
+    </div>
+    <div class="ms-panel-body">
+      <div class="ms-panel-hint">
+        每列 = 一个 M2 元结构层级;每节点 = 一个 M1 类,右上角徽章显示层级;
+        <b>箭头 = M1 compositon 关联</b>(<code>is_hierarchy=false</code>),跨列表示层级间包含,同列曲线表示同层级嵌套。点击节点闪烁定位下方卡片。
+      </div>
+      <div class="ms-tree-canvas" style="width:${canvasW}px; height:${canvasH}px;">
+        <svg class="ms-tree-svg" width="${canvasW}" height="${canvasH}">
+          <defs>
+            <marker id="ms-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                    markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 Z" fill="context-stroke" />
+            </marker>
+          </defs>
+          ${edgeSvg}
+        </svg>
+        ${headerRects.join('')}
+        ${nodeCards}
+      </div>
+    </div>
+  `;
+
+  const toggleBtn = panel.querySelector('[data-action="toggle"]');
+  const body = panel.querySelector('.ms-panel-body');
+  toggleBtn.addEventListener('click', () => {
+    const collapsed = body.classList.toggle('collapsed');
+    toggleBtn.textContent = collapsed ? '展开 ▼' : '收起 ▲';
+  });
+
+  // Click node → flash corresponding M1 card
+  panel.querySelectorAll('.ms-tree-node').forEach(nd => {
+    nd.addEventListener('click', () => {
+      const m1Id = nd.dataset.m1Id;
+      const target = document.querySelector(`#model-tree-m1 [data-id="${m1Id}"][data-type="class"]`);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('flash-highlight');
+        setTimeout(() => target.classList.remove('flash-highlight'), 1400);
+        // Also highlight node + its edges
+        panel.querySelectorAll('.ms-tree-node.active, .ms-tree-edge.active').forEach(el => el.classList.remove('active'));
+        nd.classList.add('active');
+        panel.querySelectorAll(`.ms-tree-edge[data-src-id="${m1Id}"], .ms-tree-edge[data-tgt-id="${m1Id}"]`)
+          .forEach(edge => edge.classList.add('active'));
+      } else {
+        showToast('M1 类卡片未在当前视图', 'error');
+      }
+    });
+  });
+
+  return panel;
 }
 
 function showToast(msg, type = 'success') {
@@ -1260,6 +1890,9 @@ async function loadModel(modelId, layer) {
       state.m2Model = model;
       state.m2ModelId = modelId;
       renderTree('m2');
+      // If an M1 tree is already rendered, re-render it so the V3.0
+      // metastructure panel (which depends on M2) appears / refreshes.
+      if (state.m1Model) renderTree('m1');
     } else {
       state.m1Model = model;
       state.m1ModelId = modelId;
@@ -2645,17 +3278,41 @@ function renderTree(layer) {
   const dashboard = document.createElement('div');
   dashboard.className = 'tree-dashboard';
   const pkgLabel = layer === 'm2' ? `${pkg.label || pkg.name}` : `${pkg.label || pkg.name}`;
+
+  // V3.0: count structural patterns in this package
+  const structuralPatterns = pkg.structural_patterns || [];
+  const flatCount = classes.length - structuralPatterns.reduce(
+    (sum, sp) => sum + (sp.participating_class_ids?.length || 0), 0
+  );
+  // Publish status (V3.0 § 2.4)
+  const publishStatus = pkg.publish_status || 'draft';
+  const publishLabel = {
+    draft: '🟡 草稿', review: '🟠 评审中',
+    published: '🟢 已发布', deprecated: '⚫ 已废弃',
+  }[publishStatus] || publishStatus;
+
   dashboard.innerHTML = `
     <div class="tree-dashboard-header">
       <span class="tree-badge ${layer === 'm2' ? 'badge-m2' : 'badge-m1'}">${layer.toUpperCase()}</span>
       <span class="tree-dashboard-title">${escapeHtml(pkgLabel)}</span>
       <span class="tree-dashboard-ver" title="当前版本">v${model.current_version || '1.0'}</span>
+      <button type="button" class="tree-dashboard-status status-${publishStatus}" data-action="change-publish" data-model-id="${modelId || ''}" data-current-status="${publishStatus}" title="点击切换发布状态 (V3.0 § 2.4)">${publishLabel} <span class="status-edit-icon">✎</span></button>
     </div>
     <div class="tree-dashboard-stats">
       <div class="tree-stat tree-stat-classes">
         <div class="tree-stat-num">${classes.length}</div>
         <div class="tree-stat-label">类</div>
       </div>
+      ${layer === 'm2' ? `
+      <div class="tree-stat tree-stat-structural">
+        <div class="tree-stat-num">${structuralPatterns.length}</div>
+        <div class="tree-stat-label" title="V3.0: 多 MetaClass + 层级关联">元结构</div>
+      </div>
+      <div class="tree-stat tree-stat-flat">
+        <div class="tree-stat-num">${Math.max(0, flatCount)}</div>
+        <div class="tree-stat-label" title="V3.0: 单 MetaClass">元类</div>
+      </div>
+      ` : `
       <div class="tree-stat tree-stat-attrs">
         <div class="tree-stat-num">${totalAttrs}</div>
         <div class="tree-stat-label">属性</div>
@@ -2664,6 +3321,7 @@ function renderTree(layer) {
         <div class="tree-stat-num">${assocs.length}</div>
         <div class="tree-stat-label">关联</div>
       </div>
+      `}
       <div class="tree-stat tree-stat-enums">
         <div class="tree-stat-num">${enums.length}</div>
         <div class="tree-stat-label">枚举</div>
@@ -2683,6 +3341,31 @@ function renderTree(layer) {
     filterTreeEntities(container, q);
   });
 
+  // Wire publish-status button
+  const statusBtn = dashboard.querySelector('[data-action="change-publish"]');
+  if (statusBtn) {
+    statusBtn.addEventListener('click', () => openPublishStatusDialog(layer, modelId, publishStatus));
+  }
+
+  // ---- V3.0 元结构面板 (仅 M2, 且存在 structural_patterns 时显示) ----
+  if (layer === 'm2' && structuralPatterns.length) {
+    const msPanel = renderMetaStructurePanel(modelId, pkg, structuralPatterns);
+    container.appendChild(msPanel);
+  }
+
+  // ---- V3.0 M1 元结构分布面板 (仅 M1, 且关联的 M2 存在 structural_patterns) ----
+  let _m1LevelMap = {};
+  if (layer === 'm1') {
+    const m2Pkg = state.m2Model?.versions?.slice(-1)[0]?.package;
+    if (m2Pkg && (m2Pkg.structural_patterns || []).length) {
+      const m1Panel = renderM1MetaStructurePanel(pkg, m2Pkg);
+      if (m1Panel) container.appendChild(m1Panel);
+      _m1LevelMap = computeM1LevelMap(pkg, m2Pkg);
+    }
+  }
+  // expose to card-rendering code via closure variable
+  const m1LevelMap = _m1LevelMap;
+
   const root = document.createElement('div');
   root.className = 'tree-node';
 
@@ -2692,8 +3375,6 @@ function renderTree(layer) {
       const section = document.createElement('div');
       section.className = 'tree-cards-section';
       section.innerHTML = '<div class="tree-cards-section-title">🔷 类 Classes</div>';
-      const grid = document.createElement('div');
-      grid.className = 'tree-cards-grid';
       // Pre-compute relationship indices for fast lookup per class
       const assocsBySource = {};   // className -> [assoc]
       const assocsByTarget = {};
@@ -2705,7 +3386,108 @@ function renderTree(layer) {
       const enumIdToObj = {};
       for (const en of enums) enumIdToObj[en.id] = en;
 
+      // ---- V3.0: group classes by metastructure level so browsing mirrors
+      //      the 元结构 shape users just saw in the tree panel. ----
+      // Shape of `groups`: [{ key, title, level, grid:HTMLElement, classes:[] }]
+      // Fallback (no metastructure info): single group keyed 'all'.
+      const LEVEL_COLOR_CSS = {
+        1: 'var(--ms-l1)', 2: 'var(--ms-l2)', 3: 'var(--ms-l3)',
+        4: 'var(--ms-l4)', 5: 'var(--ms-l5)', 0: 'var(--ms-floating)',
+      };
+      const groups = [];
+      let groupByLevel = null;
+
+      if (layer === 'm1' && Object.keys(m1LevelMap).length > 0) {
+        // Build: { level -> { levelName, m2Label, classes: [] } }
+        const m2Pkg = state.m2Model?.versions?.slice(-1)[0]?.package;
+        const maxLvl = m2Pkg ? Math.max(0, ...(m2Pkg.structural_patterns || [])
+          .flatMap(sp => (sp.participating_class_ids || [])
+            .map(cid => m2Pkg.classes.find(c => c.id === cid)?.meta_structure_level || 0))) : 4;
+        groupByLevel = {};
+        for (const cls of classes) {
+          const e = m1LevelMap[cls.id];
+          const lvl = e ? e.level : 0;
+          if (!groupByLevel[lvl]) groupByLevel[lvl] = { level: lvl, items: [], levelName: '', m2Label: '' };
+          groupByLevel[lvl].items.push(cls);
+          if (e) { groupByLevel[lvl].levelName = e.levelName; groupByLevel[lvl].m2Label = e.m2ClassLabel; }
+        }
+        // Order: 1..maxLvl then 0 (floating)
+        for (let L = 1; L <= Math.max(maxLvl, 4); L++) {
+          if (groupByLevel[L]) groups.push(groupByLevel[L]);
+        }
+        if (groupByLevel[0]) {
+          groupByLevel[0].levelName = '游离';
+          groupByLevel[0].m2Label = '未挂载 M2';
+          groups.push(groupByLevel[0]);
+        }
+      } else if (layer === 'm2') {
+        // M2: group by own meta_structure_level (so 元结构参与类 / 元类 are visually split)
+        groupByLevel = {};
+        for (const cls of classes) {
+          const lvl = cls.meta_structure_level || 0;
+          if (!groupByLevel[lvl]) groupByLevel[lvl] = { level: lvl, items: [], levelName: '', m2Label: '' };
+          groupByLevel[lvl].items.push(cls);
+          if (lvl) {
+            groupByLevel[lvl].levelName = `L${lvl}`;
+            groupByLevel[lvl].m2Label = cls.label || cls.name;
+          }
+        }
+        // If everything is level 0 (no metastructure), degrade to single group
+        const hasLeveled = Object.keys(groupByLevel).some(k => Number(k) > 0);
+        if (hasLeveled) {
+          for (let L = 1; L <= 5; L++) if (groupByLevel[L]) groups.push(groupByLevel[L]);
+          if (groupByLevel[0]) {
+            groupByLevel[0].levelName = '元类';
+            groupByLevel[0].m2Label = '不属于任何元结构';
+            groups.push(groupByLevel[0]);
+          }
+        } else {
+          groups.push({ level: null, items: classes });
+        }
+      } else {
+        groups.push({ level: null, items: classes });
+      }
+
+      // Create subsection + grid per group, append to section
+      for (const g of groups) {
+        if (g.level != null) {
+          const sub = document.createElement('div');
+          sub.className = `tree-cards-subsection tree-cards-sub-L${g.level}`;
+          sub.innerHTML = `
+            <div class="tree-cards-subsection-title" style="border-left-color:${LEVEL_COLOR_CSS[g.level]};">
+              <span class="tree-cards-sub-level" style="color:${LEVEL_COLOR_CSS[g.level]};">${escapeHtml(g.levelName || '')}</span>
+              <span class="tree-cards-sub-meta">${escapeHtml(g.m2Label || '')}</span>
+              <span class="tree-cards-sub-count">${g.items.length} 个类</span>
+            </div>
+          `;
+          const gGrid = document.createElement('div');
+          gGrid.className = 'tree-cards-grid';
+          g.grid = gGrid;
+          sub.appendChild(gGrid);
+          section.appendChild(sub);
+        } else {
+          // Ungrouped: put grid directly under section
+          const gGrid = document.createElement('div');
+          gGrid.className = 'tree-cards-grid';
+          g.grid = gGrid;
+          section.appendChild(gGrid);
+        }
+      }
+
+      // Helper: get the right grid for a class
+      function getGridForClass(cls) {
+        for (const g of groups) {
+          if (g.level == null) return g.grid;  // ungrouped
+          const lvl = (layer === 'm1')
+            ? (m1LevelMap[cls.id]?.level || 0)
+            : (cls.meta_structure_level || 0);
+          if (g.level === lvl) return g.grid;
+        }
+        return groups[0].grid;  // safety fallback
+      }
+
       for (const cls of classes) {
+        const grid = getGridForClass(cls);
         const attrCount = (cls.attributes || []).length;
         const inheritedCount = (cls.attributes || []).filter(a => a.is_inherited).length;
         const ownCount = attrCount - inheritedCount;
@@ -2729,10 +3511,27 @@ function renderTree(layer) {
         card.dataset.searchText = `${cls.name} ${cls.label || ''} ${cls.description || ''} ${(cls.attributes || []).map(a => a.name).join(' ')}`.toLowerCase();
         card.dataset.id = cls.id;
         card.dataset.type = 'class';
+        // V3.0: tag cards with metastructure level for coloring (M1 via parent, M2 via own role)
+        let _msLevel = null, _msLevelName = '', _msTooltip = '';
+        if (layer === 'm1' && m1LevelMap[cls.id]) {
+          const e = m1LevelMap[cls.id];
+          _msLevel = e.level;
+          _msLevelName = e.levelName;
+          _msTooltip = `${e.levelName} · 继承自 ${e.m2ClassLabel}\n(来自元结构 "${e.patternLabel}")`;
+        } else if (layer === 'm2' && cls.meta_structure_level) {
+          _msLevel = cls.meta_structure_level;
+          _msLevelName = `L${cls.meta_structure_level}`;
+          _msTooltip = `M2 元结构层级 ${cls.meta_structure_level} (${cls.meta_structure_role || ''})`;
+        }
+        if (_msLevel) card.dataset.msLevel = String(_msLevel);
+        const _chipHtml = _msLevel
+          ? `<span class="tree-card-ms-chip ms-chip-L${_msLevel}" title="${escapeHtml(_msTooltip)}">L${_msLevel}</span>`
+          : '';
         card.innerHTML = `
           <div class="tree-card-header">
             <span class="tree-badge badge-class">C</span>
             <span class="tree-card-name">${escapeHtml(cls.name)}</span>
+            ${_chipHtml}
           </div>
           <div class="tree-card-label">${escapeHtml(cls.label || '')}${parentHint}</div>
           ${descShort ? `<div class="tree-card-desc">${escapeHtml(descShort)}</div>` : ''}
@@ -2794,7 +3593,7 @@ function renderTree(layer) {
           openEntityDetailPage(cls, classes, enums, assocs, layer);
         });
       }
-      section.appendChild(grid);
+      // Grids were already attached to the section via groups above; just append section.
       root.appendChild(section);
     }
 
@@ -3521,6 +4320,22 @@ function showExportModal() {
   statusEl.textContent = '';
   statusEl.className = 'export-review-status';
 
+  // Populate the "完整包" tab summary (current M1/M2)
+  const pkgM1 = document.getElementById('pkg-m1-name');
+  const pkgM2 = document.getElementById('pkg-m2-name');
+  if (pkgM1) pkgM1.textContent = m1 ? `${m1.label || m1.name} · ${m1.id}` : '(未选择)';
+  if (pkgM2) pkgM2.textContent = m2 ? `${m2.label || m2.name} · ${m2.id}` : '(无关联 M2)';
+  const pkgInclM2 = document.getElementById('pkg-include-m2');
+  if (pkgInclM2) { pkgInclM2.checked = !!m2; pkgInclM2.disabled = !m2; }
+  // Doc count hint
+  const docIds = (m1 && m1.source_document_ids) || [];
+  const docsHint = document.getElementById('pkg-docs-hint');
+  if (docsHint) docsHint.textContent = docIds.length ? `(此模型关联 ${docIds.length} 个文档)` : '(此模型未关联文档)';
+  const pkgNote = document.getElementById('pkg-note');
+  if (pkgNote) pkgNote.value = '';
+  const pkgSize = document.getElementById('pkg-size-hint');
+  if (pkgSize) pkgSize.textContent = '';
+
   // Default to "raw" tab
   switchExportMode('raw');
 
@@ -3535,14 +4350,230 @@ function switchExportMode(mode) {
     s.classList.toggle('hidden', s.dataset.mode !== mode));
   // Update primary button text
   const btn = document.getElementById('btn-export-confirm');
-  if (btn) btn.textContent = mode === 'review' ? '📦 生成审查包 (.zip)' : '导出';
+  if (btn) {
+    btn.textContent = mode === 'review' ? '📦 生成审查包 (.zip)'
+                    : mode === 'package' ? '📦 导出完整包 (.mofpkg.zip)'
+                    : '导出';
+  }
 }
 
 async function doExport() {
-  if (_exportMode === 'review') {
-    return doExportReviewPackage();
-  }
+  if (_exportMode === 'review') return doExportReviewPackage();
+  if (_exportMode === 'package') return doExportCompletePackage();
   return doExportRaw();
+}
+
+async function doExportCompletePackage() {
+  const m1Id = state.m1ModelId;
+  if (!m1Id) {
+    await showDialog({ type: 'warning', title: '无法导出', message: '当前未选择 M1 模型。' });
+    return;
+  }
+  const options = {
+    includeM2: document.getElementById('pkg-include-m2')?.checked !== false,
+    includeAllVersions: !!document.getElementById('pkg-include-versions')?.checked,
+    includeDocuments: !!document.getElementById('pkg-include-documents')?.checked,
+    includeLLM: !!document.getElementById('pkg-include-llm')?.checked,
+    note: (document.getElementById('pkg-note')?.value || '').trim(),
+  };
+  const confirmBtn = document.getElementById('btn-export-confirm');
+  const origText = confirmBtn.textContent;
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = '📦 打包中...';
+  try {
+    const { blob, filename } = await API.exportPackage(m1Id, options);
+    // Trigger download
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+    // Update size hint + close modal after a short pause
+    const sizeEl = document.getElementById('pkg-size-hint');
+    if (sizeEl) sizeEl.textContent = `✓ 已下载: ${filename} (${(blob.size / 1024).toFixed(1)} KB)`;
+    showToast(`完整包已下载 (${(blob.size / 1024).toFixed(1)} KB)`, 'success');
+    setTimeout(() => document.getElementById('export-modal').classList.add('hidden'), 1200);
+  } catch (e) {
+    showDialog({ type: 'error', title: '完整包导出失败', message: e.message });
+  } finally {
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = origText;
+  }
+}
+
+// ============================================================================
+//                          Complete Package — IMPORT
+// ============================================================================
+
+let _importPkgFile = null;       // currently selected File
+let _importPkgPreview = null;    // cached preview response
+
+function showImportPackageModal() {
+  _importPkgFile = null;
+  _importPkgPreview = null;
+  const m = document.getElementById('import-package-modal');
+  // Reset state
+  document.getElementById('import-pkg-filename').classList.add('hidden');
+  document.getElementById('import-pkg-filename').textContent = '';
+  document.getElementById('import-pkg-preview').classList.add('hidden');
+  document.getElementById('btn-import-pkg-confirm').disabled = true;
+  const fileInput = document.getElementById('import-pkg-file');
+  if (fileInput) fileInput.value = '';
+  // Default strategy
+  const renameRadio = document.querySelector('input[name="import-strat"][value="rename"]');
+  if (renameRadio) renameRadio.checked = true;
+  m.classList.remove('hidden');
+}
+
+async function handleImportPackageFile(file) {
+  if (!file) return;
+  _importPkgFile = file;
+  const fnEl = document.getElementById('import-pkg-filename');
+  fnEl.textContent = `📦 ${file.name} · ${(file.size / 1024).toFixed(1)} KB`;
+  fnEl.classList.remove('hidden');
+  const previewEl = document.getElementById('import-pkg-preview');
+  const manifestEl = document.getElementById('import-pkg-manifest');
+  const conflictsEl = document.getElementById('import-pkg-conflicts');
+  manifestEl.innerHTML = '<div class="import-loading">正在解析包...</div>';
+  conflictsEl.innerHTML = '';
+  previewEl.classList.remove('hidden');
+  try {
+    const preview = await API.previewImportPackage(file);
+    _importPkgPreview = preview;
+    renderImportPreview(preview);
+    document.getElementById('btn-import-pkg-confirm').disabled = false;
+  } catch (e) {
+    manifestEl.innerHTML = `<div class="import-err">❌ 包解析失败: ${escapeHtml(e.message)}</div>`;
+    document.getElementById('btn-import-pkg-confirm').disabled = true;
+  }
+}
+
+function renderImportPreview(p) {
+  const m = p.manifest || {};
+  const cs = m.contents || { models: [], documents: [], llm_providers: [] };
+  const dep = p.dependency || {};
+  const manifestEl = document.getElementById('import-pkg-manifest');
+  const rows = [];
+  rows.push(`<div class="import-pkg-meta"><b>标题:</b> ${escapeHtml(m.title || '(无)')}</div>`);
+  rows.push(`<div class="import-pkg-meta"><b>导出时间:</b> ${escapeHtml(m.exported_at || '')}  ·  <b>格式版本:</b> ${escapeHtml(m.format_version || '')}  ·  <b>系统版本:</b> ${escapeHtml(m.mof_system_version || '')}</div>`);
+  if (m.note) rows.push(`<div class="import-pkg-meta"><b>备注:</b> ${escapeHtml(m.note)}</div>`);
+  // Models
+  if (cs.models.length) {
+    rows.push('<div class="import-pkg-meta"><b>模型:</b></div>');
+    for (const md of cs.models) {
+      const extra = [];
+      if (md.class_count != null) extra.push(`${md.class_count} 类`);
+      if (md.assoc_count) extra.push(`${md.assoc_count} 关联`);
+      if (md.pattern_count) extra.push(`${md.pattern_count} 元结构`);
+      rows.push(`<div class="import-pkg-line">${md.role === 'm1' ? '🏷️' : '🧬'} <b>${md.role.toUpperCase()}</b> <code>${escapeHtml(md.id)}</code> · ${escapeHtml(md.label || '')}${extra.length ? ' · (' + extra.join(', ') + ')' : ''}</div>`);
+    }
+  }
+  if (cs.documents && cs.documents.length) {
+    rows.push(`<div class="import-pkg-meta"><b>源文档:</b> ${cs.documents.length} 个</div>`);
+  }
+  if (cs.llm_providers && cs.llm_providers.length) {
+    rows.push(`<div class="import-pkg-meta"><b>LLM Provider:</b> ${cs.llm_providers.length} 个 (API Key 未包含,导入后需要重新配置)</div>`);
+  }
+  // Dependency status
+  if (dep.m2_template_id) {
+    const st = dep.status;
+    const label = st === 'bundled' ? '✓ M2 已随包' : st === 'local' ? '✓ M2 本地已有' : '⚠ M2 缺失';
+    const cls = st === 'missing' ? 'import-dep-bad' : 'import-dep-ok';
+    rows.push(`<div class="import-pkg-meta ${cls}"><b>依赖:</b> m2_template_id = <code>${escapeHtml(dep.m2_template_id)}</code> · ${label}</div>`);
+  }
+  // Warnings
+  if (p.warnings && p.warnings.length) {
+    for (const w of p.warnings) rows.push(`<div class="import-pkg-warn">⚠ ${escapeHtml(w)}</div>`);
+  }
+  manifestEl.innerHTML = rows.join('');
+
+  // Conflicts
+  const confEl = document.getElementById('import-pkg-conflicts');
+  const conflicts = p.conflicts || {};
+  const modelConf = (conflicts.models || []).filter(m => m.conflict);
+  const docConf = (conflicts.documents || []).filter(d => d.conflict);
+  if (!modelConf.length && !docConf.length) {
+    confEl.innerHTML = '<div class="import-pkg-conf-ok">✓ 无冲突,所有 ID 本地均未存在</div>';
+  } else {
+    const lines = ['<div class="import-pkg-conf-warn">⚠ 以下 ID 本地已存在,请选择冲突策略:</div>'];
+    for (const m of modelConf) lines.push(`<div class="import-pkg-line">• ${m.role.toUpperCase()} <code>${escapeHtml(m.id)}</code> · ${escapeHtml(m.label || '')}</div>`);
+    for (const d of docConf) lines.push(`<div class="import-pkg-line">• DOC <code>${escapeHtml(d.id)}</code> · ${escapeHtml(d.filename || '')}</div>`);
+    confEl.innerHTML = lines.join('');
+  }
+}
+
+async function doImportPackage() {
+  if (!_importPkgFile) return;
+  const strategy = document.querySelector('input[name="import-strat"]:checked')?.value || 'rename';
+  const autoLoad = !!document.getElementById('import-auto-load')?.checked;
+  const btn = document.getElementById('btn-import-pkg-confirm');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '📥 导入中...';
+  try {
+    const result = await API.importPackage(_importPkgFile, {
+      strategy,
+      importDocuments: true,
+      importLLM: false,
+    });
+    // Summary
+    const imported = (result.imported || []).filter(x => x.role || x.type !== 'document');
+    const msg = `导入完成: ${imported.length} 项成功`
+      + (result.skipped?.length ? ` · ${result.skipped.length} 跳过` : '')
+      + (result.failed?.length ? ` · ${result.failed.length} 失败` : '');
+    showToast(msg, result.failed?.length ? 'error' : 'success');
+    // Close modal
+    document.getElementById('import-package-modal').classList.add('hidden');
+    // Refresh model list
+    if (typeof loadExistingModels === 'function') {
+      await loadExistingModels();
+    }
+    // Auto-load if desired
+    if (autoLoad && result.primary_m1_id) {
+      const picker = document.getElementById('model-picker');
+      if (picker) {
+        picker.value = result.primary_m1_id;
+        picker.dispatchEvent(new Event('change'));
+      } else if (typeof loadModel === 'function') {
+        await loadModel(result.primary_m1_id, 'm1');
+      }
+    }
+    // Surface any warnings/failures
+    if (result.failed?.length) {
+      const lines = result.failed.map(f => `• ${f.id || f.type || ''}: ${f.error || f.reason || ''}`).join('\n');
+      showDialog({ type: 'warning', title: '部分导入失败', message: lines });
+    } else if (result.warnings?.length) {
+      showDialog({ type: 'info', title: '导入提示', message: result.warnings.join('\n') });
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '导入失败', message: e.message });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function wireImportPackageModal() {
+  const btnOpen = document.getElementById('btn-import-package');
+  const btnCancel = document.getElementById('btn-import-pkg-cancel');
+  const btnConfirm = document.getElementById('btn-import-pkg-confirm');
+  const zone = document.getElementById('import-pkg-zone');
+  const fileInput = document.getElementById('import-pkg-file');
+  const pickBtn = document.getElementById('import-pkg-pick-btn');
+  if (!btnOpen) return;
+  btnOpen.addEventListener('click', showImportPackageModal);
+  btnCancel.addEventListener('click', () => document.getElementById('import-package-modal').classList.add('hidden'));
+  btnConfirm.addEventListener('click', doImportPackage);
+  pickBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', (e) => {
+    const f = e.target.files?.[0]; if (f) handleImportPackageFile(f);
+  });
+  // Drag-drop
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('dragover');
+    const f = e.dataTransfer?.files?.[0]; if (f) handleImportPackageFile(f);
+  });
 }
 
 async function doExportRaw() {
@@ -4400,7 +5431,18 @@ function graphBuildFromState() {
     return Math.min(36, 18 + n * 1.2);
   };
 
+  // V3.0 metastructure patterns defined on the M2 Package — used to group
+  // M2 MetaClasses that belong to the same 元结构 in the visualization.
+  const m2StructuralPatterns = m2Pkg?.structural_patterns || [];
+  const m2PatternByClassId = new Map();  // class_id → pattern object
+  for (const sp of m2StructuralPatterns) {
+    for (const cid of (sp.participating_class_ids || [])) {
+      m2PatternByClassId.set(cid, sp);
+    }
+  }
+
   for (const c of m2Classes) {
+    const pattern = m2PatternByClassId.get(c.id);
     const node = {
       id: 'm2:' + c.id,
       layer: 'm2',
@@ -4409,6 +5451,11 @@ function graphBuildFromState() {
       x: 0, y: 0, vx: 0, vy: 0,
       pinned: false,
       abstract: !!c.is_abstract,
+      // Metastructure metadata for rendering grouped boxes / coloring
+      metaStructureId: pattern?.id || c.meta_structure_id || null,
+      metaStructureName: pattern?.label || pattern?.name || null,
+      metaStructureRole: c.meta_structure_role || null,
+      metaStructureLevel: c.meta_structure_level || null,
     };
     Graph.nodes.push(node);
     Graph.nodesById.set(node.id, node);
@@ -4464,6 +5511,8 @@ function graphBuildFromState() {
   }
 
   // --- Edges: M2 intra-layer associations ---
+  // V3.0: metastructure hierarchy associations get a distinct "m2-hierarchy" kind
+  // so they can be rendered more prominently (colored, arrow style).
   for (const a of (m2Pkg?.associations || [])) {
     const srcName = a.source?.class_name;
     const tgtName = a.target?.class_name;
@@ -4475,12 +5524,14 @@ function graphBuildFromState() {
       ? 'm2:' + a.target.class_ref
       : [...m2NameToId.entries()].find(([n]) => n === tgtName)?.[1];
     if (!srcId || !tgtId || srcId === tgtId) continue;
+    const isHierarchy = !!a.is_hierarchy;
     Graph.edges.push({
       id: `as:m2:${a.id || srcId + '>' + tgtId}`,
-      kind: 'm2-assoc',
+      kind: isHierarchy ? 'm2-hierarchy' : 'm2-assoc',
       source: srcId,
       target: tgtId,
       label: a.label || a.name || '',
+      hierarchyOrder: a.hierarchy_order || null,
     });
   }
 }
@@ -4926,7 +5977,8 @@ function graphRender() {
   for (const n of Graph.nodes) {
     if (!graphNodeVisible(n)) continue;
     const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    g.setAttribute('class', `g-node layer-${n.layer}${n.abstract ? ' is-abstract' : ''}`);
+    const msCls = n.metaStructureRole ? ` ms-${n.metaStructureRole}` : '';
+    g.setAttribute('class', `g-node layer-${n.layer}${n.abstract ? ' is-abstract' : ''}${msCls}`);
     g.setAttribute('transform', `translate(${n.x}, ${n.y})`);
     g.dataset.nodeId = n.id;
     if (n.id === Graph.selectedId) g.classList.add('selected');

@@ -31,6 +31,7 @@
         <span class="toolbar-sep"></span>
         <button id="btn-validate" class="btn" disabled>&#10003; 验证</button>
         <button id="btn-export" class="btn" disabled>&#8615; 导出</button>
+        <button id="btn-import-package" class="btn" title="从 .mofpkg.zip 完整包导入">&#128229; 导入包</button>
         <button id="btn-version" class="btn" disabled>&#128196; 版本</button>
       </div>
       <div class="toolbar-right">
@@ -388,6 +389,7 @@
         <div class="export-mode-tabs">
           <button class="export-mode-tab active" data-mode="raw">原始数据</button>
           <button class="export-mode-tab" data-mode="review">&#128196; 审查包 (业务人员评审)</button>
+          <button class="export-mode-tab" data-mode="package">&#128230; 完整包 (迁移/备份)</button>
         </div>
 
         <!-- Mode: raw -->
@@ -433,11 +435,93 @@
           <div class="export-review-status" id="review-status"></div>
         </div>
 
+        <!-- Mode: complete package (migration / backup) -->
+        <div class="export-mode-section hidden" data-mode="package">
+          <p class="export-hint">
+            打包当前 M1 + 关联 M2 + 可选资产为单个 <code>.mofpkg.zip</code> 文件,
+            可在另一台 MOF Generator 系统里用"导入包"还原。
+          </p>
+          <div class="pkg-current">
+            <div class="pkg-current-row">
+              <span class="pkg-current-label">M1 模型:</span>
+              <span id="pkg-m1-name" class="pkg-current-val">—</span>
+            </div>
+            <div class="pkg-current-row">
+              <span class="pkg-current-label">关联 M2:</span>
+              <span id="pkg-m2-name" class="pkg-current-val">—</span>
+            </div>
+          </div>
+          <div class="pkg-options">
+            <label class="pkg-option"><input type="checkbox" id="pkg-include-m2" checked>
+              <span><b>M2 元模型</b> (强烈建议, 保证父类引用完整)</span></label>
+            <label class="pkg-option"><input type="checkbox" id="pkg-include-versions">
+              <span>所有历史版本 (默认只带当前版本)</span></label>
+            <label class="pkg-option"><input type="checkbox" id="pkg-include-documents">
+              <span>源文档 (meta + 文本 + 原始二进制) <span id="pkg-docs-hint" class="pkg-hint-sm">—</span></span></label>
+            <label class="pkg-option"><input type="checkbox" id="pkg-include-llm">
+              <span>LLM Provider 结构 <em>(API Key 不会导出)</em></span></label>
+          </div>
+          <label class="pkg-note">
+            备注 (可选):
+            <input type="text" id="pkg-note" placeholder="导出说明 / 交付对象 / 用途..." maxlength="120">
+          </label>
+          <div class="pkg-preview-size" id="pkg-size-hint"></div>
+        </div>
+
         <div class="modal-actions">
           <button id="btn-export-confirm" class="btn btn-primary">导出</button>
           <button id="btn-export-cancel" class="btn">取消</button>
         </div>
         <pre id="export-preview" class="export-preview hidden"></pre>
+      </div>
+    </div>
+
+    <!-- Import package modal -->
+    <div id="import-package-modal" class="overlay hidden">
+      <div class="modal-card">
+        <h3>📥 导入完整包</h3>
+
+        <!-- File picker / drop zone -->
+        <div id="import-pkg-zone" class="import-pkg-zone">
+          <input type="file" id="import-pkg-file" accept=".zip" hidden>
+          <div class="import-pkg-zone-hint">
+            拖拽 <code>.mofpkg.zip</code> 到此处,或
+            <button type="button" id="import-pkg-pick-btn" class="import-pkg-pick">点击选择文件</button>
+          </div>
+          <div id="import-pkg-filename" class="import-pkg-filename hidden"></div>
+        </div>
+
+        <!-- Preview (populated after file selected) -->
+        <div id="import-pkg-preview" class="import-pkg-preview hidden">
+          <div class="import-pkg-section">
+            <div class="import-pkg-title">包内容</div>
+            <div id="import-pkg-manifest" class="import-pkg-manifest"></div>
+          </div>
+          <div class="import-pkg-section">
+            <div class="import-pkg-title">冲突检测</div>
+            <div id="import-pkg-conflicts" class="import-pkg-conflicts"></div>
+          </div>
+          <div class="import-pkg-section">
+            <div class="import-pkg-title">冲突处理策略</div>
+            <div class="import-pkg-strategies">
+              <label class="import-pkg-strat"><input type="radio" name="import-strat" value="rename" checked>
+                <span><b>🎯 改名导入 (推荐)</b><br>生成新 ID,本地不变、新旧并存,内部引用自动重写。</span></label>
+              <label class="import-pkg-strat"><input type="radio" name="import-strat" value="skip">
+                <span><b>🛑 跳过已存在</b><br>冲突的不导入,本地保留原样。</span></label>
+              <label class="import-pkg-strat"><input type="radio" name="import-strat" value="overwrite">
+                <span><b>🔄 覆盖已存在 (危险)</b><br>用包内数据替换本地同 ID 模型,本地版本丢失。</span></label>
+            </div>
+          </div>
+          <div class="import-pkg-section">
+            <label class="pkg-option"><input type="checkbox" id="import-auto-load" checked>
+              <span>导入完成后自动打开 M1 模型</span></label>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button id="btn-import-pkg-confirm" class="btn btn-primary" disabled>确认导入</button>
+          <button id="btn-import-pkg-cancel" class="btn">取消</button>
+        </div>
       </div>
     </div>
 

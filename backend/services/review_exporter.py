@@ -246,49 +246,139 @@ def _build_word(m1_model, m2_model, m1_pkg, m2_pkg, mappings, svg_by_name: dict)
         _insert_svg_if_available(doc, svg_by_name, 0, caption="图 2-1: M2 元模型总览")
 
         # M2 summary table
-        doc.add_heading("2.1 M2 基类清单", level=2)
-        t = doc.add_table(rows=1, cols=5)
+        doc.add_heading("2.1 M2 基类清单 (按形态分类)", level=2)
+        doc.add_paragraph(
+            "按 V3.0 方法论, M2 有两种形态: "
+            "【元类 FlatClass】单个 MetaClass, 产出扁平列表; "
+            "【元结构 StructuralClass】一组 MetaClass + 有序层级关联, 产出异质树形。"
+        )
+        t = doc.add_table(rows=1, cols=6)
         t.style = "Light Grid Accent 1"
         hdr = t.rows[0].cells
-        for i, text in enumerate(["业务主题", "中文标签", "M1 子类数", "是否带层级", "说明"]):
+        for i, text in enumerate(["业务主题", "中文标签", "形态", "参与类数", "M1 子类数", "说明"]):
             hdr[i].text = text
             _set_cell_bold(hdr[i])
 
         child_count = _count_by_m2(mappings)
-        for c in m2_classes:
+        groups = _group_m2_by_pattern(m2_pkg)
+        # Structural patterns first
+        for pname, data in groups.items():
+            if pname == "__flat__":
+                continue
+            sp = data["pattern"]
+            participating = data["classes"]
+            # Sum children across participating classes
+            total_children = sum(child_count.get(c.get("name", ""), 0) for c in participating)
+            row = t.add_row().cells
+            row[0].text = sp.get("name") or pname
+            row[1].text = sp.get("label") or pname
+            row[2].text = "元结构"
+            row[3].text = str(len(participating))
+            row[4].text = str(total_children)
+            row[5].text = (sp.get("description") or "")[:60]
+        # Then flat classes
+        for c in groups.get("__flat__", []):
             cname = c.get("name", "")
             row = t.add_row().cells
             row[0].text = cname
             row[1].text = c.get("label", "") or ""
-            row[2].text = str(child_count.get(cname, 0))
-            has_h = _m2_has_hierarchy(c, m2_pkg)
-            row[3].text = "✓ 是" if has_h else "✗ 否"
-            row[4].text = (c.get("description") or "")[:60]
+            row[2].text = "元类"
+            row[3].text = "1"
+            row[4].text = str(child_count.get(cname, 0))
+            row[5].text = (c.get("description") or "")[:60]
 
-        # 2.2+ per-M2 detail sections
+        # 2.2+ per-theme detail sections (V3.0: each section is either one 元类
+        # OR one 元结构 covering its multiple participating MetaClasses)
         doc.add_page_break()
-        for idx, c in enumerate(m2_classes):
+        section_idx = 2
+        svg_idx = 1  # SVG page index offset (index 0 is the overview)
+
+        # -- Structural patterns first --
+        for pname, data in groups.items():
+            if pname == "__flat__":
+                continue
+            sp = data["pattern"]
+            participating = data["classes"]
+            title = sp.get("label") or sp.get("name") or pname
+
+            doc.add_heading(f"2.{section_idx} {title} (元结构 StructuralClass)", level=2)
+            if sp.get("description"):
+                doc.add_paragraph(sp["description"])
+
+            # Hierarchy chain
+            p = doc.add_paragraph()
+            _add_run(p, "层级链: ", bold=True)
+            _add_run(p, " → ".join(sp.get("level_names") or []))
+
+            # Per-theme diagram
+            _insert_svg_if_available(
+                doc, svg_by_name, svg_idx,
+                caption=f"图 2-{section_idx}: {title} · 元结构图",
+            )
+            svg_idx += 1
+
+            # Constraints
+            if sp.get("constraints"):
+                p = doc.add_paragraph()
+                _add_run(p, "OCL 约束: ", bold=True)
+                _add_run(p, ", ".join(sp["constraints"]), size=10)
+
+            # Each level/MetaClass section
+            for lvl_idx, c in enumerate(participating):
+                cname = c.get("name", "")
+                clabel = c.get("label", "") or cname
+                role = c.get("meta_structure_role", "")
+                role_label = {"root": "根", "intermediate": "中间", "leaf": "叶"}.get(role, role)
+                p = doc.add_paragraph()
+                _add_run(
+                    p,
+                    f"【L{lvl_idx + 1} · {role_label}】 {clabel} ({cname})",
+                    bold=True, size=12,
+                )
+                if c.get("description"):
+                    doc.add_paragraph(c["description"])
+                attrs = c.get("attributes") or []
+                if attrs:
+                    at = doc.add_table(rows=1, cols=5)
+                    at.style = "Light Grid"
+                    for i, text in enumerate(["属性名", "中文", "类型", "多重性", "说明"]):
+                        cell = at.rows[0].cells[i]
+                        cell.text = text
+                        _set_cell_bold(cell)
+                    for a in attrs:
+                        r = at.add_row().cells
+                        r[0].text = a.get("name", "")
+                        r[1].text = a.get("label", "") or ""
+                        r[2].text = _fmt_type(a)
+                        r[3].text = _fmt_mult(a.get("multiplicity"))
+                        r[4].text = (a.get("description") or "")[:40]
+                # M1 children assigned to THIS specific level class
+                this_level_children = [m for m in mappings if m.get("m2_parent_name") == cname]
+                if this_level_children:
+                    doc.add_paragraph(f"  → 映射的 M1 类 ({len(this_level_children)} 个):")
+                    for m in this_level_children:
+                        m1n = m.get("m1_class_name", "")
+                        m1c = _find_m1(m1_pkg, m1n)
+                        m1l = (m1c.get("label") if m1c else "") or ""
+                        doc.add_paragraph(f"    • {m1l or m1n} ({m1n})", style="List Bullet")
+
+            doc.add_page_break()
+            section_idx += 1
+
+        # -- Flat classes (元类) next --
+        for c in groups.get("__flat__", []):
             cname = c.get("name", "")
             clabel = c.get("label", "") or cname
-            doc.add_heading(f"2.{idx + 2} {clabel} ({cname})", level=2)
-
+            doc.add_heading(f"2.{section_idx} {clabel} ({cname}) — 元类 FlatClass", level=2)
             if c.get("description"):
                 doc.add_paragraph(c["description"])
 
-            # Levels
-            levels = _get_m2_levels(c, m2_pkg)
-            if levels:
-                p = doc.add_paragraph()
-                _add_run(p, "层级结构: ", bold=True)
-                _add_run(p, " → ".join(levels))
-
-            # Embed per-theme SVG if available (index i+1 for M2 themes)
             _insert_svg_if_available(
-                doc, svg_by_name, idx + 1,
-                caption=f"图 2-{idx + 2}: {clabel} · 主题归属",
+                doc, svg_by_name, svg_idx,
+                caption=f"图 2-{section_idx}: {clabel} · 主题归属",
             )
+            svg_idx += 1
 
-            # M2 attributes table
             attrs = c.get("attributes") or []
             if attrs:
                 p = doc.add_paragraph()
@@ -307,61 +397,19 @@ def _build_word(m1_model, m2_model, m1_pkg, m2_pkg, mappings, svg_by_name: dict)
                     r[3].text = _fmt_mult(a.get("multiplicity"))
                     r[4].text = (a.get("description") or "")[:40]
 
-            # M1 children grouped by level
-            children = [m for m in mappings if m.get("m2_parent_name") == cname]
-            if children:
+            # M1 children (no levels in flat case)
+            flat_children = [m for m in mappings if m.get("m2_parent_name") == cname]
+            if flat_children:
                 p = doc.add_paragraph()
-                _add_run(p, f"包含的 M1 子类 ({len(children)} 个):", bold=True)
-                if levels:
-                    # ASCII tree by level
-                    by_level = {}
-                    orphans = []
-                    for m in children:
-                        lvl = m.get("level")
-                        if lvl and lvl != "whole_tree" and lvl in levels:
-                            by_level.setdefault(lvl, []).append(m)
-                        else:
-                            orphans.append(m)
-                    for i, lvl in enumerate(levels):
-                        group = by_level.get(lvl, [])
-                        doc.add_paragraph(
-                            f"├─ {lvl} 层 ({len(group)} 类)",
-                            style="Normal",
-                        )
-                        for m in group:
-                            m1_name = m.get("m1_class_name", "")
-                            m1_cls = _find_m1(m1_pkg, m1_name)
-                            m1_label = m1_cls.get("label", "") if m1_cls else ""
-                            connector = "│  └─" if i < len(levels) - 1 else "   └─"
-                            doc.add_paragraph(
-                                f"{connector} {m1_label or m1_name} ({m1_name})",
-                                style="Normal",
-                            )
-                    if orphans:
-                        doc.add_paragraph(
-                            f"└─ 全树模板 (whole_tree, {len(orphans)} 类)",
-                            style="Normal",
-                        )
-                        for m in orphans:
-                            m1_name = m.get("m1_class_name", "")
-                            m1_cls = _find_m1(m1_pkg, m1_name)
-                            m1_label = m1_cls.get("label", "") if m1_cls else ""
-                            doc.add_paragraph(
-                                f"   └─ {m1_label or m1_name} ({m1_name})",
-                                style="Normal",
-                            )
-                else:
-                    # Flat list
-                    for m in children:
-                        m1_name = m.get("m1_class_name", "")
-                        m1_cls = _find_m1(m1_pkg, m1_name)
-                        m1_label = m1_cls.get("label", "") if m1_cls else ""
-                        doc.add_paragraph(
-                            f"  ◦ {m1_label or m1_name} ({m1_name})",
-                            style="List Bullet",
-                        )
+                _add_run(p, f"包含的 M1 子类 ({len(flat_children)} 个):", bold=True)
+                for m in flat_children:
+                    m1n = m.get("m1_class_name", "")
+                    m1c = _find_m1(m1_pkg, m1n)
+                    m1l = (m1c.get("label") if m1c else "") or ""
+                    doc.add_paragraph(f"  • {m1l or m1n} ({m1n})", style="List Bullet")
 
             doc.add_page_break()
+            section_idx += 1
 
     # --- Section 3: M1 领域模型 ---
     doc.add_heading("三、M1 领域模型清单", level=1)
@@ -827,6 +875,13 @@ def _count_by_m2(mappings: list) -> dict:
 
 
 def _m2_has_hierarchy(m2_cls: dict, m2_pkg: dict) -> bool:
+    """Return True if this M2 class participates in a V3.0 StructuralPattern,
+    OR (legacy compat) it has a level enum attribute (pre-V3.0 simplified model)."""
+    # V3.0: check structural_patterns metadata
+    for sp in (m2_pkg.get("structural_patterns") or []):
+        if m2_cls.get("id") in (sp.get("participating_class_ids") or []):
+            return True
+    # Legacy: single class with level enum (pre-V3.0)
     enum_ids = {e.get("id") for e in (m2_pkg.get("enumerations") or [])}
     for a in (m2_cls.get("attributes") or []):
         if a.get("name") == "level" and a.get("enum_ref") in enum_ids:
@@ -835,6 +890,13 @@ def _m2_has_hierarchy(m2_cls: dict, m2_pkg: dict) -> bool:
 
 
 def _get_m2_levels(m2_cls: dict, m2_pkg: dict) -> list:
+    """Return ordered level names for the metastructure this class belongs to.
+    V3.0: look up the StructuralPattern; legacy: read the level enum literals."""
+    # V3.0
+    for sp in (m2_pkg.get("structural_patterns") or []):
+        if m2_cls.get("id") in (sp.get("participating_class_ids") or []):
+            return list(sp.get("level_names") or [])
+    # Legacy
     enum_id = None
     for a in (m2_cls.get("attributes") or []):
         if a.get("name") == "level":
@@ -846,6 +908,40 @@ def _get_m2_levels(m2_cls: dict, m2_pkg: dict) -> list:
         if e.get("id") == enum_id:
             return [l.get("label") or l.get("name") for l in (e.get("literals") or [])]
     return []
+
+
+def _get_structural_pattern_for(m2_cls: dict, m2_pkg: dict) -> dict | None:
+    """Return the StructuralPattern this M2 class participates in, or None."""
+    for sp in (m2_pkg.get("structural_patterns") or []):
+        if m2_cls.get("id") in (sp.get("participating_class_ids") or []):
+            return sp
+    return None
+
+
+def _group_m2_by_pattern(m2_pkg: dict) -> dict:
+    """Return {pattern_name: [m2_class dicts in hierarchy order]} for structural patterns,
+    plus {'__flat__': [flat class dicts]} for FlatClass themes.
+    Used by the report builder to group M2 classes by their theme."""
+    result = {"__flat__": []}
+    classes_by_id = {c.get("id"): c for c in (m2_pkg.get("classes") or [])}
+    handled_class_ids: set = set()
+
+    for sp in (m2_pkg.get("structural_patterns") or []):
+        pname = sp.get("label") or sp.get("name") or "未命名元结构"
+        ordered = []
+        for cid in (sp.get("participating_class_ids") or []):
+            c = classes_by_id.get(cid)
+            if c:
+                ordered.append(c)
+                handled_class_ids.add(cid)
+        if ordered:
+            result[pname] = {"pattern": sp, "classes": ordered}
+
+    for c in (m2_pkg.get("classes") or []):
+        if c.get("id") not in handled_class_ids:
+            result["__flat__"].append(c)
+
+    return result
 
 
 def _find_m1(m1_pkg: dict, name: str):

@@ -26,6 +26,10 @@ backend/data/llm_stats.json
 !backend/data/m2_templates/
 !backend/data/m3_fixed.json
 
+# Local backend process logs (created by Start-Process redirection during dev)
+backend.log
+backend.err.log
+
 # Editor / OS
 .vscode/
 .idea/

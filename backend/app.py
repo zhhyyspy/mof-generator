@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from backend.routers import documents, m2_templates, models, extraction, export, llm_config
+from backend.routers import documents, m2_templates, models, extraction, export, llm_config, package_io
 
 
 class NoCacheStaticsMiddleware(BaseHTTPMiddleware):
@@ -64,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(extraction.router)
     app.include_router(export.router)
     app.include_router(llm_config.router)
+    app.include_router(package_io.router)
 
     # Serve frontend static files
     frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
