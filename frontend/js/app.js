@@ -389,6 +389,7 @@ function setupToolbar() {
   wireImportPackageModal();
   wireSynonymModal();
   wirePatternEditorModal();
+  wireAssocEditorModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -2104,7 +2105,250 @@ function renderMetaStructurePanel(modelId, pkg, patterns) {
     });
   });
 
+  // V3.2 P5: M2-M2 associations management section
+  const assocSection = renderAssocManagementSection(modelId, pkg);
+  panel.querySelector('.ms-panel-body').appendChild(assocSection);
+
   return panel;
+}
+
+// ============================================================================
+//                 V3.2 P5: M2-M2 Association Management
+// ============================================================================
+
+// Persisted filter state
+const _assocMgrFilter = { m2: 'all' };  // 'all' | 'hier' | 'plain'
+
+function renderAssocManagementSection(modelId, pkg) {
+  const section = document.createElement('div');
+  section.className = 'assoc-mgr-section';
+  const assocs = pkg.associations || [];
+  const classesById = Object.fromEntries((pkg.classes || []).map(c => [c.id, c]));
+  const hier = assocs.filter(a => a.is_hierarchy);
+  const plain = assocs.filter(a => !a.is_hierarchy);
+  const filter = _assocMgrFilter.m2 || 'all';
+  const filtered = filter === 'hier' ? hier : filter === 'plain' ? plain : assocs;
+
+  const rows = filtered.map(a => {
+    const srcName = a.source?.class_name
+      || classesById[a.source?.class_ref]?.name || '?';
+    const tgtName = a.target?.class_name
+      || classesById[a.target?.class_ref]?.name || '?';
+    const srcCls = classesById[a.source?.class_ref];
+    const tgtCls = classesById[a.target?.class_ref];
+    const srcMult = a.source?.multiplicity;
+    const tgtMult = a.target?.multiplicity;
+    const multStr = (m) => m ? `[${m.lower ?? 0}..${m.upper === -1 ? '*' : (m.upper ?? '*')}]` : '';
+    const icon = a.is_hierarchy ? '🏗️' : '🔗';
+    const hint = a.is_hierarchy
+      ? `is_hierarchy=true · order=${a.hierarchy_order ?? '?'}`
+      : 'is_hierarchy=false';
+    return `
+      <div class="assoc-row" data-assoc-id="${a.id}">
+        <div class="assoc-row-head">
+          <span class="assoc-row-icon">${icon}</span>
+          <span class="assoc-row-name">${escapeHtml(a.name || '(未命名)')}</span>
+          <span class="assoc-row-label">${escapeHtml(a.label || '')}</span>
+          <span class="assoc-row-type">${escapeHtml(a.association_type || 'association')}</span>
+        </div>
+        <div class="assoc-row-body">
+          <span class="assoc-endpoint">
+            <strong>${escapeHtml(srcCls?.label || srcName)}</strong>
+            <span class="assoc-mult">${multStr(srcMult)}</span>
+          </span>
+          <span class="assoc-arrow">→</span>
+          <span class="assoc-endpoint">
+            <strong>${escapeHtml(tgtCls?.label || tgtName)}</strong>
+            <span class="assoc-mult">${multStr(tgtMult)}</span>
+          </span>
+        </div>
+        <div class="assoc-row-foot">
+          <span class="assoc-hint">${hint}</span>
+          <button type="button" class="assoc-edit" data-action="assoc-edit">✎ 编辑</button>
+          <button type="button" class="assoc-del" data-action="assoc-del">🗑</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  section.innerHTML = `
+    <div class="assoc-mgr-header">
+      <span class="assoc-mgr-title">🔗 M2 关系管理 · ${assocs.length} 条</span>
+      <div class="assoc-mgr-filters">
+        <button data-filter="all" class="${filter === 'all' ? 'active' : ''}">全部 ${assocs.length}</button>
+        <button data-filter="hier" class="${filter === 'hier' ? 'active' : ''}">🏗️ 层级边 ${hier.length}</button>
+        <button data-filter="plain" class="${filter === 'plain' ? 'active' : ''}">🔗 普通关联 ${plain.length}</button>
+      </div>
+      <button type="button" class="assoc-mgr-new" data-action="assoc-new">+ 新增 M2 关系</button>
+    </div>
+    <div class="assoc-mgr-list">${rows || '<div class="assoc-mgr-empty">(当前过滤下无关联)</div>'}</div>
+  `;
+
+  // Wire filter buttons
+  section.querySelectorAll('.assoc-mgr-filters button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _assocMgrFilter.m2 = btn.dataset.filter;
+      const newSection = renderAssocManagementSection(modelId, pkg);
+      section.replaceWith(newSection);
+    });
+  });
+  // New button
+  section.querySelector('[data-action="assoc-new"]').addEventListener('click',
+    () => openAssocEditor(modelId, null, pkg));
+  // Edit + Delete per row
+  section.querySelectorAll('[data-action="assoc-edit"]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.closest('.assoc-row').dataset.assocId;
+      openAssocEditor(modelId, id, pkg);
+    });
+  });
+  section.querySelectorAll('[data-action="assoc-del"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row = btn.closest('.assoc-row');
+      const id = row.dataset.assocId;
+      const a = assocs.find(x => x.id === id);
+      if (!window.confirm(`确认删除关联 "${a?.name || id}"?\n如果它是某元结构的层级边, 会从 pattern 的 hierarchy_association_ids 中移除。`)) return;
+      try {
+        await API.deleteAssociation(modelId, id);
+        showToast('已删除', 'success');
+        if (typeof loadModel === 'function') await loadModel(modelId, 'm2');
+      } catch (e) {
+        showDialog({ type: 'error', title: '删除失败', message: e.message });
+      }
+    });
+  });
+
+  return section;
+}
+
+// ---- Association editor modal ----
+
+let _aeState = { m2Id: null, assocId: null, pkg: null };
+
+function openAssocEditor(m2Id, assocId, pkg) {
+  _aeState = { m2Id, assocId, pkg };
+  const modal = document.getElementById('assoc-editor-modal');
+  const titleEl = document.getElementById('assoc-editor-title');
+  titleEl.textContent = assocId ? '🔗 编辑 M2 关联' : '🔗 新增 M2 关联';
+
+  // Populate class dropdowns
+  const srcSel = document.getElementById('ae-src-class');
+  const tgtSel = document.getElementById('ae-tgt-class');
+  const options = (pkg.classes || []).map(c =>
+    `<option value="${c.id}">${escapeHtml(c.label || c.name)} · ${escapeHtml(c.name)}</option>`
+  ).join('');
+  srcSel.innerHTML = options;
+  tgtSel.innerHTML = options;
+
+  const isHier = document.getElementById('ae-is-hierarchy');
+  const hierOrder = document.getElementById('ae-hier-order');
+  const hierOrderWrap = hierOrder.closest('.ae-hier-order');
+
+  if (assocId) {
+    const a = (pkg.associations || []).find(x => x.id === assocId);
+    if (!a) { showToast('关联不存在', 'error'); return; }
+    document.getElementById('ae-name').value = a.name || '';
+    document.getElementById('ae-label').value = a.label || '';
+    document.getElementById('ae-description').value = a.description || '';
+    document.getElementById('ae-type').value = a.association_type || 'association';
+    srcSel.value = a.source?.class_ref || '';
+    tgtSel.value = a.target?.class_ref || '';
+    document.getElementById('ae-src-role').value = a.source?.role_name || '';
+    document.getElementById('ae-tgt-role').value = a.target?.role_name || '';
+    document.getElementById('ae-src-lower').value = a.source?.multiplicity?.lower ?? 1;
+    document.getElementById('ae-src-upper').value = a.source?.multiplicity?.upper ?? 1;
+    document.getElementById('ae-tgt-lower').value = a.target?.multiplicity?.lower ?? 0;
+    document.getElementById('ae-tgt-upper').value = a.target?.multiplicity?.upper ?? -1;
+    isHier.checked = !!a.is_hierarchy;
+    hierOrder.value = a.hierarchy_order ?? '';
+  } else {
+    document.getElementById('ae-name').value = '';
+    document.getElementById('ae-label').value = '';
+    document.getElementById('ae-description').value = '';
+    document.getElementById('ae-type').value = 'association';
+    document.getElementById('ae-src-role').value = '';
+    document.getElementById('ae-tgt-role').value = '';
+    document.getElementById('ae-src-lower').value = 1;
+    document.getElementById('ae-src-upper').value = 1;
+    document.getElementById('ae-tgt-lower').value = 0;
+    document.getElementById('ae-tgt-upper').value = -1;
+    isHier.checked = false;
+    hierOrder.value = '';
+  }
+  hierOrderWrap.classList.toggle('hidden', !isHier.checked);
+  modal.classList.remove('hidden');
+}
+
+function wireAssocEditorModal() {
+  const isHier = document.getElementById('ae-is-hierarchy');
+  if (!isHier) return;
+  const hierOrderWrap = document.getElementById('ae-hier-order').closest('.ae-hier-order');
+  isHier.addEventListener('change', () => {
+    hierOrderWrap.classList.toggle('hidden', !isHier.checked);
+  });
+  document.getElementById('btn-assoc-cancel').addEventListener('click',
+    () => document.getElementById('assoc-editor-modal').classList.add('hidden'));
+  document.getElementById('btn-assoc-save').addEventListener('click', doAssocSave);
+}
+
+async function doAssocSave() {
+  const s = _aeState;
+  if (!s.m2Id || !s.pkg) return;
+  const name = document.getElementById('ae-name').value.trim();
+  if (!name) { showToast('名称不能为空', 'error'); return; }
+  const srcId = document.getElementById('ae-src-class').value;
+  const tgtId = document.getElementById('ae-tgt-class').value;
+  if (!srcId || !tgtId) { showToast('必须选择源类和目标类', 'error'); return; }
+  const data = {
+    name,
+    label: document.getElementById('ae-label').value.trim() || null,
+    description: document.getElementById('ae-description').value.trim() || null,
+    association_type: document.getElementById('ae-type').value,
+    source_class_id: srcId,
+    source_role: document.getElementById('ae-src-role').value.trim() || null,
+    source_lower: Number(document.getElementById('ae-src-lower').value) || 0,
+    source_upper: Number(document.getElementById('ae-src-upper').value) || -1,
+    target_class_id: tgtId,
+    target_role: document.getElementById('ae-tgt-role').value.trim() || null,
+    target_lower: Number(document.getElementById('ae-tgt-lower').value) || 0,
+    target_upper: Number(document.getElementById('ae-tgt-upper').value) || -1,
+    is_hierarchy: document.getElementById('ae-is-hierarchy').checked,
+    hierarchy_order: document.getElementById('ae-hier-order').value
+      ? Number(document.getElementById('ae-hier-order').value) : null,
+  };
+  const btn = document.getElementById('btn-assoc-save');
+  btn.disabled = true; const origText = btn.textContent; btn.textContent = '保存中...';
+  try {
+    if (s.assocId) {
+      await API.updateAssociation(s.m2Id, s.assocId, data);
+      showToast('关联已更新', 'success');
+    } else {
+      // POST creates the assoc with basic fields; if user marked is_hierarchy
+      // or added a description, PATCH immediately after to set them.
+      const created = await API.addAssociation(s.m2Id, {
+        name: data.name, label: data.label,
+        source_class_id: data.source_class_id, source_role: data.source_role,
+        source_lower: data.source_lower, source_upper: data.source_upper,
+        target_class_id: data.target_class_id, target_role: data.target_role,
+        target_lower: data.target_lower, target_upper: data.target_upper,
+        association_type: data.association_type,
+      });
+      if (data.is_hierarchy || data.description || data.hierarchy_order != null) {
+        await API.updateAssociation(s.m2Id, created.id, {
+          is_hierarchy: !!data.is_hierarchy,
+          hierarchy_order: data.hierarchy_order,
+          description: data.description,
+        });
+      }
+      showToast('关联已新建', 'success');
+    }
+    document.getElementById('assoc-editor-modal').classList.add('hidden');
+    if (typeof loadModel === 'function') await loadModel(s.m2Id, 'm2');
+  } catch (e) {
+    showDialog({ type: 'error', title: '保存失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = origText;
+  }
 }
 
 /**

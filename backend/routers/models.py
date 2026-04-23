@@ -332,17 +332,23 @@ async def delete_attribute(model_id: str, class_id: str, attr_id: str):
 async def add_association(model_id: str, req: AssociationCreateRequest):
     model = _get_model_or_404(model_id)
     pkg = _current_package(model)
+    # Resolve class_name from class_ref for display/search
+    cls_by_id = {c.id: c for c in pkg.classes}
+    src_cls = cls_by_id.get(req.source_class_id)
+    tgt_cls = cls_by_id.get(req.target_class_id)
     assoc = Association(
         id=str(uuid.uuid4()),
         name=req.name,
         label=req.label,
         source=AssociationEnd(
             class_ref=req.source_class_id,
+            class_name=src_cls.name if src_cls else None,
             role_name=req.source_role,
             multiplicity=Multiplicity(lower=req.source_lower, upper=req.source_upper),
         ),
         target=AssociationEnd(
             class_ref=req.target_class_id,
+            class_name=tgt_cls.name if tgt_cls else None,
             role_name=req.target_role,
             multiplicity=Multiplicity(lower=req.target_lower, upper=req.target_upper),
         ),
@@ -353,10 +359,63 @@ async def add_association(model_id: str, req: AssociationCreateRequest):
     return assoc.model_dump()
 
 
+@router.patch("/{model_id}/associations/{assoc_id}")
+async def update_association(model_id: str, assoc_id: str, data: dict):
+    """V3.2: edit arbitrary M2/M1 association fields.
+
+    Accepts partial update; any of these keys are applied:
+      name, label, description, association_type, is_hierarchy, hierarchy_order,
+      source_class_id, source_role, source_lower, source_upper,
+      target_class_id, target_role, target_lower, target_upper.
+    """
+    model = _get_model_or_404(model_id)
+    pkg = _current_package(model)
+    assoc = next((a for a in pkg.associations if a.id == assoc_id), None)
+    if assoc is None:
+        raise HTTPException(404, f"Association {assoc_id} not found")
+    cls_by_id = {c.id: c for c in pkg.classes}
+
+    if "name" in data: assoc.name = data["name"]
+    if "label" in data: assoc.label = data["label"]
+    if "description" in data: assoc.description = data["description"]
+    if "association_type" in data: assoc.association_type = data["association_type"]
+    if "is_hierarchy" in data: assoc.is_hierarchy = bool(data["is_hierarchy"])
+    if "hierarchy_order" in data: assoc.hierarchy_order = data["hierarchy_order"]
+
+    if "source_class_id" in data:
+        cid = data["source_class_id"]
+        assoc.source.class_ref = cid
+        src_cls = cls_by_id.get(cid)
+        if src_cls: assoc.source.class_name = src_cls.name
+    if "source_role" in data: assoc.source.role_name = data["source_role"]
+    if "source_lower" in data or "source_upper" in data:
+        lo = data.get("source_lower", assoc.source.multiplicity.lower)
+        up = data.get("source_upper", assoc.source.multiplicity.upper)
+        assoc.source.multiplicity = Multiplicity(lower=lo, upper=up)
+
+    if "target_class_id" in data:
+        cid = data["target_class_id"]
+        assoc.target.class_ref = cid
+        tgt_cls = cls_by_id.get(cid)
+        if tgt_cls: assoc.target.class_name = tgt_cls.name
+    if "target_role" in data: assoc.target.role_name = data["target_role"]
+    if "target_lower" in data or "target_upper" in data:
+        lo = data.get("target_lower", assoc.target.multiplicity.lower)
+        up = data.get("target_upper", assoc.target.multiplicity.upper)
+        assoc.target.multiplicity = Multiplicity(lower=lo, upper=up)
+
+    store.save_model(model)
+    return assoc.model_dump()
+
+
 @router.delete("/{model_id}/associations/{assoc_id}")
 async def delete_association(model_id: str, assoc_id: str):
     model = _get_model_or_404(model_id)
     pkg = _current_package(model)
+    # V3.2: also clean up references from StructuralPattern.hierarchy_association_ids
+    for sp in (pkg.structural_patterns or []):
+        if sp.hierarchy_association_ids and assoc_id in sp.hierarchy_association_ids:
+            sp.hierarchy_association_ids = [x for x in sp.hierarchy_association_ids if x != assoc_id]
     pkg.associations = [a for a in pkg.associations if a.id != assoc_id]
     store.save_model(model)
     return {"status": "deleted"}

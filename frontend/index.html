@@ -526,6 +526,66 @@
       </div>
     </div>
 
+    <!-- V3.2 P5: M2 Association editor (create + edit) -->
+    <div id="assoc-editor-modal" class="overlay hidden">
+      <div class="modal-card assoc-editor-card">
+        <h3 id="assoc-editor-title">🔗 编辑 M2 关联</h3>
+        <div class="ae-body">
+          <label class="ae-field"><span>名称 (英文)</span>
+            <input type="text" id="ae-name" placeholder="例如 facilityHasGroup" /></label>
+          <label class="ae-field"><span>中文标签</span>
+            <input type="text" id="ae-label" placeholder="设施包含分组" /></label>
+          <label class="ae-field"><span>描述</span>
+            <textarea id="ae-description" rows="2"></textarea></label>
+
+          <div class="ae-end-grid">
+            <div class="ae-end">
+              <div class="ae-end-title">源 (Source)</div>
+              <label class="ae-field"><span>源类</span>
+                <select id="ae-src-class"></select></label>
+              <label class="ae-field"><span>源角色</span>
+                <input type="text" id="ae-src-role" placeholder="facility" /></label>
+              <div class="ae-mult-row">
+                <label><span>下限</span><input type="number" id="ae-src-lower" value="1" min="0" /></label>
+                <label><span>上限 (-1 = 无限)</span><input type="number" id="ae-src-upper" value="1" min="-1" /></label>
+              </div>
+            </div>
+            <div class="ae-end">
+              <div class="ae-end-title">目标 (Target)</div>
+              <label class="ae-field"><span>目标类</span>
+                <select id="ae-tgt-class"></select></label>
+              <label class="ae-field"><span>目标角色</span>
+                <input type="text" id="ae-tgt-role" placeholder="groups" /></label>
+              <div class="ae-mult-row">
+                <label><span>下限</span><input type="number" id="ae-tgt-lower" value="0" min="0" /></label>
+                <label><span>上限 (-1 = 无限)</span><input type="number" id="ae-tgt-upper" value="-1" min="-1" /></label>
+              </div>
+            </div>
+          </div>
+
+          <label class="ae-field ae-field-row"><span>关联类型</span>
+            <select id="ae-type">
+              <option value="composition">composition (部分-整体)</option>
+              <option value="aggregation">aggregation (聚合)</option>
+              <option value="association">association (引用)</option>
+            </select></label>
+
+          <div class="ae-hier-note">
+            <span>此关联是否为元结构层级边?</span>
+            <label><input type="checkbox" id="ae-is-hierarchy"> ☑ 作为层级边 (is_hierarchy=true)</label>
+            <label class="ae-hier-order hidden">
+              <span>hierarchy_order</span>
+              <input type="number" id="ae-hier-order" min="1" placeholder="1..N-1" />
+            </label>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-assoc-cancel" class="btn">取消</button>
+          <button id="btn-assoc-save" class="btn btn-primary">💾 保存</button>
+        </div>
+      </div>
+    </div>
+
     <!-- V3.2: Structural Pattern editor modal (create/edit) -->
     <div id="pattern-editor-modal" class="overlay hidden">
       <div class="modal-card pattern-editor-card">

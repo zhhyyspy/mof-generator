@@ -125,6 +125,9 @@ export const API = {
   async addAssociation(modelId, data) {
     return (await request(`/models/${modelId}/associations`, { method: 'POST', body: JSON.stringify(data) })).json();
   },
+  async updateAssociation(modelId, assocId, data) {
+    return (await request(`/models/${modelId}/associations/${assocId}`, { method: 'PATCH', body: JSON.stringify(data) })).json();
+  },
   async deleteAssociation(modelId, assocId) {
     return (await request(`/models/${modelId}/associations/${assocId}`, { method: 'DELETE' })).json();
   },
