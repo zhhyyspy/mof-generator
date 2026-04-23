@@ -653,9 +653,12 @@ select:focus { border-color: var(--border-focus); outline: none; }
   margin-bottom: 4px;
 }
 
+/* V3.3: Primary name position = Chinese label (大字号加粗);
+   secondary = English name (小号灰色 monospace, 放在 tree-card-label 行) */
 .tree-card-name {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
+  color: var(--text);
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -671,11 +674,23 @@ select:focus { border-color: var(--border-focus); outline: none; }
 
 .tree-card-label {
   font-size: 11px;
-  color: var(--text-label);
+  color: var(--text-dim);
   margin-bottom: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.tree-card-code {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.03);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: normal;
 }
 
 .card-parent {
@@ -789,17 +804,23 @@ select:focus { border-color: var(--border-focus); outline: none; }
 }
 .card-attr-row:hover { background: var(--bg-hover); }
 
+/* V3.3: Chinese label = primary; English name = secondary */
+.card-attr-row .attr-chinese {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+}
 .card-attr-row .attr-name {
   font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text);
+  font-size: 10px;
+  color: var(--text-dim);
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.card-attr-row .attr-chinese { color: var(--text-dim); font-size: 11px; }
 .card-attr-row .attr-type { font-family: var(--mono); font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
 .attr-inh-tag { background: rgba(139,144,165,0.2); color: var(--text-dim); font-size: 9px; padding: 1px 5px; border-radius: 3px; }
 
@@ -3208,15 +3229,18 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
 }
 .synonym-choice:hover { background: rgba(74,158,255,0.06); }
 .synonym-choice input[type="radio"] { accent-color: var(--accent); }
+/* V3.3: Primary = Chinese; Secondary = English monospace */
 .synonym-cls-name {
-  font-family: monospace;
   color: var(--text);
-  font-weight: 500;
+  font-weight: 600;
+  font-size: 12px;
   flex-shrink: 0;
 }
 .synonym-cls-label {
   flex: 1;
   color: var(--text-dim);
+  font-family: monospace;
+  font-size: 11px;
 }
 .synonym-cls-attrs {
   font-size: 10px;
@@ -3753,15 +3777,17 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
   margin-bottom: 3px;
 }
 .assoc-row-icon { font-size: 13px; }
+/* V3.3: Primary = Chinese; secondary = English monospace */
 .assoc-row-name {
-  font-family: monospace;
   font-weight: 600;
   color: var(--text);
+  font-size: 12px;
 }
 .assoc-row-label {
   flex: 1;
   color: var(--text-dim);
-  font-size: 11px;
+  font-family: monospace;
+  font-size: 10px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5696,7 +5722,7 @@ select option:checked {
 
 .ed-attr-row {
   display: grid;
-  grid-template-columns: 1fr 1fr auto auto;
+  grid-template-columns: 1.3fr 0.7fr auto auto;
   gap: 10px;
   padding: 5px 8px;
   border-radius: 3px;
@@ -5705,17 +5731,19 @@ select option:checked {
 }
 .ed-attr-row:hover { background: var(--bg-hover); }
 
-.ed-attr-name {
-  font-family: var(--mono);
+/* V3.3: Primary = Chinese label, Secondary = English name */
+.ed-attr-chinese {
   color: var(--text);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ed-attr-chinese {
+.ed-attr-name {
+  font-family: var(--mono);
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -3263,8 +3263,8 @@ function renderAssocManagementSection(modelId, pkg) {
       <div class="assoc-row" data-assoc-id="${a.id}">
         <div class="assoc-row-head">
           <span class="assoc-row-icon">${icon}</span>
-          <span class="assoc-row-name">${escapeHtml(a.name || '(未命名)')}</span>
-          <span class="assoc-row-label">${escapeHtml(a.label || '')}</span>
+          <span class="assoc-row-name">${escapeHtml(a.label || a.name || '(未命名)')}</span>
+          <span class="assoc-row-label">${a.label ? escapeHtml(a.name || '') : ''}</span>
           <span class="assoc-row-type">${escapeHtml(a.association_type || 'association')}</span>
         </div>
         <div class="assoc-row-body">
@@ -3948,7 +3948,7 @@ function openEntityDetailPage(cls, allClasses, allEnums, allAssocs, layer, opts 
 
   const layerLabel = layer === 'm2' ? 'M2 元模型' : 'M1 领域层';
   document.getElementById('ed-layer').textContent = layerLabel;
-  document.getElementById('ed-current-name').textContent = `${cls.name} ${cls.label ? '· ' + cls.label : ''}`;
+  document.getElementById('ed-current-name').textContent = cls.label ? `${cls.label} · ${cls.name}` : cls.name;
 
   // ----- Cross-layer class index (critical for M2↔M1 parent/child resolution) -----
   // M2 classes' children live in the M1 package (M1 inherits from M2 via parent_class_name).
@@ -4110,8 +4110,8 @@ function renderAttrsPanel(ownAttrs, inhAttrs, enumById, classId, layer) {
       ? `<span class="ed-attr-default" title="默认值 (实例未指定时自动填入)">默认: ${escapeHtml(String(a.default_value))}</span>`
       : '';
     return `<div class="ed-attr-row">
-      <span class="ed-attr-name">${escapeHtml(a.name)}</span>
-      <span class="ed-attr-chinese">${escapeHtml(a.label || '')}</span>
+      <span class="ed-attr-chinese">${escapeHtml(a.label || a.name)}</span>
+      <span class="ed-attr-name">${a.label ? escapeHtml(a.name) : ''}</span>
       <span class="ed-attr-type">${a.data_type}${unit}${enumLink}</span>
       <span class="ed-attr-mult">${mult}</span>
       ${defaultBadge}
@@ -5566,7 +5566,7 @@ function renderTree(layer) {
         card.innerHTML = `
           <div class="tree-card-header">
             <span class="tree-badge badge-class">C</span>
-            <span class="tree-card-name">${escapeHtml(cls.name)}</span>
+            <span class="tree-card-name" title="双击可修改标签">${escapeHtml(cls.label || cls.name)}</span>
             ${_chipHtml}
             <div class="tree-card-quick-actions">
               <button class="tcq-btn" data-qaction="rename" title="重命名 (中文标签)">✎</button>
@@ -5575,7 +5575,9 @@ function renderTree(layer) {
               <button class="tcq-btn tcq-del" data-qaction="delete" title="删除 (带依赖分析)">🗑</button>
             </div>
           </div>
-          <div class="tree-card-label" title="双击可修改标签">${escapeHtml(cls.label || '')}${parentHint}</div>
+          <div class="tree-card-label">
+            ${cls.label ? `<code class="tree-card-code">${escapeHtml(cls.name)}</code>` : ''}${parentHint}
+          </div>
           ${descShort ? `<div class="tree-card-desc">${escapeHtml(descShort)}</div>` : ''}
           <div class="tree-card-stats-row">
             <span class="card-stat card-stat-attrs" title="自有/继承属性">📋 ${ownCount}<span class="card-stat-sub">/${inheritedCount}</span></span>
@@ -5612,8 +5614,8 @@ function renderTree(layer) {
             const unit = a.unit ? ` (${a.unit})` : '';
             const inh = a.is_inherited ? ' <span class="attr-inh-tag">继承</span>' : '';
             html += `<div class="card-attr-row" data-attr-id="${a.id}">
-              <span class="attr-name">${escapeHtml(a.name)}</span>
-              <span class="attr-chinese">${escapeHtml(a.label || '')}</span>
+              <span class="attr-chinese">${escapeHtml(a.label || a.name)}</span>
+              <span class="attr-name">${a.label ? escapeHtml(a.name) : ''}</span>
               <span class="attr-type">${a.data_type}${unit}</span>${inh}
             </div>`;
           }
@@ -5670,10 +5672,10 @@ function renderTree(layer) {
             }
           });
         });
-        // V3.3: double-click label to inline rename
-        const labelEl = card.querySelector('.tree-card-label');
-        if (labelEl) {
-          labelEl.addEventListener('dblclick', e => {
+        // V3.3: double-click name (Chinese label) to inline rename
+        const nameEl = card.querySelector('.tree-card-name');
+        if (nameEl) {
+          nameEl.addEventListener('dblclick', e => {
             e.stopPropagation();
             const modelId = layer === 'm1' ? state.m1ModelId : state.m2ModelId;
             if (modelId) inlineRenameLabel(modelId, cls.id, cls.label);
@@ -5702,10 +5704,12 @@ function renderTree(layer) {
         card.innerHTML = `
           <div class="tree-card-header">
             <span class="tree-badge badge-enum">E</span>
-            <span class="tree-card-name">${escapeHtml(en.name)}</span>
+            <span class="tree-card-name">${escapeHtml(en.label || en.name)}</span>
             <span class="tree-card-meta">${lits.length} 值</span>
           </div>
-          <div class="tree-card-label">${escapeHtml(en.label || '')}</div>
+          <div class="tree-card-label">
+            ${en.label ? `<code class="tree-card-code">${escapeHtml(en.name)}</code>` : ''}
+          </div>
           <div class="tree-card-desc">${escapeHtml(litPreview)}${lits.length > 4 ? ` ...+${lits.length - 4}` : ''}</div>
         `;
         card.addEventListener('click', () => {
@@ -5738,10 +5742,12 @@ function renderTree(layer) {
         card.innerHTML = `
           <div class="tree-card-header">
             <span class="tree-badge badge-assoc">R</span>
-            <span class="tree-card-name">${escapeHtml(a.name)}</span>
+            <span class="tree-card-name">${escapeHtml(a.label || a.name)}</span>
             <span class="tree-card-meta">${escapeHtml(a.association_type || 'association')}</span>
           </div>
-          <div class="tree-card-label">${escapeHtml(a.label || '')}</div>
+          <div class="tree-card-label">
+            ${a.label ? `<code class="tree-card-code">${escapeHtml(a.name)}</code>` : ''}
+          </div>
           <div class="tree-card-assoc-flow">
             <span class="assoc-endpoint">${escapeHtml(srcName)}</span>
             <span class="assoc-arrow">→</span>
@@ -6720,8 +6726,8 @@ async function runSynonymDetection() {
           <input type="radio" name="syn-keep-${gi}" value="${c.id}"
             ${c.id === g.suggest_keep_id ? 'checked' : ''}
             data-group="${gi}">
-          <span class="synonym-cls-name">${escapeHtml(c.name)}</span>
-          <span class="synonym-cls-label">${escapeHtml(c.label || '')}</span>
+          <span class="synonym-cls-name">${escapeHtml(c.label || c.name)}</span>
+          <span class="synonym-cls-label">${c.label ? escapeHtml(c.name) : ''}</span>
           <span class="synonym-cls-attrs">${c.attr_count || 0} 属性</span>
         </label>
       `).join('');
@@ -7301,9 +7307,14 @@ function renderReviewEntities(classes, enums, assocs, suspectedM0 = new Set()) {
 
   const renderClsRow = (cls, isSuspected) => {
     const attrs = cls.attributes || [];
-    const attrLines = attrs.map(a =>
-      `<div class="review-attr-line"><span class="review-attr-name">${a.name} ${a.label || ''}</span><span class="review-attr-type">${a.data_type}${a.unit ? ' ('+a.unit+')' : ''}</span></div>`
-    ).join('');
+    const attrLines = attrs.map(a => {
+      const primary = a.label || a.name;
+      const secondary = a.label ? a.name : '';
+      return `<div class="review-attr-line">
+        <span class="review-attr-name"><b>${escapeHtml(primary)}</b>${secondary ? ` <code style="color:var(--text-dim);font-size:10px;">${escapeHtml(secondary)}</code>` : ''}</span>
+        <span class="review-attr-type">${a.data_type}${a.unit ? ' ('+a.unit+')' : ''}</span>
+      </div>`;
+    }).join('');
     const badge = isSuspected
       ? `<span class="review-m0-badge" title="名称含编号/地名/年份等,疑似 M0 实例">⚠ 疑似 M0</span>`
       : '';
@@ -7313,7 +7324,7 @@ function renderReviewEntities(classes, enums, assocs, suspectedM0 = new Set()) {
         <div class="review-entity-header">
           <input type="checkbox" class="review-entity-check" data-id="${cls.id}" data-type="class" ${checked}>
           <span class="review-entity-badge badge-class">C</span>
-          <span class="review-entity-name">${cls.name} <span style="color:var(--text-dim);font-weight:400">${cls.label || ''}</span></span>
+          <span class="review-entity-name"><b>${escapeHtml(cls.label || cls.name)}</b>${cls.label ? ` <code style="color:var(--text-dim);font-weight:400;font-size:11px;">${escapeHtml(cls.name)}</code>` : ''}</span>
           ${badge}
           <span class="review-entity-meta">${attrs.length} 个属性</span>
           <button class="review-entity-toggle" data-target="details-${cls.id}">${attrs.length > 0 ? '▶ 展开' : ''}</button>
@@ -7346,7 +7357,7 @@ function renderReviewEntities(classes, enums, assocs, suspectedM0 = new Set()) {
           <div class="review-entity-header">
             <input type="checkbox" class="review-entity-check" data-id="${en.id}" data-type="enumeration" checked>
             <span class="review-entity-badge badge-enum">E</span>
-            <span class="review-entity-name">${en.name} <span style="color:var(--text-dim);font-weight:400">${en.label || ''}</span></span>
+            <span class="review-entity-name"><b>${escapeHtml(en.label || en.name)}</b>${en.label ? ` <code style="color:var(--text-dim);font-weight:400;font-size:11px;">${escapeHtml(en.name)}</code>` : ''}</span>
             <span class="review-entity-meta">${(en.literals||[]).length} 个值</span>
           </div>
           <div class="review-assoc-desc" style="padding-left:44px;font-size:11px;color:var(--text-dim)">${litText}</div>
@@ -7367,7 +7378,7 @@ function renderReviewEntities(classes, enums, assocs, suspectedM0 = new Set()) {
           <div class="review-entity-header">
             <input type="checkbox" class="review-entity-check" data-id="${a.id}" data-type="association" checked>
             <span class="review-entity-badge badge-assoc">R</span>
-            <span class="review-entity-name">${a.name}</span>
+            <span class="review-entity-name"><b>${escapeHtml(a.label || a.name)}</b>${a.label ? ` <code style="color:var(--text-dim);font-weight:400;font-size:11px;">${escapeHtml(a.name)}</code>` : ''}</span>
             <span class="review-entity-meta">${src} → ${tgt} ${multStr}</span>
           </div>
         </div>`;
