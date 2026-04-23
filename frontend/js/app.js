@@ -393,6 +393,7 @@ function setupToolbar() {
   wireAttrBuilderModal();
   wireRelBuilderModal();
   wireSafeDeleteModal();
+  wireClassWizardModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -1330,10 +1331,11 @@ function toCamelCase(s) {
     .join('');
 }
 
-/** Attribute templates — one-click add a group */
+/** Attribute templates — one-click add a group. Phase 2 expands library. */
 const ATTR_TEMPLATES = {
   basic: {
     title: '基础信息', icon: '📋',
+    description: '编号 + 名称 + 描述 + 备注',
     attrs: [
       { name: 'code',   label: '编号', logical_type: 'text' },
       { name: 'name',   label: '名称', logical_type: 'text' },
@@ -1343,6 +1345,7 @@ const ATTR_TEMPLATES = {
   },
   device: {
     title: '设备属性', icon: '⚙️',
+    description: '型号 + 厂家 + 出厂编号 + 投运日期',
     attrs: [
       { name: 'modelNo',      label: '型号', logical_type: 'text' },
       { name: 'manufacturer', label: '生产厂家', logical_type: 'text' },
@@ -1352,11 +1355,58 @@ const ATTR_TEMPLATES = {
   },
   project: {
     title: '工程项目', icon: '💼',
+    description: '投资额 + 开工日期 + 完工日期 + 状态',
     attrs: [
       { name: 'investment',    label: '投资额', logical_type: 'quantity', unit: '万元' },
       { name: 'startDate',     label: '开工日期', logical_type: 'date' },
       { name: 'finishDate',    label: '完工日期', logical_type: 'date' },
       { name: 'projectStatus', label: '项目状态', logical_type: 'text' },
+    ],
+  },
+  contract: {
+    title: '合同属性', icon: '📝',
+    description: '合同号 + 签订日期 + 金额 + 甲乙方 + 状态',
+    attrs: [
+      { name: 'contractNo',   label: '合同编号', logical_type: 'text' },
+      { name: 'signedAt',     label: '签订日期', logical_type: 'date' },
+      { name: 'amount',       label: '合同金额', logical_type: 'quantity', unit: '万元' },
+      { name: 'partyA',       label: '甲方', logical_type: 'text' },
+      { name: 'partyB',       label: '乙方', logical_type: 'text' },
+      { name: 'contractStatus', label: '合同状态', logical_type: 'text' },
+    ],
+  },
+  person: {
+    title: '人员属性', icon: '👥',
+    description: '姓名 + 工号 + 部门 + 职位 + 入职日期 + 联系方式',
+    attrs: [
+      { name: 'fullName',  label: '姓名', logical_type: 'text' },
+      { name: 'employeeNo', label: '工号', logical_type: 'text' },
+      { name: 'department', label: '部门', logical_type: 'text' },
+      { name: 'position',   label: '职位', logical_type: 'text' },
+      { name: 'hireDate',   label: '入职日期', logical_type: 'date' },
+      { name: 'contact',    label: '联系方式', logical_type: 'text' },
+    ],
+  },
+  approval: {
+    title: '审批流', icon: '📅',
+    description: '申请人 + 审批人 + 申请日期 + 审批日期 + 状态',
+    attrs: [
+      { name: 'applicant',  label: '申请人', logical_type: 'text' },
+      { name: 'approver',   label: '审批人', logical_type: 'text' },
+      { name: 'applyDate',  label: '申请日期', logical_type: 'date' },
+      { name: 'approveDate', label: '审批日期', logical_type: 'date' },
+      { name: 'approvalStatus', label: '审批状态', logical_type: 'text' },
+    ],
+  },
+  organization: {
+    title: '组织属性', icon: '🏢',
+    description: '组织编号 + 名称 + 上级单位 + 负责人 + 成立日期',
+    attrs: [
+      { name: 'orgCode',    label: '组织编号', logical_type: 'text' },
+      { name: 'orgName',    label: '组织名称', logical_type: 'text' },
+      { name: 'parentOrg',  label: '上级单位', logical_type: 'text' },
+      { name: 'orgManager', label: '负责人', logical_type: 'text' },
+      { name: 'foundedAt',  label: '成立日期', logical_type: 'date' },
     ],
   },
 };
@@ -1624,6 +1674,479 @@ async function abApplyTemplate(tplKey) {
   } catch (e) {
     showDialog({ type: 'error', title: '模板应用失败', message: e.message });
   }
+}
+
+// ============================================================================
+//                  V3.3 Phase 2: Class Creation Wizard (5 steps)
+// ============================================================================
+
+const CW_STEPS = [
+  { num: 1, title: '这是什么业务对象?', key: 'basic' },
+  { num: 2, title: '它属于哪个已有类?', key: 'parent' },
+  { num: 3, title: '它有哪些属性?', key: 'attrs' },
+  { num: 4, title: '它和哪些类有关系?', key: 'relations' },
+  { num: 5, title: '确认并创建', key: 'review' },
+];
+
+let _cwState = {
+  modelId: null, layer: null, currentStep: 1,
+  label: '', name: '', description: '',
+  parentClassId: '', parentClassName: '',
+  selectedTemplates: [],   // keys of ATTR_TEMPLATES
+  customAttrs: [],         // [{label, logical_type, unit?, literals?}]
+  relations: [],           // [{targetClassId, relType, qty}]
+};
+
+function openClassWizard(modelId, layer) {
+  _cwState = {
+    modelId, layer, currentStep: 1,
+    label: '', name: '', description: '',
+    parentClassId: '', parentClassName: '',
+    selectedTemplates: [], customAttrs: [], relations: [],
+  };
+  renderCwStep();
+  document.getElementById('class-wizard-modal').classList.remove('hidden');
+}
+
+function renderCwStepper() {
+  const stepper = document.getElementById('cw-stepper');
+  stepper.innerHTML = CW_STEPS.map(s => {
+    const cls = s.num === _cwState.currentStep ? 'cw-step-active'
+              : s.num < _cwState.currentStep ? 'cw-step-done'
+              : 'cw-step-pending';
+    return `<div class="cw-step ${cls}">
+      <span class="cw-step-num">${s.num}</span>
+      <span class="cw-step-title">${s.title}</span>
+    </div>`;
+  }).join('<span class="cw-step-sep">→</span>');
+}
+
+function renderCwStep() {
+  renderCwStepper();
+  const body = document.getElementById('cw-body');
+  const st = _cwState.currentStep;
+
+  if (st === 1) {
+    body.innerHTML = `
+      <div class="cw-step-body">
+        <div class="cw-step-hint">
+          💡 用中文起一个能让业务同事一看就懂的名字。例如: <em>水泵水轮机</em> / <em>合同</em> /
+          <em>工作单</em> / <em>审批人</em>。
+        </div>
+        <label class="ab-field">
+          <span>中文标签 <em class="ab-req">*</em></span>
+          <input type="text" id="cw-label" placeholder="例如: 水泵水轮机" value="${escapeHtml(_cwState.label)}" />
+        </label>
+        <label class="ab-field">
+          <span>描述 (选填, 帮助其他人理解)</span>
+          <textarea id="cw-desc" rows="2" placeholder="用 1-2 句话说明这个类代表什么">${escapeHtml(_cwState.description)}</textarea>
+        </label>
+        <details class="ab-advanced">
+          <summary>⚙ 进阶: 英文类名 (默认自动生成)</summary>
+          <label class="ab-field">
+            <span>英文 name (PascalCase)</span>
+            <input type="text" id="cw-name" placeholder="自动: 由中文转换" value="${escapeHtml(_cwState.name)}" />
+          </label>
+        </details>
+      </div>
+    `;
+    const labelInput = document.getElementById('cw-label');
+    labelInput.addEventListener('input', e => { _cwState.label = e.target.value; autoFillCwName(); });
+    document.getElementById('cw-desc').addEventListener('input', e => { _cwState.description = e.target.value; });
+    const nameInput = document.getElementById('cw-name');
+    nameInput.addEventListener('input', e => { _cwState.name = e.target.value; nameInput.dataset.userEdited = '1'; });
+    labelInput.focus();
+  } else if (st === 2) {
+    // Parent class picker
+    const pkg = _cwPackage();
+    const classes = pkg.classes || [];
+    // Also include M2 classes if layer === 'm1'
+    let m2Classes = [];
+    if (_cwState.layer === 'm1' && state.m2Model) {
+      const m2Pkg = state.m2Model.versions?.slice(-1)[0]?.package;
+      m2Classes = (m2Pkg?.classes || []).map(c => ({...c, _fromM2: true}));
+    }
+    const allOptions = [...classes, ...m2Classes];
+    const rows = allOptions.map(c => {
+      const isSelected = c.id === _cwState.parentClassId;
+      const badge = c._fromM2 ? '<span class="cw-badge cw-badge-m2">M2</span>'
+                              : '<span class="cw-badge cw-badge-m1">M1</span>';
+      return `
+        <label class="cw-parent-row ${isSelected ? 'selected' : ''}">
+          <input type="radio" name="cw-parent" value="${c.id}" ${isSelected ? 'checked' : ''}
+                 data-name="${escapeHtml(c.name)}" data-from-m2="${c._fromM2 ? '1' : ''}" />
+          ${badge}
+          <span class="cw-parent-label">${escapeHtml(c.label || c.name)}</span>
+          <span class="cw-parent-name">${escapeHtml(c.name)}</span>
+          <span class="cw-parent-attrs">${(c.attributes || []).length} 属性</span>
+        </label>`;
+    }).join('');
+    body.innerHTML = `
+      <div class="cw-step-body">
+        <div class="cw-step-hint">
+          💡 选了父类会自动继承它的属性。不确定就选"不设父类",以后再改。
+        </div>
+        <label class="cw-parent-row ${!_cwState.parentClassId ? 'selected' : ''}">
+          <input type="radio" name="cw-parent" value="" ${!_cwState.parentClassId ? 'checked' : ''} />
+          <span class="cw-badge cw-badge-none">—</span>
+          <span class="cw-parent-label"><em>不设父类 (独立新类)</em></span>
+        </label>
+        <input type="text" id="cw-parent-search" class="cw-search" placeholder="🔍 搜索父类..." />
+        <div class="cw-parent-list" id="cw-parent-list">${rows}</div>
+      </div>
+    `;
+    body.querySelectorAll('input[name="cw-parent"]').forEach(r => {
+      r.addEventListener('change', e => {
+        _cwState.parentClassId = e.target.value;
+        _cwState.parentClassName = e.target.dataset.name || '';
+        body.querySelectorAll('.cw-parent-row').forEach(row =>
+          row.classList.toggle('selected', row.querySelector('input').checked));
+      });
+    });
+    document.getElementById('cw-parent-search').addEventListener('input', e => {
+      const q = e.target.value.toLowerCase().trim();
+      body.querySelectorAll('.cw-parent-row').forEach(row => {
+        const txt = row.textContent.toLowerCase();
+        row.style.display = (!q || txt.includes(q)) ? '' : 'none';
+      });
+    });
+  } else if (st === 3) {
+    // Template + custom attrs picker
+    body.innerHTML = `
+      <div class="cw-step-body">
+        <div class="cw-step-hint">
+          💡 点击模板卡片一键添加一组常用属性 (可多选),也可以跳过,以后在类卡上再加。
+        </div>
+        <div class="cw-tpl-grid">
+          ${Object.entries(ATTR_TEMPLATES).map(([k, t]) => {
+            const selected = _cwState.selectedTemplates.includes(k);
+            return `
+              <label class="cw-tpl-card ${selected ? 'selected' : ''}" data-key="${k}">
+                <input type="checkbox" value="${k}" ${selected ? 'checked' : ''} />
+                <div class="cw-tpl-head">${t.icon} <b>${escapeHtml(t.title)}</b></div>
+                <div class="cw-tpl-desc">${escapeHtml(t.description || '')}</div>
+                <div class="cw-tpl-count">${t.attrs.length} 个属性</div>
+              </label>`;
+          }).join('')}
+        </div>
+        <div class="cw-custom-attrs">
+          <div class="cw-sub-title">自定义属性 (已添加 ${_cwState.customAttrs.length} 个)</div>
+          <div class="cw-custom-list">
+            ${_cwState.customAttrs.map((a, i) => {
+              const spec = LOGICAL_TYPES[a.logical_type] || LOGICAL_TYPES.text;
+              return `<div class="cw-custom-row">
+                <span>${spec.icon} <b>${escapeHtml(a.label)}</b></span>
+                <span class="cw-custom-type">${escapeHtml(spec.label)}${a.unit ? ' · '+escapeHtml(a.unit) : ''}</span>
+                <button type="button" class="cw-custom-del" data-idx="${i}">×</button>
+              </div>`;
+            }).join('')}
+          </div>
+          <button type="button" id="cw-custom-add" class="btn">+ 添加自定义属性</button>
+        </div>
+      </div>
+    `;
+    body.querySelectorAll('.cw-tpl-card input').forEach(cb => {
+      cb.addEventListener('change', e => {
+        const k = e.target.value;
+        if (e.target.checked) {
+          if (!_cwState.selectedTemplates.includes(k)) _cwState.selectedTemplates.push(k);
+        } else {
+          _cwState.selectedTemplates = _cwState.selectedTemplates.filter(x => x !== k);
+        }
+        cb.closest('.cw-tpl-card').classList.toggle('selected', e.target.checked);
+      });
+    });
+    body.querySelectorAll('.cw-custom-del').forEach(btn => {
+      btn.addEventListener('click', () => {
+        _cwState.customAttrs.splice(Number(btn.dataset.idx), 1);
+        renderCwStep();
+      });
+    });
+    document.getElementById('cw-custom-add').addEventListener('click', cwOpenCustomAttr);
+  } else if (st === 4) {
+    const pkg = _cwPackage();
+    const candidates = (pkg.classes || []);
+    const rows = candidates.map(c => {
+      const existing = _cwState.relations.find(r => r.targetClassId === c.id);
+      return `
+        <div class="cw-rel-row ${existing ? 'selected' : ''}" data-id="${c.id}" data-name="${escapeHtml(c.name)}">
+          <label>
+            <input type="checkbox" class="cw-rel-check" ${existing ? 'checked' : ''} />
+            <span class="cw-parent-label">${escapeHtml(c.label || c.name)}</span>
+            <span class="cw-parent-name">${escapeHtml(c.name)}</span>
+          </label>
+          ${existing ? `
+            <div class="cw-rel-detail">
+              关系: <select class="cw-rel-type">
+                <option value="composition"${existing.relType === 'composition' ? ' selected' : ''}>📦 包含</option>
+                <option value="aggregation"${existing.relType === 'aggregation' ? ' selected' : ''}>🤝 拥有</option>
+                <option value="association"${existing.relType === 'association' ? ' selected' : ''}>↔ 引用</option>
+              </select>
+              数量: <select class="cw-rel-qty">
+                <option value="one"${existing.qty === 'one' ? ' selected' : ''}>1 个</option>
+                <option value="many"${existing.qty === 'many' ? ' selected' : ''}>多个</option>
+              </select>
+            </div>` : ''}
+        </div>`;
+    }).join('');
+    body.innerHTML = `
+      <div class="cw-step-body">
+        <div class="cw-step-hint">
+          💡 选几个和这个新类有关系的已有类。勾选后可以选关系类型。可以跳过此步。
+        </div>
+        <input type="text" id="cw-rel-search" class="cw-search" placeholder="🔍 搜索类..." />
+        <div class="cw-rel-list">${rows || '<div class="cw-empty">(当前模型没有其他类)</div>'}</div>
+      </div>
+    `;
+    const attach = () => {
+      body.querySelectorAll('.cw-rel-check').forEach(cb => {
+        cb.addEventListener('change', e => {
+          const row = e.target.closest('.cw-rel-row');
+          const tid = row.dataset.id;
+          const tname = row.dataset.name;
+          if (e.target.checked) {
+            _cwState.relations.push({ targetClassId: tid, targetClassName: tname, relType: 'composition', qty: 'many' });
+          } else {
+            _cwState.relations = _cwState.relations.filter(r => r.targetClassId !== tid);
+          }
+          renderCwStep();
+        });
+      });
+      body.querySelectorAll('.cw-rel-type').forEach(sel => {
+        sel.addEventListener('change', e => {
+          const row = e.target.closest('.cw-rel-row');
+          const rel = _cwState.relations.find(r => r.targetClassId === row.dataset.id);
+          if (rel) rel.relType = e.target.value;
+        });
+      });
+      body.querySelectorAll('.cw-rel-qty').forEach(sel => {
+        sel.addEventListener('change', e => {
+          const row = e.target.closest('.cw-rel-row');
+          const rel = _cwState.relations.find(r => r.targetClassId === row.dataset.id);
+          if (rel) rel.qty = e.target.value;
+        });
+      });
+    };
+    attach();
+    document.getElementById('cw-rel-search').addEventListener('input', e => {
+      const q = e.target.value.toLowerCase().trim();
+      body.querySelectorAll('.cw-rel-row').forEach(row => {
+        row.style.display = (!q || row.textContent.toLowerCase().includes(q)) ? '' : 'none';
+      });
+    });
+  } else if (st === 5) {
+    // Review
+    const totalTplAttrs = _cwState.selectedTemplates.reduce(
+      (s, k) => s + (ATTR_TEMPLATES[k]?.attrs.length || 0), 0);
+    const totalAttrs = totalTplAttrs + _cwState.customAttrs.length;
+    const parentLine = _cwState.parentClassName
+      ? `<b>${escapeHtml(_cwState.parentClassName)}</b>`
+      : '<em class="cw-muted">(无, 独立新类)</em>';
+    body.innerHTML = `
+      <div class="cw-step-body">
+        <div class="cw-review-card">
+          <div class="cw-review-title">即将创建:</div>
+          <div class="cw-review-row"><span class="cw-lbl">中文标签:</span> <b>${escapeHtml(_cwState.label)}</b></div>
+          <div class="cw-review-row"><span class="cw-lbl">英文名:</span> <code>${escapeHtml(_cwState.name || toCamelCase(_cwState.label))}</code></div>
+          ${_cwState.description ? `<div class="cw-review-row"><span class="cw-lbl">描述:</span> ${escapeHtml(_cwState.description)}</div>` : ''}
+          <div class="cw-review-row"><span class="cw-lbl">父类:</span> ${parentLine}</div>
+          <div class="cw-review-row"><span class="cw-lbl">属性:</span> ${totalAttrs} 个
+            ${totalTplAttrs ? ` (${_cwState.selectedTemplates.length} 组模板 共 ${totalTplAttrs}) ` : ''}
+            ${_cwState.customAttrs.length ? ` · ${_cwState.customAttrs.length} 个自定义` : ''}
+          </div>
+          <div class="cw-review-row"><span class="cw-lbl">关联:</span> ${_cwState.relations.length} 条</div>
+        </div>
+        <div class="cw-final-hint">点击 <b>✓ 创建</b> 按顺序写入后端:先建类 → 再加属性 → 最后建关联。任一步失败仅影响后续步骤。</div>
+      </div>
+    `;
+  }
+  updateCwFooter();
+}
+
+function _cwPackage() {
+  const m = _cwState.layer === 'm1' ? state.m1Model : state.m2Model;
+  return m?.versions?.slice(-1)[0]?.package || { classes: [] };
+}
+
+function autoFillCwName() {
+  const nameInput = document.getElementById('cw-name');
+  if (!nameInput || nameInput.dataset.userEdited === '1') return;
+  // PascalCase: uppercase first letter
+  let cam = toCamelCase(_cwState.label);
+  // If camelCase result is empty, starts with digit, or is all digits (likely pure CJK label),
+  // generate a readable fallback based on existing class count.
+  if (!cam || /^\d/.test(cam)) {
+    const pkg = _cwPackage();
+    const existing = (pkg.classes || []).length;
+    cam = `newClass${existing + 1}`;
+  }
+  _cwState.name = cam[0].toUpperCase() + cam.slice(1);
+  nameInput.value = _cwState.name;
+}
+
+function updateCwFooter() {
+  const isLast = _cwState.currentStep === CW_STEPS.length;
+  document.getElementById('btn-cw-back').disabled = _cwState.currentStep === 1;
+  document.getElementById('btn-cw-next').classList.toggle('hidden', isLast);
+  document.getElementById('btn-cw-finish').classList.toggle('hidden', !isLast);
+}
+
+function cwNext() {
+  // Step 1 validation
+  if (_cwState.currentStep === 1) {
+    if (!_cwState.label.trim()) { showToast('中文标签不能为空', 'error'); return; }
+    if (!_cwState.name) { autoFillCwName(); }
+    if (!_cwState.name) _cwState.name = 'NewClass';
+  }
+  if (_cwState.currentStep < CW_STEPS.length) {
+    _cwState.currentStep++;
+    renderCwStep();
+  }
+}
+
+function cwBack() {
+  if (_cwState.currentStep > 1) {
+    _cwState.currentStep--;
+    renderCwStep();
+  }
+}
+
+async function cwOpenCustomAttr() {
+  // Simple prompt-based custom attr for wizard (avoid nested modal complexity)
+  const label = window.prompt('自定义属性的中文名:');
+  if (!label || !label.trim()) return;
+  const typeKey = window.prompt(
+    '选择类型 (输入对应数字):\n' +
+    '1 = 📝 文本\n' +
+    '2 = # 数字\n' +
+    '3 = 💰 金额/物理量 (需要单位)\n' +
+    '4 = 📅 日期\n' +
+    '5 = ✓ 是/否\n' +
+    '6 = 🏷️ 选项列表'
+  );
+  const typeMap = { '1': 'text', '2': 'number', '3': 'quantity', '4': 'date', '5': 'boolean', '6': 'enum' };
+  const lt = typeMap[typeKey?.trim()];
+  if (!lt) { showToast('无效选择,已取消', 'error'); return; }
+  const attr = { label: label.trim(), logical_type: lt };
+  if (lt === 'quantity') {
+    const unit = window.prompt('单位 (如 MW, °C, ¥):');
+    if (!unit) return;
+    attr.unit = unit.trim();
+  } else if (lt === 'enum') {
+    const lits = window.prompt('选项列表 (用逗号或斜线分隔, 如: 运行中,检修,停用):');
+    if (!lits) return;
+    attr.literals = lits.split(/[,/，、]+/).map(s => s.trim()).filter(Boolean);
+    if (!attr.literals.length) return;
+  }
+  _cwState.customAttrs.push(attr);
+  renderCwStep();
+}
+
+async function cwFinish() {
+  const s = _cwState;
+  const finishBtn = document.getElementById('btn-cw-finish');
+  finishBtn.disabled = true; const origText = finishBtn.textContent; finishBtn.textContent = '创建中...';
+  try {
+    // Step A: Create the class
+    const classPayload = {
+      name: s.name || toCamelCase(s.label),
+      label: s.label,
+      description: s.description || null,
+      parent_class_ref: s.parentClassId || null,
+      parent_class_name: s.parentClassName || null,
+    };
+    const newClass = await API.addClass(s.modelId, classPayload);
+    showToast(`✓ 类 "${s.label}" 已创建`, 'success');
+
+    // Step B: Apply selected templates
+    let addedAttrs = 0;
+    for (const tplKey of s.selectedTemplates) {
+      const tpl = ATTR_TEMPLATES[tplKey];
+      if (!tpl) continue;
+      for (const a of tpl.attrs) {
+        const spec = LOGICAL_TYPES[a.logical_type] || LOGICAL_TYPES.text;
+        try {
+          await API.addAttribute(s.modelId, newClass.id, {
+            name: a.name, label: a.label,
+            data_type: spec.dataType,
+            multiplicity_lower: 1, multiplicity_upper: 1,
+            unit: a.unit || null,
+            logical_type: a.logical_type,
+          });
+          addedAttrs++;
+        } catch (e) { console.warn('attr add failed:', a.name, e.message); }
+      }
+    }
+
+    // Step C: Custom attributes
+    for (const a of s.customAttrs) {
+      const spec = LOGICAL_TYPES[a.logical_type] || LOGICAL_TYPES.text;
+      let enumRef = null;
+      if (a.logical_type === 'enum' && a.literals?.length) {
+        const newEnum = await API.addEnumeration(s.modelId, {
+          name: toCamelCase(a.label) + 'Enum' || 'enum',
+          label: a.label + ' 选项',
+          literals: a.literals.map(l => ({ name: toCamelCase(l) || l, label: l })),
+        });
+        enumRef = newEnum.id;
+      }
+      try {
+        await API.addAttribute(s.modelId, newClass.id, {
+          name: toCamelCase(a.label) || 'attr',
+          label: a.label,
+          data_type: spec.dataType,
+          multiplicity_lower: 1, multiplicity_upper: 1,
+          unit: a.unit || null,
+          enum_ref: enumRef,
+          logical_type: a.logical_type,
+        });
+        addedAttrs++;
+      } catch (e) { console.warn('custom attr add failed:', a.label, e.message); }
+    }
+
+    // Step D: Relations
+    let addedRels = 0;
+    for (const rel of s.relations) {
+      try {
+        await API.addAssociation(s.modelId, {
+          name: toCamelCase(s.label) + (rel.relType === 'association' ? 'Refs' : 'Has') + (rel.targetClassName || 'Target'),
+          label: `${s.label} ${rel.relType === 'association' ? '引用' : '包含'} ${rel.targetClassName || '?'}`,
+          source_class_id: newClass.id,
+          source_role: toCamelCase(s.label).charAt(0).toLowerCase() + toCamelCase(s.label).slice(1),
+          source_lower: 1, source_upper: 1,
+          target_class_id: rel.targetClassId,
+          target_role: (rel.targetClassName || 'target').charAt(0).toLowerCase() + (rel.targetClassName || 'target').slice(1) + (rel.qty === 'many' ? 's' : ''),
+          target_lower: 0, target_upper: rel.qty === 'many' ? -1 : 1,
+          association_type: rel.relType,
+        });
+        addedRels++;
+      } catch (e) { console.warn('rel add failed:', e.message); }
+    }
+
+    showToast(
+      `新类创建完成 · ${addedAttrs} 属性 · ${addedRels} 关联`,
+      (addedAttrs === 0 && addedRels === 0 && (s.customAttrs.length + s.selectedTemplates.length + s.relations.length > 0))
+        ? 'error' : 'success'
+    );
+
+    document.getElementById('class-wizard-modal').classList.add('hidden');
+    if (typeof loadModel === 'function') {
+      await loadModel(s.modelId, s.layer);
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '向导失败', message: e.message });
+  } finally {
+    finishBtn.disabled = false; finishBtn.textContent = origText;
+  }
+}
+
+function wireClassWizardModal() {
+  if (!document.getElementById('class-wizard-modal')) return;
+  document.getElementById('btn-cw-cancel').addEventListener('click',
+    () => document.getElementById('class-wizard-modal').classList.add('hidden'));
+  document.getElementById('btn-cw-back').addEventListener('click', cwBack);
+  document.getElementById('btn-cw-next').addEventListener('click', cwNext);
+  document.getElementById('btn-cw-finish').addEventListener('click', cwFinish);
 }
 
 function wireAttrBuilderModal() {
@@ -4798,6 +5321,7 @@ function renderTree(layer) {
       <span class="tree-dashboard-title">${escapeHtml(pkgLabel)}</span>
       <span class="tree-dashboard-ver" title="当前版本">v${model.current_version || '1.0'}</span>
       <button type="button" class="tree-dashboard-status status-${publishStatus}" data-action="change-publish" data-model-id="${modelId || ''}" data-current-status="${publishStatus}" title="点击切换发布状态 (V3.0 § 2.4)">${publishLabel} <span class="status-edit-icon">✎</span></button>
+      <button type="button" class="tree-dashboard-newclass" data-action="new-class" title="使用向导创建新类 (5 步)">🆕 新建类</button>
     </div>
     <div class="tree-dashboard-stats">
       <div class="tree-stat tree-stat-classes">
@@ -4849,6 +5373,14 @@ function renderTree(layer) {
   const statusBtn = dashboard.querySelector('[data-action="change-publish"]');
   if (statusBtn) {
     statusBtn.addEventListener('click', () => openPublishStatusDialog(layer, modelId, publishStatus));
+  }
+  // V3.3 Phase 2: New class wizard button
+  const newClassBtn = dashboard.querySelector('[data-action="new-class"]');
+  if (newClassBtn) {
+    newClassBtn.addEventListener('click', () => {
+      if (!modelId) { showToast('请先选择或创建一个模型', 'error'); return; }
+      openClassWizard(modelId, layer);
+    });
   }
 
   // ---- V3.0 元结构面板 (仅 M2, 且存在 structural_patterns 时显示) ----

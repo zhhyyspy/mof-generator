@@ -526,6 +526,27 @@
       </div>
     </div>
 
+    <!-- V3.3 Phase 2: Class creation wizard (5 steps) -->
+    <div id="class-wizard-modal" class="overlay hidden">
+      <div class="modal-card class-wizard-card">
+        <div class="cw-header">
+          <h3 id="cw-title">🆕 新建类 · 向导</h3>
+          <div class="cw-stepper" id="cw-stepper">
+            <!-- Filled dynamically: [1][2][3][4][5] with progress -->
+          </div>
+        </div>
+        <div class="cw-body" id="cw-body">
+          <!-- Step content injected by JS -->
+        </div>
+        <div class="cw-footer modal-actions">
+          <button id="btn-cw-cancel" class="btn">取消</button>
+          <button id="btn-cw-back" class="btn" disabled>&lt; 上一步</button>
+          <button id="btn-cw-next" class="btn btn-primary">下一步 &gt;</button>
+          <button id="btn-cw-finish" class="btn btn-primary hidden">✓ 创建</button>
+        </div>
+      </div>
+    </div>
+
     <!-- V3.3: Visual attribute builder (quick add/edit attribute on any class) -->
     <div id="attr-builder-modal" class="overlay hidden">
       <div class="modal-card attr-builder-card">
