@@ -1405,13 +1405,15 @@ async function loadQualityBanner(dashboardEl, modelId, layer) {
         ${f.hint_action ? `<div class="quality-action">💡 ${escapeHtml(f.hint_action)}</div>` : ''}
       </div>
     `).join('');
+    // Apply persisted expand state (user can expand and have it stick across re-renders)
+    const expanded = _qualityBannerExpanded[layer];
     banner.innerHTML = `
       <div class="quality-banner-head">
         <span class="quality-banner-icon">${icon}</span>
         <span class="quality-banner-title">抽取质量体检 · ${actionable.length} 项提示</span>
-        <button class="quality-banner-toggle" data-action="toggle-quality">展开 ▼</button>
+        <button class="quality-banner-toggle" data-action="toggle-quality">${expanded ? '收起 ▲' : '展开 ▼'}</button>
       </div>
-      <div class="quality-banner-body hidden">${itemsHtml}</div>
+      <div class="quality-banner-body${expanded ? '' : ' hidden'}">${itemsHtml}</div>
     `;
     // Insert after dashboard header, before search
     const searchRow = dashboardEl.querySelector('.tree-dashboard-search');
@@ -1422,6 +1424,7 @@ async function loadQualityBanner(dashboardEl, modelId, layer) {
       const body = banner.querySelector('.quality-banner-body');
       const hidden = body.classList.toggle('hidden');
       toggle.textContent = hidden ? '展开 ▼' : '收起 ▲';
+      _qualityBannerExpanded[layer] = !hidden;
     });
   } catch (e) {
     // Silent — quality check is best-effort
@@ -1508,13 +1511,16 @@ function renderMetaStructurePanel(modelId, pkg, patterns) {
     `;
   }).join('');
 
+  // Apply persisted collapse state on initial render
+  const _m2Collapsed = _collapsedMetaPanels.m2 ? ' collapsed' : '';
+  const _m2ToggleLabel = _collapsedMetaPanels.m2 ? '展开 ▼' : '收起 ▲';
   panel.innerHTML = `
     <div class="ms-panel-header">
       <span class="ms-panel-title">🏗️ V3.0 元结构 (Structural Patterns)</span>
       <span class="ms-panel-count">${patterns.length} 个元结构</span>
-      <button type="button" class="ms-panel-toggle" data-action="toggle">收起 ▲</button>
+      <button type="button" class="ms-panel-toggle" data-action="toggle">${_m2ToggleLabel}</button>
     </div>
-    <div class="ms-panel-body">
+    <div class="ms-panel-body${_m2Collapsed}">
       <div class="ms-panel-hint">
         元结构 = 多个 MetaClass + N-1 条层级关联构成的可复用结构模板。
         可重命名元结构标签 (点击标题→修改→点击 💾 保存)。
@@ -1523,12 +1529,13 @@ function renderMetaStructurePanel(modelId, pkg, patterns) {
     </div>
   `;
 
-  // Toggle collapse
+  // Toggle collapse (persisted across re-renders)
   const toggleBtn = panel.querySelector('[data-action="toggle"]');
   const body = panel.querySelector('.ms-panel-body');
   toggleBtn.addEventListener('click', () => {
     const collapsed = body.classList.toggle('collapsed');
     toggleBtn.textContent = collapsed ? '展开 ▼' : '收起 ▲';
+    _collapsedMetaPanels.m2 = collapsed;
   });
 
   // Click level chip → scroll to that class in the tree
@@ -1889,6 +1896,9 @@ function renderM1MetaStructurePanel(m1Pkg, m2Pkg) {
 
   const panel = document.createElement('div');
   panel.className = 'meta-structure-panel meta-structure-panel-m1';
+  // Apply persisted collapse state on initial render
+  const _m1Collapsed = _collapsedMetaPanels.m1 ? ' collapsed' : '';
+  const _m1ToggleLabel = _collapsedMetaPanels.m1 ? '展开 ▼' : '收起 ▲';
   panel.innerHTML = `
     <div class="ms-panel-header">
       <span class="ms-panel-title">🏗️ M1 在元结构中的分布 · 组合关系树</span>
@@ -1897,9 +1907,9 @@ function renderM1MetaStructurePanel(m1Pkg, m2Pkg) {
         ${floatingCount ? ` · ⚠ ${floatingCount} 个游离` : ''}
         · 源自 <em>${escapeHtml(patterns[0].label || patterns[0].name)}</em>
       </span>
-      <button type="button" class="ms-panel-toggle" data-action="toggle">收起 ▲</button>
+      <button type="button" class="ms-panel-toggle" data-action="toggle">${_m1ToggleLabel}</button>
     </div>
-    <div class="ms-panel-body">
+    <div class="ms-panel-body${_m1Collapsed}">
       <div class="ms-panel-hint">
         每列 = 一个 M2 元结构层级;每节点 = 一个 M1 类,右上角徽章显示层级;
         <b>箭头 = M1 compositon 关联</b>(<code>is_hierarchy=false</code>),跨列表示层级间包含,同列曲线表示同层级嵌套。点击节点闪烁定位下方卡片。
@@ -1925,6 +1935,7 @@ function renderM1MetaStructurePanel(m1Pkg, m2Pkg) {
   toggleBtn.addEventListener('click', () => {
     const collapsed = body.classList.toggle('collapsed');
     toggleBtn.textContent = collapsed ? '展开 ▼' : '收起 ▲';
+    _collapsedMetaPanels.m1 = collapsed;
   });
 
   // Click node → flash corresponding M1 card
@@ -2017,6 +2028,14 @@ async function loadModel(modelId, layer) {
 // Tree Rendering (shared for M1 and M2)
 // ============================================================
 const _treeViewMode = { m1: 'cards', m2: 'cards' };  // 'cards' | 'hierarchy' | 'flat'
+
+// Persisted UI state across re-renders (bug fix: expanding a card then
+// triggering any save/edit shouldn't collapse it). Keys are class IDs.
+const _expandedTreeCards = { m1: new Set(), m2: new Set() };
+// Persisted state for the M2 元结构 inspector + M1 composition tree panels.
+const _collapsedMetaPanels = { m1: false, m2: false };
+// Persistent state for quality banner (collapsed by default, user-expandable)
+const _qualityBannerExpanded = { m1: false, m2: false };
 
 // ============================================================
 // Entity Detail Page — rich relationship view
@@ -3671,30 +3690,47 @@ function renderTree(layer) {
         // Expand button → inline attribute list
         const expandBtn = card.querySelector('.tree-card-expand');
         const details = card.querySelector('.tree-card-details');
+
+        // Lazy populate attribute list (idempotent). Used both on first click
+        // and when restoring persistent expand state.
+        const populateDetails = () => {
+          if (details.innerHTML) return;
+          let html = '<div class="card-attrs-list">';
+          for (const a of (cls.attributes || [])) {
+            const unit = a.unit ? ` (${a.unit})` : '';
+            const inh = a.is_inherited ? ' <span class="attr-inh-tag">继承</span>' : '';
+            html += `<div class="card-attr-row" data-attr-id="${a.id}">
+              <span class="attr-name">${escapeHtml(a.name)}</span>
+              <span class="attr-chinese">${escapeHtml(a.label || '')}</span>
+              <span class="attr-type">${a.data_type}${unit}</span>${inh}
+            </div>`;
+          }
+          html += '</div>';
+          details.innerHTML = html;
+          details.querySelectorAll('.card-attr-row').forEach(row => {
+            row.addEventListener('click', ev => {
+              ev.stopPropagation();
+              selectElement('attribute', row.dataset.attrId, cls.id, layer);
+            });
+          });
+        };
+
+        // Restore persistent expand state (from _expandedTreeCards[layer]).
+        // If this card was expanded before the re-render, reopen it now.
+        if (_expandedTreeCards[layer]?.has(cls.id)) {
+          details.classList.remove('hidden');
+          expandBtn.textContent = '▲ 收起';
+          populateDetails();
+        }
+
         expandBtn.addEventListener('click', e => {
           e.stopPropagation();
-          const open = details.classList.toggle('hidden');
+          const open = details.classList.toggle('hidden');   // 'hidden' added → collapsed
           expandBtn.textContent = open ? '▼ 展开' : '▲ 收起';
-          if (!open && !details.innerHTML) {
-            let html = '<div class="card-attrs-list">';
-            for (const a of (cls.attributes || [])) {
-              const unit = a.unit ? ` (${a.unit})` : '';
-              const inh = a.is_inherited ? ' <span class="attr-inh-tag">继承</span>' : '';
-              html += `<div class="card-attr-row" data-attr-id="${a.id}">
-                <span class="attr-name">${escapeHtml(a.name)}</span>
-                <span class="attr-chinese">${escapeHtml(a.label || '')}</span>
-                <span class="attr-type">${a.data_type}${unit}</span>${inh}
-              </div>`;
-            }
-            html += '</div>';
-            details.innerHTML = html;
-            details.querySelectorAll('.card-attr-row').forEach(row => {
-              row.addEventListener('click', ev => {
-                ev.stopPropagation();
-                selectElement('attribute', row.dataset.attrId, cls.id, layer);
-              });
-            });
-          }
+          // Persist so subsequent re-renders preserve this state.
+          if (open) _expandedTreeCards[layer]?.delete(cls.id);
+          else _expandedTreeCards[layer]?.add(cls.id);
+          if (!open) populateDetails();
         });
 
         // Detail button → open entity detail page
@@ -5206,6 +5242,15 @@ function updateWorkbenchResults(result, failedBatches = [], isFinal = false) {
     else prevUnchecked.add(cb.dataset.id);
   });
 
+  // BUG fix: polling re-renders wipe out expanded-detail state. Snapshot which
+  // entities are currently expanded, and re-apply after the innerHTML rebuild.
+  const prevExpanded = new Set();
+  document.querySelectorAll('.review-entity-details.open').forEach(el => {
+    // ID naming is "details-<classId>"; extract the class id
+    const m = (el.id || '').match(/^details-(.+)$/);
+    if (m) prevExpanded.add(m[1]);
+  });
+
   // V3.1: default-uncheck suspected M0 instances unless user previously chose otherwise
   const suspectedM0 = new Set(result.suspected_m0_class_ids || []);
 
@@ -5220,6 +5265,16 @@ function updateWorkbenchResults(result, failedBatches = [], isFinal = false) {
     } else if (suspectedM0.has(cb.dataset.id) && !prevChecked.has(cb.dataset.id)) {
       cb.checked = false;
       cb.closest('.review-entity').classList.add('unchecked');
+    }
+  });
+
+  // Restore expand state
+  prevExpanded.forEach(cid => {
+    const details = document.getElementById(`details-${cid}`);
+    if (details) {
+      details.classList.add('open');
+      const btn = document.querySelector(`.review-entity-toggle[data-target="details-${cid}"]`);
+      if (btn) btn.textContent = '▼ 收起';
     }
   });
 
