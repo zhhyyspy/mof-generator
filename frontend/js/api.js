@@ -183,6 +183,34 @@ export const API = {
     return (await request(`/models/${modelId}/versions/${version}/activate`, { method: 'POST' })).json();
   },
 
+  // V3.2: Structural Pattern CRUD + impact preview
+  async validatePattern(m2Id, patternReq) {
+    return (await request(`/models/${m2Id}/structural-patterns/validate`, {
+      method: 'POST', body: JSON.stringify(patternReq),
+    })).json();
+  },
+  async previewPatternImpact(m2Id, body) {
+    // body: {pattern_id?, pattern: {...}}
+    return (await request(`/models/${m2Id}/structural-patterns/preview-impact`, {
+      method: 'POST', body: JSON.stringify(body),
+    })).json();
+  },
+  async createPattern(m2Id, body) {
+    return (await request(`/models/${m2Id}/structural-patterns`, {
+      method: 'POST', body: JSON.stringify(body),
+    })).json();
+  },
+  async updatePattern(m2Id, patternId, body) {
+    return (await request(`/models/${m2Id}/structural-patterns/${patternId}`, {
+      method: 'PUT', body: JSON.stringify(body),
+    })).json();
+  },
+  async deletePattern(m2Id, patternId, keepClasses = true) {
+    return (await request(`/models/${m2Id}/structural-patterns/${patternId}?keep_classes=${keepClasses ? 'true' : 'false'}`, {
+      method: 'DELETE',
+    })).json();
+  },
+
   // V3.1: quality sanity checks
   async qualityCheck(modelId) {
     return (await request(`/models/${modelId}/quality-check`)).json();

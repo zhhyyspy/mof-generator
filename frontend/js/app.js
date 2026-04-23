@@ -388,6 +388,7 @@ function setupToolbar() {
   // Wire complete-package Import modal (V3.0 .mofpkg.zip)
   wireImportPackageModal();
   wireSynonymModal();
+  wirePatternEditorModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -1286,6 +1287,508 @@ async function loadExistingModels() {
  * Fetches allowed transitions from backend, shows a small inline modal,
  * calls setPublishStatus, then refreshes the model.
  */
+// ============================================================================
+//                    V3.2 Structural Pattern Editor + Impact Preview
+// ============================================================================
+
+const PE_ROLE_META = {
+  root: { icon: '👑', label: 'root', color: 'var(--ms-l1)' },
+  intermediate: { icon: '🔸', label: 'intermediate', color: 'var(--text-dim)' },
+  leaf: { icon: '🍃', label: 'leaf', color: 'var(--ms-l4)' },
+};
+const PE_CONSTRAINT_LABELS = {
+  no_cycle: '禁止成环',
+  no_cross_level: '禁止跨级引用',
+  no_reverse: '禁止反向关联',
+  root_fixed: '根节点固定',
+};
+
+// Editor state
+let _peState = {
+  m2Id: null,
+  patternId: null,        // null → new, else → edit
+  m2Pkg: null,
+  levels: [],             // [{level_name, class_id, role}]
+  lastValidationErrors: [],
+  pendingMigrations: null,  // set after Impact Preview decisions
+};
+
+/** Entry: open the editor for a specific pattern, or blank if patternId=null */
+function openPatternEditor(m2Id, patternId = null) {
+  const m2Model = state.m2Model;
+  if (!m2Model || m2Model.id !== m2Id) {
+    showDialog({ type: 'warning', title: '无法编辑', message: '请先在 M2 tab 切到目标 M2 模型' });
+    return;
+  }
+  const pkg = m2Model.versions?.slice(-1)[0]?.package;
+  if (!pkg) return;
+  _peState = {
+    m2Id, patternId,
+    m2Pkg: pkg,
+    levels: [],
+    lastValidationErrors: [],
+    pendingMigrations: null,
+  };
+
+  // Pre-fill form
+  const titleEl = document.getElementById('pattern-editor-title');
+  titleEl.textContent = patternId ? '🏗️ 编辑元结构' : '🆕 新建元结构';
+  const nameEl = document.getElementById('pe-name');
+  const labelEl = document.getElementById('pe-label');
+  const descEl = document.getElementById('pe-description');
+  const recAssocEl = document.getElementById('pe-rec-assoc');
+
+  if (patternId) {
+    const sp = (pkg.structural_patterns || []).find(s => s.id === patternId);
+    if (!sp) { showDialog({ type: 'error', title: '错误', message: '找不到要编辑的元结构' }); return; }
+    nameEl.value = sp.name || '';
+    labelEl.value = sp.label || '';
+    descEl.value = sp.description || '';
+    recAssocEl.value = sp.recommended_assoc_type || 'composition';
+    // Reconstruct levels from pattern
+    const classById = Object.fromEntries((pkg.classes || []).map(c => [c.id, c]));
+    _peState.levels = (sp.participating_class_ids || []).map((cid, i) => {
+      const c = classById[cid];
+      const role = c?.meta_structure_role
+        || (i === 0 ? 'root' : i === sp.participating_class_ids.length - 1 ? 'leaf' : 'intermediate');
+      return {
+        level_name: sp.level_names?.[i] || `L${i+1}`,
+        class_id: cid,
+        role,
+      };
+    });
+    // Constraints
+    document.querySelectorAll('#pattern-editor-modal .pe-constraints input').forEach(cb => {
+      cb.checked = (sp.constraints || []).includes(cb.value);
+    });
+  } else {
+    nameEl.value = '';
+    labelEl.value = '';
+    descEl.value = '';
+    recAssocEl.value = 'composition';
+    _peState.levels = [];
+    document.querySelectorAll('#pattern-editor-modal .pe-constraints input').forEach(cb => {
+      cb.checked = true;
+    });
+  }
+
+  renderPeLevels();
+  renderPePreview();
+  refreshPeValidation();
+  document.getElementById('pattern-editor-modal').classList.remove('hidden');
+}
+
+/** Render the levels list */
+function renderPeLevels() {
+  const container = document.getElementById('pe-levels');
+  const pkg = _peState.m2Pkg;
+  const cls = pkg.classes || [];
+  // Classes already in other patterns (can't add unless it's this pattern)
+  const claimedElsewhere = new Set();
+  for (const sp of (pkg.structural_patterns || [])) {
+    if (sp.id === _peState.patternId) continue;
+    for (const cid of (sp.participating_class_ids || [])) claimedElsewhere.add(cid);
+  }
+
+  const classOptionsForLevel = (lvlIdx) => {
+    const myLevelClassIds = new Set(_peState.levels.map((l, i) => i === lvlIdx ? null : l.class_id));
+    return cls.filter(c => !claimedElsewhere.has(c.id) && !myLevelClassIds.has(c.id))
+      .map(c => `<option value="${c.id}"${c.id === _peState.levels[lvlIdx]?.class_id ? ' selected' : ''}>
+        ${escapeHtml(c.label || c.name)} · ${escapeHtml(c.name)}
+      </option>`).join('');
+  };
+
+  const rolesOptions = (selected) => Object.entries(PE_ROLE_META).map(([k, m]) =>
+    `<option value="${k}"${k === selected ? ' selected' : ''}>${m.icon} ${m.label}</option>`
+  ).join('');
+
+  container.innerHTML = _peState.levels.map((lvl, i) => `
+    <div class="pe-level-row" data-idx="${i}">
+      <span class="pe-level-drag" title="上下移动">≡</span>
+      <span class="pe-level-num">L${i + 1}</span>
+      <input type="text" class="pe-level-name" value="${escapeHtml(lvl.level_name)}"
+             placeholder="层级名 (如 L1-设施)" data-field="level_name" />
+      <select class="pe-level-class" data-field="class_id">
+        <option value="">— 选择 MetaClass —</option>
+        ${classOptionsForLevel(i)}
+      </select>
+      <select class="pe-level-role" data-field="role">${rolesOptions(lvl.role)}</select>
+      <button type="button" class="pe-level-up" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
+      <button type="button" class="pe-level-down" title="下移" ${i === _peState.levels.length - 1 ? 'disabled' : ''}>↓</button>
+      <button type="button" class="pe-level-del" title="删除">×</button>
+    </div>
+  `).join('');
+
+  // Wire events
+  container.querySelectorAll('.pe-level-row').forEach(row => {
+    const idx = Number(row.dataset.idx);
+    row.querySelectorAll('[data-field]').forEach(el => {
+      el.addEventListener('input', e => {
+        _peState.levels[idx][e.target.dataset.field] =
+          e.target.tagName === 'SELECT' ? e.target.value : e.target.value;
+        // Auto-derive role when class_id changes if role was empty
+        if (e.target.dataset.field === 'class_id' && !_peState.levels[idx].role) {
+          _peState.levels[idx].role = idx === 0 ? 'root'
+            : idx === _peState.levels.length - 1 ? 'leaf' : 'intermediate';
+        }
+        renderPePreview();
+        refreshPeValidation();
+      });
+    });
+    row.querySelector('.pe-level-up').addEventListener('click', () => peMoveLevel(idx, -1));
+    row.querySelector('.pe-level-down').addEventListener('click', () => peMoveLevel(idx, +1));
+    row.querySelector('.pe-level-del').addEventListener('click', () => peDeleteLevel(idx));
+  });
+}
+
+function peMoveLevel(idx, delta) {
+  const tgt = idx + delta;
+  if (tgt < 0 || tgt >= _peState.levels.length) return;
+  const [moved] = _peState.levels.splice(idx, 1);
+  _peState.levels.splice(tgt, 0, moved);
+  // Re-derive roles based on new positions
+  _peState.levels.forEach((l, i) => {
+    if (i === 0) l.role = 'root';
+    else if (i === _peState.levels.length - 1) l.role = 'leaf';
+    else l.role = 'intermediate';
+  });
+  renderPeLevels();
+  renderPePreview();
+  refreshPeValidation();
+}
+
+function peDeleteLevel(idx) {
+  _peState.levels.splice(idx, 1);
+  _peState.levels.forEach((l, i) => {
+    if (i === 0) l.role = 'root';
+    else if (i === _peState.levels.length - 1) l.role = 'leaf';
+    else l.role = 'intermediate';
+  });
+  renderPeLevels();
+  renderPePreview();
+  refreshPeValidation();
+}
+
+function peAddLevel() {
+  const total = _peState.levels.length;
+  const role = total === 0 ? 'root' : 'leaf';
+  // If we add a new last (was leaf), the previous leaf becomes intermediate
+  if (total > 0) {
+    _peState.levels[total - 1].role = total - 1 === 0 ? 'root' : 'intermediate';
+  }
+  _peState.levels.push({
+    level_name: `L${total + 1}-`,
+    class_id: '',
+    role,
+  });
+  renderPeLevels();
+  renderPePreview();
+  refreshPeValidation();
+}
+
+/** Live preview: mini tree showing current levels + auto-derived edges */
+function renderPePreview() {
+  const container = document.getElementById('pe-preview');
+  const pkg = _peState.m2Pkg;
+  const classById = Object.fromEntries((pkg.classes || []).map(c => [c.id, c]));
+  if (!_peState.levels.length) {
+    container.innerHTML = '<div class="pe-preview-empty">(尚未添加层级)</div>';
+    return;
+  }
+  const rows = [];
+  for (let i = 0; i < _peState.levels.length; i++) {
+    const lvl = _peState.levels[i];
+    const c = classById[lvl.class_id];
+    const meta = PE_ROLE_META[lvl.role] || PE_ROLE_META.intermediate;
+    rows.push(`
+      <div class="pe-preview-node pe-preview-role-${lvl.role}">
+        <div class="pe-preview-level-name" style="color:${meta.color}">${escapeHtml(lvl.level_name || `L${i+1}`)}</div>
+        <div class="pe-preview-class-name">${c ? escapeHtml(c.label || c.name) : '<span class="pe-preview-unset">(未选类)</span>'}</div>
+        <div class="pe-preview-role">${meta.icon} ${meta.label}${c ? ' · ' + escapeHtml(c.name) : ''}</div>
+      </div>
+    `);
+    if (i < _peState.levels.length - 1) {
+      rows.push(`<div class="pe-preview-arrow">↓</div>`);
+    }
+  }
+  container.innerHTML = rows.join('');
+}
+
+/** Call backend validate + diff + impact, render feedback */
+async function refreshPeValidation() {
+  const validationEl = document.getElementById('pe-validation');
+  const req = buildPeRequest();
+  // First local quick checks
+  const localErrors = [];
+  if (!req.name) localErrors.push('⚠ 元结构名称不能为空');
+  if ((req.levels || []).length < 2) localErrors.push('⚠ 至少需要 2 个层级');
+  const classIds = req.levels.map(l => l.class_id).filter(Boolean);
+  if (new Set(classIds).size !== classIds.length) localErrors.push('⚠ 同一个类不能在多个层级出现');
+  const emptyClass = req.levels.some(l => !l.class_id);
+  if (emptyClass) localErrors.push('⚠ 所有层级必须选定 MetaClass');
+  const emptyName = req.levels.some(l => !(l.level_name || '').trim());
+  if (emptyName) localErrors.push('⚠ 所有层级必须填写层级名');
+
+  if (localErrors.length) {
+    _peState.lastValidationErrors = localErrors;
+    validationEl.innerHTML = localErrors.map(e => `<div class="pe-error">${escapeHtml(e)}</div>`).join('');
+    return;
+  }
+
+  try {
+    const resp = await API.validatePattern(_peState.m2Id, req);
+    _peState.lastValidationErrors = resp.errors || [];
+    if (resp.valid) {
+      validationEl.innerHTML = `
+        <div class="pe-ok">✓ 结构有效 · ${req.levels.length} 层 · 将自动派生 ${Math.max(0, req.levels.length - 1)} 条层级边</div>`;
+    } else {
+      validationEl.innerHTML = resp.errors.map(e => `<div class="pe-error">⚠ ${escapeHtml(e)}</div>`).join('');
+    }
+  } catch (e) {
+    validationEl.innerHTML = `<div class="pe-error">验证失败: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function buildPeRequest() {
+  const constraints = Array.from(document.querySelectorAll('#pattern-editor-modal .pe-constraints input:checked'))
+    .map(cb => cb.value);
+  return {
+    name: document.getElementById('pe-name').value.trim(),
+    label: document.getElementById('pe-label').value.trim(),
+    description: document.getElementById('pe-description').value.trim(),
+    recommended_assoc_type: document.getElementById('pe-rec-assoc').value,
+    constraints,
+    levels: _peState.levels.map(l => ({
+      level_name: l.level_name,
+      class_id: l.class_id,
+      role: l.role,
+    })),
+  };
+}
+
+async function peSaveWorkflow() {
+  // Validate one more time
+  await refreshPeValidation();
+  if (_peState.lastValidationErrors.length) {
+    showDialog({ type: 'warning', title: '无法保存', message: _peState.lastValidationErrors.join('\n') });
+    return;
+  }
+  const req = buildPeRequest();
+  const previewBody = { pattern_id: _peState.patternId, pattern: req };
+  let preview;
+  try {
+    preview = await API.previewPatternImpact(_peState.m2Id, previewBody);
+  } catch (e) {
+    showDialog({ type: 'error', title: '影响预览失败', message: e.message });
+    return;
+  }
+  if (!preview.valid) {
+    showDialog({ type: 'warning', title: '校验未通过', message: (preview.errors || []).join('\n') });
+    return;
+  }
+
+  // If no hard changes AND no m1 impact → save directly
+  const hardChanges = (preview.changes || []).filter(c => c.severity === 'hard');
+  if (hardChanges.length === 0 && (preview.m1_impacts || []).length === 0) {
+    await peCommitPattern(req, []);
+    return;
+  }
+
+  // Open Impact Preview dialog
+  openPatternImpactDialog(preview, req);
+}
+
+async function peCommitPattern(req, migrations) {
+  const body = { pattern: req, m1_migrations: migrations };
+  try {
+    const result = _peState.patternId
+      ? await API.updatePattern(_peState.m2Id, _peState.patternId, body)
+      : await API.createPattern(_peState.m2Id, body);
+    const w = result.wire_info || {};
+    const mig = result.migrations || {};
+    showToast(
+      `元结构已保存 · 新建 ${(w.created||[]).length} 边 · ` +
+      `升级 ${(w.promoted||[]).length} · 降级 ${(w.demoted||[]).length} · ` +
+      `M1 迁移 ${(mig.updated||[]).length}`,
+      'success'
+    );
+    document.getElementById('pattern-editor-modal').classList.add('hidden');
+    document.getElementById('pattern-impact-modal').classList.add('hidden');
+    // Refresh M2 model + any M1 models
+    if (typeof loadModel === 'function' && _peState.m2Id) {
+      await loadModel(_peState.m2Id, 'm2');
+      if (state.m1ModelId) await loadModel(state.m1ModelId, 'm1');
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '保存失败', message: e.message });
+  }
+}
+
+// ---- Impact Preview dialog ----
+
+function openPatternImpactDialog(preview, req) {
+  const content = document.getElementById('pi-content');
+  const safe = (preview.changes || []).filter(c => c.severity === 'safe');
+  const soft = (preview.changes || []).filter(c => c.severity === 'soft');
+  const hard = (preview.changes || []).filter(c => c.severity === 'hard');
+  const impacts = preview.m1_impacts || [];
+
+  // Group impacts by m2_class_name (which hard change affects them)
+  const impactsByClassName = {};
+  for (const imp of impacts) {
+    (impactsByClassName[imp.m2_class_name] = impactsByClassName[imp.m2_class_name] || []).push(imp);
+  }
+
+  const safeHtml = safe.length ? `
+    <div class="pi-section pi-section-safe">
+      <div class="pi-section-title">🟢 零影响变更 (可直接应用)</div>
+      ${safe.map(c => `<div class="pi-change-item">✓ ${escapeHtml(c.description)}</div>`).join('')}
+    </div>` : '';
+
+  const softHtml = soft.length ? `
+    <div class="pi-section pi-section-soft">
+      <div class="pi-section-title">🟡 新增/扩展变更</div>
+      ${soft.map(c => `<div class="pi-change-item">+ ${escapeHtml(c.description)}</div>`).join('')}
+    </div>` : '';
+
+  // M2 class dropdown for reassign — include all M2 classes
+  const m2Pkg = _peState.m2Pkg;
+  const m2ClassOptions = (m2Pkg.classes || []).map(c =>
+    `<option value="${c.id}" data-name="${escapeHtml(c.name)}">${escapeHtml(c.label || c.name)} · ${escapeHtml(c.name)}</option>`
+  ).join('');
+
+  const hardHtml = hard.length ? `
+    <div class="pi-section pi-section-hard">
+      <div class="pi-section-title">🔴 需要决策的变更</div>
+      ${hard.map(c => {
+        const classImpacts = impactsByClassName[c.extra?.class_name] || [];
+        return `
+        <div class="pi-hard-change">
+          <div class="pi-hard-title">${escapeHtml(c.description)}</div>
+          ${classImpacts.length ? `
+            <div class="pi-impact-summary">
+              影响: ${classImpacts.length} 个 M1 类 (parent_class_name = <code>${escapeHtml(c.extra.class_name)}</code>)
+            </div>
+            <div class="pi-impact-bulk">
+              <span class="pi-impact-bulk-label">批量处理:</span>
+              <label><input type="radio" name="bulk-${c.extra.class_name}" value="keep_parent" checked>
+                🔓 保留当前父类 (推荐)</label>
+              <label><input type="radio" name="bulk-${c.extra.class_name}" value="reassign">
+                🔀 重挂到 <select class="pi-reassign-target" data-class-name="${escapeHtml(c.extra.class_name)}">
+                  <option value="">— 选目标类 —</option>${m2ClassOptions}
+                </select></label>
+              <label><input type="radio" name="bulk-${c.extra.class_name}" value="null_parent">
+                🚫 清空父类 (变孤儿)</label>
+              <label><input type="radio" name="bulk-${c.extra.class_name}" value="delete_m1">
+                🗑 删除 M1 类</label>
+            </div>
+            <details class="pi-impact-details">
+              <summary>展开逐个处理 (${classImpacts.length} 个 M1 类)</summary>
+              <div class="pi-m1-list">
+                ${classImpacts.map(imp => `
+                  <div class="pi-m1-row" data-m1-model="${imp.m1_model_id}" data-m1-class="${imp.m1_class_id}"
+                       data-m2-class-name="${escapeHtml(c.extra.class_name)}">
+                    <span class="pi-m1-label">${escapeHtml(imp.m1_class_label)}</span>
+                    <span class="pi-m1-code">${escapeHtml(imp.m1_class_name)}</span>
+                    <span class="pi-m1-model">in <em>${escapeHtml(imp.m1_model_label)}</em></span>
+                    <select class="pi-m1-action">
+                      <option value="keep_parent" selected>🔓 保留</option>
+                      <option value="reassign">🔀 重挂到...</option>
+                      <option value="null_parent">🚫 清空</option>
+                      <option value="delete_m1">🗑 删除</option>
+                    </select>
+                  </div>`).join('')}
+              </div>
+            </details>
+          ` : ''}
+        </div>`;
+      }).join('')}
+    </div>` : '';
+
+  content.innerHTML = safeHtml + softHtml + hardHtml + (
+    (safe.length + soft.length + hard.length === 0) ?
+      '<div class="pi-empty">✓ 未检测到变更</div>' : ''
+  );
+  _peState.pendingPreview = preview;
+  _peState.pendingReq = req;
+  document.getElementById('pattern-impact-modal').classList.remove('hidden');
+}
+
+function collectMigrationsFromImpactDialog() {
+  const migrations = [];
+  document.querySelectorAll('.pi-m1-row').forEach(row => {
+    const m2ClassName = row.dataset.m2ClassName;
+    const actionSel = row.querySelector('.pi-m1-action');
+    let action = actionSel.value;
+
+    // If per-row not customized (still default), fall back to bulk radio
+    const bulkRadio = document.querySelector(`input[name="bulk-${m2ClassName}"]:checked`);
+    if (bulkRadio && action === 'keep_parent') {
+      action = bulkRadio.value;
+    }
+
+    const mig = {
+      m1_model_id: row.dataset.m1Model,
+      m1_class_id: row.dataset.m1Class,
+      action,
+    };
+    if (action === 'reassign') {
+      // Find target selector near this bulk (from bulk setting)
+      const tgtSel = document.querySelector(`.pi-reassign-target[data-class-name="${m2ClassName}"]`);
+      if (tgtSel && tgtSel.value) {
+        mig.target_class_id = tgtSel.value;
+        mig.target_class_name = tgtSel.selectedOptions[0]?.dataset.name;
+      }
+    }
+    migrations.push(mig);
+  });
+  return migrations;
+}
+
+function wirePatternEditorModal() {
+  document.getElementById('pe-add-level').addEventListener('click', peAddLevel);
+  document.getElementById('btn-pattern-cancel').addEventListener('click',
+    () => document.getElementById('pattern-editor-modal').classList.add('hidden'));
+  document.getElementById('btn-pattern-save').addEventListener('click', peSaveWorkflow);
+  // Wire input listeners for basic info — recompute preview on change
+  ['pe-name', 'pe-label', 'pe-description', 'pe-rec-assoc'].forEach(id => {
+    document.getElementById(id).addEventListener('input', () => {
+      renderPePreview();
+      refreshPeValidation();
+    });
+  });
+  document.querySelectorAll('#pattern-editor-modal .pe-constraints input').forEach(cb => {
+    cb.addEventListener('change', refreshPeValidation);
+  });
+
+  // Impact dialog
+  document.getElementById('btn-pi-back').addEventListener('click',
+    () => document.getElementById('pattern-impact-modal').classList.add('hidden'));
+  document.getElementById('btn-pi-skip-m1').addEventListener('click', async () => {
+    await peCommitPattern(_peState.pendingReq, []);
+  });
+  document.getElementById('btn-pi-apply').addEventListener('click', async () => {
+    const migrations = collectMigrationsFromImpactDialog();
+    await peCommitPattern(_peState.pendingReq, migrations);
+  });
+}
+
+async function confirmDeletePattern(m2Id, patternId, patternLabel) {
+  const proceed = window.confirm(
+    `确定删除元结构 "${patternLabel}" ?\n\n` +
+    `默认会保留所有参与的 MetaClass 和 Association (仅解绑),不影响 M1。\n` +
+    `点确定继续,点取消放弃。`
+  );
+  if (!proceed) return;
+  try {
+    const res = await API.deletePattern(m2Id, patternId, true);
+    showToast(`元结构已删除 · 保留了 ${res.classes_affected} 个类 · 降级 ${res.edges_demoted} 条边`, 'success');
+    if (typeof loadModel === 'function') await loadModel(m2Id, 'm2');
+  } catch (e) {
+    showDialog({ type: 'error', title: '删除失败', message: e.message });
+  }
+}
+
 async function openPublishStatusDialog(layer, modelId, currentStatus) {
   if (!modelId) { showToast('模型未保存,无法切换发布状态', 'error'); return; }
   const STATUS_META = {
@@ -1495,7 +1998,9 @@ function renderMetaStructurePanel(modelId, pkg, patterns) {
           <span class="ms-card-icon">🏗️</span>
           <input class="ms-card-title" type="text" value="${escapeHtml(sp.label || sp.name)}" data-field="label" />
           <span class="ms-card-count">${participating.length} 个 MetaClass · ${hierarchyEdges.length} 条层级边</span>
-          <button type="button" class="ms-card-save" data-action="save-pattern">💾 保存</button>
+          <button type="button" class="ms-card-save" data-action="save-pattern" title="仅保存标签">💾</button>
+          <button type="button" class="ms-card-edit" data-action="edit-pattern" title="编辑元结构 (层级/参与类/约束...)">✎ 编辑</button>
+          <button type="button" class="ms-card-del" data-action="delete-pattern" title="删除元结构 (保留类和关联)">🗑</button>
         </div>
         ${sp.description ? `<div class="ms-card-desc">${escapeHtml(sp.description)}</div>` : ''}
         <div class="ms-level-chain">${chainHtml || '<span class="ms-empty">链为空</span>'}</div>
@@ -1518,12 +2023,13 @@ function renderMetaStructurePanel(modelId, pkg, patterns) {
     <div class="ms-panel-header">
       <span class="ms-panel-title">🏗️ V3.0 元结构 (Structural Patterns)</span>
       <span class="ms-panel-count">${patterns.length} 个元结构</span>
+      <button type="button" class="ms-panel-new" data-action="new-pattern" title="新建元结构">🆕 新建</button>
       <button type="button" class="ms-panel-toggle" data-action="toggle">${_m2ToggleLabel}</button>
     </div>
     <div class="ms-panel-body${_m2Collapsed}">
       <div class="ms-panel-hint">
         元结构 = 多个 MetaClass + N-1 条层级关联构成的可复用结构模板。
-        可重命名元结构标签 (点击标题→修改→点击 💾 保存)。
+        点 <b>✎ 编辑</b> 修改层级、参与类、约束; <b>🗑</b> 删除 (默认保留类和关联)。
       </div>
       <div class="ms-cards">${patternCards}</div>
     </div>
@@ -1574,8 +2080,27 @@ function renderMetaStructurePanel(modelId, pkg, patterns) {
         }
       } catch (e) {
         showToast('保存失败: ' + e.message, 'error');
-        btn.disabled = false; btn.textContent = '💾 保存';
+        btn.disabled = false; btn.textContent = '💾';
       }
+    });
+  });
+
+  // V3.2: Full editor/delete/new buttons
+  const newBtn = panel.querySelector('[data-action="new-pattern"]');
+  if (newBtn) newBtn.addEventListener('click', () => openPatternEditor(modelId, null));
+
+  panel.querySelectorAll('[data-action="edit-pattern"]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const patternId = btn.closest('.ms-card').dataset.patternId;
+      openPatternEditor(modelId, patternId);
+    });
+  });
+  panel.querySelectorAll('[data-action="delete-pattern"]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const card = btn.closest('.ms-card');
+      const patternId = card.dataset.patternId;
+      const labelInput = card.querySelector('[data-field="label"]');
+      confirmDeletePattern(modelId, patternId, labelInput?.value || patternId);
     });
   });
 

@@ -526,6 +526,93 @@
       </div>
     </div>
 
+    <!-- V3.2: Structural Pattern editor modal (create/edit) -->
+    <div id="pattern-editor-modal" class="overlay hidden">
+      <div class="modal-card pattern-editor-card">
+        <h3 id="pattern-editor-title">🏗️ 编辑元结构</h3>
+        <div class="pattern-editor-body">
+          <div class="pattern-editor-left">
+            <!-- Basic info -->
+            <div class="pe-section">
+              <div class="pe-section-title">基本信息</div>
+              <label class="pe-field">
+                <span>元结构名 (英文,PascalCase)</span>
+                <input type="text" id="pe-name" placeholder="InvestmentPattern" />
+              </label>
+              <label class="pe-field">
+                <span>中文标签</span>
+                <input type="text" id="pe-label" placeholder="投资管理层级模板" />
+              </label>
+              <label class="pe-field">
+                <span>描述</span>
+                <textarea id="pe-description" rows="2" placeholder="简要描述本元结构的业务含义"></textarea>
+              </label>
+              <label class="pe-field pe-field-row">
+                <span>推荐关联类型</span>
+                <select id="pe-rec-assoc">
+                  <option value="composition">composition (部分-整体,强包含)</option>
+                  <option value="aggregation">aggregation (聚合,弱包含)</option>
+                  <option value="association">association (普通关联)</option>
+                </select>
+              </label>
+            </div>
+
+            <!-- Levels list -->
+            <div class="pe-section">
+              <div class="pe-section-title">
+                层级列表
+                <span class="pe-hint">(从上到下 L1 → LN,拖 ≡ 或上下键重排)</span>
+              </div>
+              <div id="pe-levels" class="pe-levels"></div>
+              <button type="button" id="pe-add-level" class="btn pe-add-level-btn">+ 添加层级</button>
+            </div>
+
+            <!-- Constraints -->
+            <div class="pe-section">
+              <div class="pe-section-title">结构约束</div>
+              <div class="pe-constraints">
+                <label><input type="checkbox" value="no_cycle" checked> no_cycle  禁止成环</label>
+                <label><input type="checkbox" value="no_cross_level" checked> no_cross_level  禁止跨级引用</label>
+                <label><input type="checkbox" value="no_reverse" checked> no_reverse  禁止反向关联</label>
+                <label><input type="checkbox" value="root_fixed" checked> root_fixed  根节点固定</label>
+              </div>
+            </div>
+
+            <!-- Live validation feedback -->
+            <div class="pe-section">
+              <div class="pe-section-title">验证结果</div>
+              <div id="pe-validation" class="pe-validation"></div>
+            </div>
+          </div>
+
+          <!-- Right: live preview -->
+          <div class="pattern-editor-right">
+            <div class="pe-section-title">🔍 实时预览</div>
+            <div id="pe-preview" class="pe-preview"></div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-pattern-cancel" class="btn">取消</button>
+          <button id="btn-pattern-save" class="btn btn-primary">💾 保存元结构</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- V3.2: Impact Preview dialog (cascade confirmation) -->
+    <div id="pattern-impact-modal" class="overlay hidden">
+      <div class="modal-card pattern-impact-card">
+        <h3>🔀 元结构修改影响预览</h3>
+        <div id="pi-content" class="pi-content">
+          <!-- Filled dynamically: safe changes + hard changes + m1 impacts -->
+        </div>
+        <div class="modal-actions">
+          <button id="btn-pi-back" class="btn">&lt; 返回编辑</button>
+          <button id="btn-pi-skip-m1" class="btn">跳过 M1 同步</button>
+          <button id="btn-pi-apply" class="btn btn-primary">✓ 应用全部修改</button>
+        </div>
+      </div>
+    </div>
+
     <!-- V3.1: Synonym class detection + merge modal -->
     <div id="synonym-modal" class="overlay hidden">
       <div class="modal-card">

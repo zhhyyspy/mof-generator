@@ -672,6 +672,211 @@ async def detect_synonyms(model_id: str, use_llm: bool = False):
     }
 
 
+# ============================================================================
+#                  V3.2 Structural Pattern CRUD + M1 impact
+# ============================================================================
+
+def _find_pattern(pkg: Package, pattern_id: str):
+    for sp in (pkg.structural_patterns or []):
+        if sp.id == pattern_id:
+            return sp
+    return None
+
+
+@router.post("/{m2_id}/structural-patterns/validate")
+async def validate_pattern(m2_id: str, req: dict):
+    """Pure validation — returns errors list, no side effect.
+    Editor calls this on every change to show live feedback.
+    """
+    from backend.services.pattern_manager import PatternRequest, validate_request
+    model = _get_model_or_404(m2_id)
+    pkg = _current_package(model)
+    pr = PatternRequest.from_dict(req)
+    errors = validate_request(pr, pkg)
+    return {"valid": len(errors) == 0, "errors": errors}
+
+
+@router.post("/{m2_id}/structural-patterns/preview-impact")
+async def preview_pattern_impact(m2_id: str, req: dict):
+    """Dry-run: given a new/updated pattern request, diff against committed state
+    and scan all bound M1 models for impacted classes. No store write.
+
+    req = {
+      "pattern_id": "...",           # optional; if present, edit; else new
+      "pattern": { ...PatternRequest... }
+    }
+    """
+    from backend.services.pattern_manager import (
+        PatternRequest, validate_request, diff_patterns, scan_m1_impact,
+    )
+    model = _get_model_or_404(m2_id)
+    pkg = _current_package(model)
+    pattern_id = req.get("pattern_id")
+    pr = PatternRequest.from_dict(req.get("pattern") or {})
+    errors = validate_request(pr, pkg)
+    if errors:
+        return {"valid": False, "errors": errors, "changes": [], "m1_impacts": []}
+    old = _find_pattern(pkg, pattern_id) if pattern_id else None
+    changes = diff_patterns(old, pr, pkg)
+    impacts = scan_m1_impact(changes, pkg, m2_id, store)
+    return {
+        "valid": True,
+        "errors": [],
+        "changes": [
+            {"kind": c.kind, "severity": c.severity, "description": c.description, "extra": c.extra}
+            for c in changes
+        ],
+        "m1_impacts": impacts,
+    }
+
+
+@router.post("/{m2_id}/structural-patterns")
+async def create_pattern(m2_id: str, req: dict):
+    """Create a new StructuralPattern in the M2 package.
+    req: {
+      pattern: { ...PatternRequest... },
+      m1_migrations: [...]       # optional; applied via atomic transaction
+    }
+    Returns: {pattern_id, wire_info, migrations_summary}
+    """
+    from backend.services.pattern_manager import (
+        PatternRequest, validate_request, build_pattern_entity,
+        sync_meta_structure_on_classes, auto_wire_hierarchy_edges,
+        apply_m1_migrations_and_save, AtomicModelWrite,
+    )
+    model = _get_model_or_404(m2_id)
+    pkg = _current_package(model)
+    pr = PatternRequest.from_dict(req.get("pattern") or {})
+    errors = validate_request(pr, pkg)
+    if errors:
+        raise HTTPException(400, {"msg": "pattern 校验失败", "errors": errors})
+
+    pattern = build_pattern_entity(pr)
+    pkg.structural_patterns.append(pattern)
+    sync_meta_structure_on_classes(pkg, pattern, pr)
+    wire_info = auto_wire_hierarchy_edges(pkg, pattern, pr)
+
+    migrations = req.get("m1_migrations") or []
+    if migrations:
+        result = apply_m1_migrations_and_save(
+            migrations, model, store, m2_pkg_for_rename=pkg,
+        )
+        if not result.get("m2_saved"):
+            raise HTTPException(500, {"msg": "原子保存失败已回滚", "details": result})
+    else:
+        # Just save M2
+        with AtomicModelWrite(store, [model.id]) as tx:
+            tx.save(model)
+        result = {"updated": [], "failed": [], "m2_saved": True, "m1_saved_count": 0}
+
+    return {
+        "pattern_id": pattern.id,
+        "wire_info": wire_info,
+        "migrations": result,
+    }
+
+
+@router.put("/{m2_id}/structural-patterns/{pattern_id}")
+async def update_pattern(m2_id: str, pattern_id: str, req: dict):
+    """Update (replace) an existing StructuralPattern.
+    req: {
+      pattern: { ...PatternRequest... },
+      m1_migrations: [...]
+    }
+    """
+    from backend.services.pattern_manager import (
+        PatternRequest, validate_request, build_pattern_entity,
+        sync_meta_structure_on_classes, auto_wire_hierarchy_edges,
+        apply_m1_migrations_and_save, AtomicModelWrite,
+    )
+    model = _get_model_or_404(m2_id)
+    pkg = _current_package(model)
+    old = _find_pattern(pkg, pattern_id)
+    if old is None:
+        raise HTTPException(404, f"Pattern {pattern_id} not found in M2 {m2_id}")
+
+    pr = PatternRequest.from_dict(req.get("pattern") or {})
+    errors = validate_request(pr, pkg)
+    if errors:
+        raise HTTPException(400, {"msg": "pattern 校验失败", "errors": errors})
+
+    # Replace pattern in-place (keep id)
+    new_pattern = build_pattern_entity(pr, existing_id=pattern_id)
+    for i, sp in enumerate(pkg.structural_patterns):
+        if sp.id == pattern_id:
+            pkg.structural_patterns[i] = new_pattern
+            break
+    sync_meta_structure_on_classes(pkg, new_pattern, pr)
+    wire_info = auto_wire_hierarchy_edges(pkg, new_pattern, pr)
+
+    migrations = req.get("m1_migrations") or []
+    if migrations:
+        result = apply_m1_migrations_and_save(
+            migrations, model, store, m2_pkg_for_rename=pkg,
+        )
+        if not result.get("m2_saved"):
+            raise HTTPException(500, {"msg": "原子保存失败已回滚", "details": result})
+    else:
+        with AtomicModelWrite(store, [model.id]) as tx:
+            tx.save(model)
+        result = {"updated": [], "failed": [], "m2_saved": True, "m1_saved_count": 0}
+
+    return {"pattern_id": new_pattern.id, "wire_info": wire_info, "migrations": result}
+
+
+@router.delete("/{m2_id}/structural-patterns/{pattern_id}")
+async def delete_pattern(m2_id: str, pattern_id: str, keep_classes: bool = True):
+    """Remove a StructuralPattern. By default keeps the participating MOFClasses
+    (just clears their meta_structure_* fields and demotes hierarchy assocs).
+    Set keep_classes=false to remove the participating classes too (dangerous).
+    """
+    from backend.services.pattern_manager import AtomicModelWrite
+    model = _get_model_or_404(m2_id)
+    pkg = _current_package(model)
+    old = _find_pattern(pkg, pattern_id)
+    if old is None:
+        raise HTTPException(404, f"Pattern {pattern_id} not found")
+
+    part_ids = set(old.participating_class_ids or [])
+    hier_ids = set(old.hierarchy_association_ids or [])
+
+    # Demote hierarchy edges
+    for a in pkg.associations:
+        if a.id in hier_ids:
+            a.is_hierarchy = False
+            a.hierarchy_order = None
+
+    # Clear meta_structure_* on classes (always)
+    for c in pkg.classes:
+        if c.meta_structure_id == pattern_id:
+            c.meta_structure_id = None
+            c.meta_structure_role = None
+            c.meta_structure_level = None
+
+    if not keep_classes:
+        # Remove participating classes + their associations
+        pkg.classes = [c for c in pkg.classes if c.id not in part_ids]
+        pkg.associations = [
+            a for a in pkg.associations
+            if getattr(a.source, "class_ref", None) not in part_ids
+            and getattr(a.target, "class_ref", None) not in part_ids
+        ]
+
+    # Remove pattern
+    pkg.structural_patterns = [sp for sp in pkg.structural_patterns if sp.id != pattern_id]
+
+    with AtomicModelWrite(store, [model.id]) as tx:
+        tx.save(model)
+
+    return {
+        "status": "deleted",
+        "pattern_id": pattern_id,
+        "kept_classes": keep_classes,
+        "classes_affected": len(part_ids),
+        "edges_demoted": len(hier_ids),
+    }
+
+
 @router.get("/{model_id}/quality-check")
 async def quality_check(model_id: str):
     """V3.1 Phase D: run quality sanity checks on the model's current package."""
