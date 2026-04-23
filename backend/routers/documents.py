@@ -5,12 +5,23 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from pydantic import BaseModel
 
 from backend.config import settings
 from backend.storage.file_store import store
 from backend.services.document_parser import parser
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
+
+
+# V3.1: document type taxonomy — drives M1 extraction prompt branching
+VALID_DOC_TYPES = (
+    "auto",      # unknown, classify later
+    "spec",      # 📘 制度规范 (国标/行标/管理规定/设计规范) → aggressive class extraction
+    "manual",    # 📗 技术说明书 (产品手册/设计规格) → dense attrs + relations
+    "ledger",    # 📊 实例表单 (台账/清单/登记簿) → extract column structure only, rows = M0
+    "process",   # 💬 业务过程 (会议纪要/邮件) → roles + stages only
+)
 
 
 @router.post("/")
@@ -35,7 +46,7 @@ async def upload_documents(files: list[UploadFile] = File(...)):
         # Save extracted text
         store.save_document_text(doc_id, text)
 
-        # Save metadata
+        # Save metadata; doc_type starts as "auto" until user sets it or LLM classifies.
         meta = {
             "id": doc_id,
             "filename": f.filename,
@@ -44,11 +55,56 @@ async def upload_documents(files: list[UploadFile] = File(...)):
             "char_count": len(text),
             "uploaded_at": datetime.now().isoformat(),
             "status": "ready",
+            "doc_type": "auto",          # V3.1
+            "doc_type_source": "default",  # "user" | "llm" | "default"
         }
         store.save_document_meta(doc_id, meta)
         results.append(meta)
 
     return {"documents": results}
+
+
+class DocTypeUpdate(BaseModel):
+    doc_type: str
+    source: str = "user"     # "user" or "llm"
+
+
+@router.patch("/{doc_id}/type")
+async def set_document_type(doc_id: str, req: DocTypeUpdate):
+    """V3.1: manually tag a document's type, used to branch M1 extraction prompt."""
+    if req.doc_type not in VALID_DOC_TYPES:
+        raise HTTPException(400, f"doc_type must be one of {VALID_DOC_TYPES}")
+    meta = store.get_document_meta(doc_id)
+    if meta is None:
+        raise HTTPException(404, f"Document {doc_id} not found")
+    meta["doc_type"] = req.doc_type
+    meta["doc_type_source"] = req.source
+    store.save_document_meta(doc_id, meta)
+    return {"id": doc_id, "doc_type": req.doc_type, "doc_type_source": req.source}
+
+
+@router.post("/{doc_id}/classify")
+async def classify_document(doc_id: str):
+    """V3.1: ask LLM to auto-classify the doc into one of VALID_DOC_TYPES.
+    Uses first 1200 chars only so the call is fast/cheap (~1 sec)."""
+    meta = store.get_document_meta(doc_id)
+    if meta is None:
+        raise HTTPException(404, f"Document {doc_id} not found")
+    text = store.get_document_text(doc_id) or ""
+    if not text.strip():
+        raise HTTPException(400, "Document has no extracted text")
+
+    from backend.services.ai_extractor import classify_document_type
+    try:
+        detected = await classify_document_type(text[:1200], filename=meta.get("filename", ""))
+    except Exception as e:
+        raise HTTPException(500, f"LLM classify failed: {e}")
+    if detected not in VALID_DOC_TYPES:
+        detected = "auto"
+    meta["doc_type"] = detected
+    meta["doc_type_source"] = "llm"
+    store.save_document_meta(doc_id, meta)
+    return {"id": doc_id, "doc_type": detected, "doc_type_source": "llm"}
 
 
 @router.get("/")

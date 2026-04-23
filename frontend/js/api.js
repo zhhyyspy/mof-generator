@@ -36,6 +36,16 @@ export const API = {
   },
   async listDocuments() { return (await request('/documents/')).json(); },
   async deleteDocument(id) { return (await request(`/documents/${id}`, { method: 'DELETE' })).json(); },
+  // V3.1: document type tagging
+  async setDocumentType(id, docType, source = 'user') {
+    return (await request(`/documents/${id}/type`, {
+      method: 'PATCH',
+      body: JSON.stringify({ doc_type: docType, source }),
+    })).json();
+  },
+  async classifyDocument(id) {
+    return (await request(`/documents/${id}/classify`, { method: 'POST' })).json();
+  },
 
   // Extraction: docs → M1
   async startM1Extraction(documentIds, modelName, modelLabel) {

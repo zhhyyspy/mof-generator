@@ -325,6 +325,34 @@ select:focus { border-color: var(--border-focus); outline: none; }
   color: var(--text-dim);
 }
 
+/* V3.1: doc type dropdown inside doc card */
+.doc-type-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+}
+.doc-type-select {
+  flex: 1;
+  min-width: 0;
+  padding: 1px 4px;
+  font-size: 11px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.doc-type-select:hover { border-color: var(--accent); }
+.doc-type-source {
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.8;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .doc-delete {
   opacity: 0;
   transition: opacity 0.15s;
@@ -3085,6 +3113,26 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
 .review-entity.unchecked {
   opacity: 0.45;
   border-style: dashed;
+}
+
+/* V3.1: suspected M0 instances — visually distinct */
+.review-section-m0 {
+  color: #ea580c;
+  border-bottom-color: rgba(251, 146, 60, 0.4);
+}
+.review-entity-suspected {
+  border-left: 3px solid #ea580c;
+  background: rgba(251, 146, 60, 0.04);
+}
+.review-m0-badge {
+  font-size: 10px;
+  color: #ea580c;
+  background: rgba(251, 146, 60, 0.12);
+  border: 1px solid rgba(251, 146, 60, 0.35);
+  border-radius: 10px;
+  padding: 1px 7px;
+  margin-left: 6px;
+  flex-shrink: 0;
 }
 
 .review-entity-header {

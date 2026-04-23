@@ -21,6 +21,129 @@ from backend.models.m3_schema import (
 from backend.services.llm_client import get_active_client, LLMClient
 
 
+# ============================================================================
+#                     V3.1 Document-type-aware strategy
+# ============================================================================
+
+_DOC_TYPE_PROMPTS = {
+    "spec": """
+📘 文档类型: 制度规范 (国标/行标/管理规定/设计规范)
+抽取策略:
+- 主动抽取文档里定义的**类型概念**作为 M1 Class
+- 典型线索句式:
+  • "...应具备以下属性..."
+  • "...分为 A、B、C 三类"
+  • "...由...组成/包括..."
+  • "...的定义..."
+- 属性粒度:规范里写的每个字段都抽
+- 遇到具体名字 (如 "1 号机组", "惠州电站") 跳过,它们是 M0 实例""",
+    "manual": """
+📗 文档类型: 技术说明书 (产品手册/设计规格书/技术方案)
+抽取策略:
+- 抽取设备/组件/子系统作为 M1 Class
+- 同时积极抽取它们的技术参数作为属性 (额定功率、尺寸、规格等)
+- 注意区分"产品系列"(类,应抽) 和"具体订单型号" (实例,不抽)
+- 关联重点:谁包含谁 (composition)、谁使用谁 (uses)""",
+    "ledger": """
+📊 文档类型: 实例表单 (台账/清单/登记簿)
+⚠️ 重要约束:这类文档主要是 M0 数据,不是 M1 类型定义!
+抽取策略:
+- 不要把每一行 (每条记录) 抽成一个 Class — 它们是实例
+- 只抽取:
+  1. 表头/字段名 → 抽为某个类的属性 (如果能推断出所属的类名)
+  2. 分组栏/分类栏 → 如果发现表格明确分组 (如"机电类/建筑类"),可以抽该分组词为枚举或类
+- 如果整张表看起来就是"一大批同类实例",只抽取 1 个代表类 + 所有字段作属性""",
+    "process": """
+💬 文档类型: 业务过程 (会议纪要/邮件/工作汇报/讨论记录)
+抽取策略:
+- 抽取反复出现的**角色** (审批人/责任方/评审组) 为 Class
+- 抽取反复出现的**阶段/活动** (立项/审查/批复) 为 Class
+- 抽取**决策点/节点** 为 Class (如: 评审会、批复文、里程碑)
+- 不要抽取具体人名、具体事件、具体日期 — 它们是 M0
+- 关联重点: 谁负责谁 (responsible)、谁由谁产出 (produces)""",
+    "auto": """
+🔍 文档类型: 未标注 (按通用策略抽取)
+抽取策略:
+- 先判断文档主体是类型定义 (抽 Class) 还是实例记录 (保守抽)
+- 含大量具体名称/编号 → 保守,只抽高频类型名
+- 含"...由...组成"、"...分为..." 等规范化定义 → 积极抽类""",
+}
+
+
+def _doc_type_guidance(doc_type: str) -> str:
+    """Return prompt snippet tailored to the given doc_type. Fallback to 'auto'."""
+    return _DOC_TYPE_PROMPTS.get(doc_type) or _DOC_TYPE_PROMPTS["auto"]
+
+
+# Module-level classify helper used by routers/documents.py /classify endpoint.
+async def classify_document_type(text_excerpt: str, filename: str = "") -> str:
+    """Ask LLM to classify a doc into one of spec/manual/ledger/process.
+    Returns a string matching VALID_DOC_TYPES, or 'auto' on failure."""
+    client = get_active_client()
+    prompt = f"""请判断下面这份业务文档的类型,在以下 4 类中选 1 个:
+
+- spec:     制度规范 (国标 / 行标 / 企业管理规定 / 设计规范 / 技术规范)
+- manual:   技术说明书 (产品手册 / 设计规格书 / 施工方案 / 操作手册)
+- ledger:   实例表单 (设备台账 / 人员清单 / 项目登记簿 / 具体 Excel 数据表)
+- process:  业务过程 (会议纪要 / 邮件交流 / 工作汇报 / 讨论记录 / 签批流程)
+
+文件名: {filename}
+
+内容摘录 (前 1200 字):
+---
+{text_excerpt}
+---
+
+仅返回一个标签 (spec/manual/ledger/process),不要任何其他文字。"""
+    try:
+        resp = await client.chat(prompt, max_tokens=20)
+        answer = (resp or "").strip().lower()
+        for t in ("spec", "manual", "ledger", "process"):
+            if t in answer:
+                return t
+    except Exception:
+        pass
+    return "auto"
+
+
+# M0-instance heuristics: runs after extraction to flag likely instance names
+# that slipped through as classes. `suspected_m0=true` in description is another
+# signal the LLM itself may attach.
+_M0_REGEXES = [
+    # Numeric unit / item numbering: "1号机组", "2号电机", "#5泵", "A3段", etc.
+    re.compile(r'\d+\s*(?:号|#|组|台|套|段|车|辆|站|房|号机|号泵|号炉|号电机)'),
+    # Type codes / model numbers: "HYB-400", "WT-2023-08", "PLC-XY-02"
+    re.compile(r'\b[A-Z]{2,}[-_]\d+'),
+    # Chinese year markers: "2024年", "20年度"
+    re.compile(r'\d{2,4}\s*年(?:度)?'),
+    # Province/city name prefix (a sampling of common admin units)
+    re.compile(r'(?:北京|上海|广州|深圳|惠州|东莞|佛山|中山|珠海|南京|杭州'
+               r'|苏州|武汉|成都|重庆|西安|沈阳|大连|青岛|济南|天津|昆明'
+               r'|长沙|合肥|郑州|福州|厦门|南昌|石家庄|太原|乌鲁木齐|兰州'
+               r'|银川|西宁|拉萨|哈尔滨|长春|呼和浩特|海口|南宁|贵阳'
+               r'|广东|江苏|浙江|山东|河北|河南|湖南|湖北|四川|安徽|福建'
+               r'|江西|云南|贵州|陕西|山西|辽宁|吉林|黑龙江|内蒙古|新疆'
+               r'|甘肃|宁夏|青海|西藏|海南|广西)'),
+]
+
+
+def detect_m0_instances(classes: list[dict]) -> list[str]:
+    """Return the IDs of classes that look like M0 instances based on name heuristics.
+    Used by the review panel to default-exclude them, with one-click restore."""
+    flagged: list[str] = []
+    for c in classes:
+        nm = (c.get("name") or "") + " " + (c.get("label") or "")
+        desc = (c.get("description") or "").lower()
+        if "suspected_m0=true" in desc:
+            flagged.append(c.get("id"))
+            continue
+        for rx in _M0_REGEXES:
+            if rx.search(nm):
+                flagged.append(c.get("id"))
+                break
+    return [cid for cid in flagged if cid]
+
+
 def _build_attributes_from_raw(attr_dicts: list) -> list[Attribute]:
     """Convert a list of raw attribute dicts (from LLM output) into Attribute objects.
 
@@ -268,6 +391,7 @@ class AIExtractor:
     async def extract_m1(
         self,
         document_texts: list[tuple[str, str]],  # list of (filename, full_text)
+        document_types: Optional[list[str]] = None,   # V3.1: per-doc type tag
         progress_callback: Optional[Callable] = None,
         parallel_callback: Optional[Callable] = None,
         check_cancelled: Optional[Callable] = None,
@@ -342,13 +466,13 @@ class AIExtractor:
 
         try:
             return await self._run_extract_m1_pipeline(
-                document_texts, progress_callback, parallel_callback, _check,
+                document_texts, document_types or [], progress_callback, parallel_callback, _check,
                 failed_batch_callback, partial_result_callback,
             )
         finally:
             self._ask = _orig_ask
 
-    async def _run_extract_m1_pipeline(self, document_texts, progress_callback, parallel_callback, _check,
+    async def _run_extract_m1_pipeline(self, document_texts, document_types, progress_callback, parallel_callback, _check,
                                          failed_batch_callback=None, partial_result_callback=None):
         """The actual extraction pipeline (called with monkey-patched self._ask)."""
         _fbc = failed_batch_callback
@@ -357,10 +481,12 @@ class AIExtractor:
         # ---- Step 1: Split any oversized file into chunks ----
         # If a single file exceeds BATCH_MAX_CHARS, chunk it with filename annotations
         # (user's requirement: every file complete — but impossible if > batch limit, so chunk)
-        preprocessed: list[tuple[str, str]] = []
-        for filename, text in document_texts:
+        # V3.1: each entry is (filename, text, doc_type) — doc_type inherited into chunks.
+        preprocessed: list[tuple[str, str, str]] = []
+        for i_doc, (filename, text) in enumerate(document_texts):
+            dtype = document_types[i_doc] if i_doc < len(document_types) else "auto"
             if len(text) <= self.BATCH_MAX_CHARS:
-                preprocessed.append((filename, text))
+                preprocessed.append((filename, text, dtype))
                 continue
             # Split large file into chunks with 500-char overlap for context preservation
             chunk_size = self.BATCH_MAX_CHARS - 500  # leave room for filename header
@@ -374,18 +500,19 @@ class AIExtractor:
             total_chunks = len(chunks)
             for idx, chunk in enumerate(chunks):
                 chunk_filename = f"{filename} [第{idx+1}/{total_chunks}部分]"
-                preprocessed.append((chunk_filename, chunk))
+                preprocessed.append((chunk_filename, chunk, dtype))
 
         # ---- Step 2: Pack chunks into batches by size ----
+        # Each batch is a list of (filename, text, doc_type) triples.
         batches = []
         current_batch = []
         current_size = 0
-        for filename, text in preprocessed:
+        for filename, text, dtype in preprocessed:
             if current_size + len(text) > self.BATCH_MAX_CHARS and current_batch:
                 batches.append(current_batch)
                 current_batch = []
                 current_size = 0
-            current_batch.append((filename, text))
+            current_batch.append((filename, text, dtype))
             current_size += len(text)
         if current_batch:
             batches.append(current_batch)
@@ -405,7 +532,7 @@ class AIExtractor:
 
         # Doc batch texts (used by both combined extraction and association extraction)
         doc_batch_texts = [
-            "\n\n---\n\n".join(f"[文档: {fn}]\n{txt}" for fn, txt in batch)
+            "\n\n---\n\n".join(f"[文档: {fn}]\n{txt}" for fn, txt, _dt in batch)
             for batch in batches
         ]
 
@@ -521,8 +648,13 @@ class AIExtractor:
             """Extract classes (with attributes) + enumerations from one doc batch."""
             _check()
             nonlocal completed_batches
+            # Dominant doc_type for this batch: use most frequent among its items
+            _dtype_counts: dict[str, int] = {}
+            for _fn, _txt, _dt in batch:
+                _dtype_counts[_dt] = _dtype_counts.get(_dt, 0) + 1
+            batch_doc_type = max(_dtype_counts, key=_dtype_counts.get) if _dtype_counts else "auto"
             subtask_id = f"extract_batch_{batch_idx}"
-            batch_filenames = [fn for fn, _ in batch]
+            batch_filenames = [fn for fn, _txt, _dt in batch]
             subtask_name = (
                 f"批{batch_idx+1}: {', '.join(batch_filenames[:2])}"
                 + ('...' if len(batch_filenames) > 2 else '')
@@ -540,7 +672,7 @@ class AIExtractor:
                         f"提取 [{completed_batches}/{total_batches}]: {subtask_name}")
 
                 batch_text = "\n\n---\n\n".join(
-                    f"[文档: {fn}]\n{txt}" for fn, txt in batch
+                    f"[文档: {fn}]\n{txt}" for fn, txt, _dt in batch
                 )
 
                 # Build context snapshot (union of current merged state + first-batch seed)
@@ -552,7 +684,7 @@ class AIExtractor:
 
                 try:
                     result = await self._extract_entities_with_attrs_from_docs(
-                        batch_text, known_context=ctx,
+                        batch_text, known_context=ctx, doc_type=batch_doc_type,
                     )
                 except Exception as e:
                     if parallel_callback:
@@ -845,16 +977,22 @@ class AIExtractor:
             classes=mof_classes, enumerations=enumerations, associations=associations,
         )
 
+        # V3.1: flag classes that look like M0 instances (name patterns, suspected_m0
+        # tag from LLM self-assessment). Review panel will default-exclude them.
+        pkg_dump = package.model_dump()
+        suspected_m0_ids = detect_m0_instances(pkg_dump.get("classes", []))
+
         if progress_callback:
             await progress_callback("completed", 1.0, "M1模型提取完成！")
 
         return {
-            "package": package.model_dump(),
+            "package": pkg_dump,
             "classes_found": len(mof_classes),
             "attributes_found": total_attrs,
             "associations_found": len(associations),
             "enumerations_found": len(enumerations),
             "confidence_notes": confidence_notes,
+            "suspected_m0_class_ids": suspected_m0_ids,    # V3.1: for review UI
         }
 
     # ==================================================================
@@ -2284,6 +2422,7 @@ Only modify what the user asked for. Keep everything else unchanged."""
         self,
         doc_text: str,
         known_context: dict = None,
+        doc_type: str = "auto",
     ) -> dict:
         """Combined single-pass extraction: classes (with attributes) + enumerations.
 
@@ -2328,12 +2467,28 @@ Already found:
 {chr(10).join(lines)}{more}
 """
 
+        # V3.1: doc-type-aware strategy injection
+        type_guidance = _doc_type_guidance(doc_type)
+
         prompt = f"""Analyze these business documents and extract:
 1. CLASSES (entity types) WITH their attributes — in ONE pass.
 2. ENUMERATIONS (closed value sets such as status, type, mode).
 
 This is M1-level extraction — identify CONCRETE, DOMAIN-SPECIFIC types exactly as
 the documents describe. Do NOT generalize.
+
+=== 文档类型 ({doc_type}) 特定策略 ===
+{type_guidance}
+
+=== M0 实例 vs M1 类型的严格区分 ===
+绝对不要把下列对象作为 Class 抽取 (它们是 M0 实例):
+- 含编号/型号代码的具体设备 (如 "HYB-400 水轮机", "机组 1#", "PLC-002" )
+- 含具体地名/单位名的实体 (如 "惠州抽水蓄能电站", "广州局 A 厂房")
+- 含年份/日期的项目或记录 (如 "2024 年度检修计划", "2023-06 月报")
+- 具体人名/组织名 (如 "张三", "设计一所")
+
+应抽取为 Class 的是**类型/概念**本身 (如 "抽水蓄能电站" 是类, "惠州抽水蓄能电站" 是实例)。
+如某名称看起来像一个具体对象而非类型,在 "description" 里备注 "suspected_m0=true"。
 {context_hint}
 For each Class:
 - "name": English PascalCase, e.g. "PumpedStorageUnit"

@@ -181,6 +181,7 @@ async def _run_m1_extraction(
 
         # ---- Phase 1: Load full text of each document ----
         doc_texts = []  # list of (filename, full_text)
+        doc_types: list[str] = []   # V3.1: aligned with doc_texts, drives prompt branching
         total_chars = 0
         for i, (doc_id, meta) in enumerate(zip(doc_ids, doc_metas)):
             filename = meta["filename"]
@@ -199,8 +200,10 @@ async def _run_m1_extraction(
                 chars = len(text)
                 total_chars += chars
                 doc_texts.append((filename, text))
+                doc_types.append(meta.get("doc_type", "auto") or "auto")
                 _update_doc(task_id, doc_id, "done")
-                _add_log(task_id, "success", f"  {filename} — {chars:,} 字符 (全量)")
+                _add_log(task_id, "success", f"  {filename} — {chars:,} 字符 (全量)"
+                         + (f" · 类型={meta.get('doc_type')}" if meta.get("doc_type") and meta.get("doc_type") != "auto" else ""))
             else:
                 _update_doc(task_id, doc_id, "error")
                 _add_log(task_id, "error", f"  {filename} — 无法读取")
@@ -324,6 +327,7 @@ async def _run_m1_extraction(
         try:
             result = await extractor.extract_m1(
                 doc_texts,
+                document_types=doc_types,          # V3.1 doc-type-aware prompts
                 progress_callback=on_progress,
                 parallel_callback=on_parallel,
                 check_cancelled=lambda: is_cancelled(task_id),

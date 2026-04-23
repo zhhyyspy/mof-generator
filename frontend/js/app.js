@@ -235,7 +235,27 @@ async function uploadFiles(fileList) {
     state.documents.push(...res.documents);
     renderDocList();
     updateToolbarState();
+    // V3.1: auto-classify each newly uploaded doc (best-effort, background)
+    for (const d of res.documents) {
+      if (d.doc_type === 'auto' || !d.doc_type) {
+        classifyDocumentBackground(d.id);
+      }
+    }
   } catch (e) { showDialog({ type: 'error', title: '上传失败', message: e.message }); }
+}
+
+async function classifyDocumentBackground(docId) {
+  try {
+    const res = await API.classifyDocument(docId);
+    const d = state.documents.find(x => x.id === docId);
+    if (d) {
+      d.doc_type = res.doc_type;
+      d.doc_type_source = res.doc_type_source;
+      renderDocList();
+    }
+  } catch (e) {
+    console.warn('Auto-classify failed for', docId, e.message);
+  }
 }
 
 async function loadDocuments() {
@@ -246,6 +266,15 @@ async function loadDocuments() {
   } catch {}
 }
 
+// V3.1: doc-type metadata for UI rendering (icon + label + tooltip)
+const DOC_TYPE_META = {
+  auto:    { icon: '🔍', label: '自动判断', title: '点击让 AI 自动分类 / 手动选择' },
+  spec:    { icon: '📘', label: '制度规范', title: '国标/行标/管理规定/设计规范 — 积极抽类' },
+  manual:  { icon: '📗', label: '技术说明书', title: '产品手册/设计规格 — 抽类 + 密集属性' },
+  ledger:  { icon: '📊', label: '实例表单', title: '台账/清单 — 谨慎,只抽列结构,行视为 M0' },
+  process: { icon: '💬', label: '业务过程', title: '会议/邮件 — 抽角色+阶段,跳过具体事件' },
+};
+
 function renderDocList() {
   const list = document.getElementById('document-list');
   list.innerHTML = '';
@@ -254,11 +283,23 @@ function renderDocList() {
     li.className = 'doc-item';
     const ext = doc.filename.split('.').pop().toUpperCase();
     const icons = { PDF: '\u{1F4D5}', DOCX: '\u{1F4D8}', TXT: '\u{1F4C4}', MD: '\u{1F4DD}', XLSX: '\u{1F4CA}', XLS: '\u{1F4CA}', CSV: '\u{1F4CA}' };
+    const dt = doc.doc_type || 'auto';
+    const dtMeta = DOC_TYPE_META[dt] || DOC_TYPE_META.auto;
+    const sourceTag = doc.doc_type_source === 'llm' ? ' · AI 判断'
+                    : doc.doc_type_source === 'user' ? ' · 手动'
+                    : '';
+    const options = Object.entries(DOC_TYPE_META).map(([k, m]) =>
+      `<option value="${k}"${k === dt ? ' selected' : ''}>${m.icon} ${m.label}</option>`
+    ).join('');
     li.innerHTML = `
       <span class="doc-icon">${icons[ext] || '\u{1F4C4}'}</span>
       <div class="doc-info">
         <div class="doc-name">${doc.filename}</div>
         <div class="doc-meta">${(doc.char_count / 1000).toFixed(1)}K 字符</div>
+        <div class="doc-type-row" title="${dtMeta.title}">
+          <select class="doc-type-select" data-doc-id="${doc.id}">${options}</select>
+          <span class="doc-type-source">${sourceTag}</span>
+        </div>
       </div>
       <button class="btn-icon doc-delete btn-danger" title="删除">&times;</button>
     `;
@@ -268,6 +309,16 @@ function renderDocList() {
       state.documents = state.documents.filter(d => d.id !== doc.id);
       renderDocList();
       updateToolbarState();
+    });
+    li.querySelector('.doc-type-select').addEventListener('change', async e => {
+      e.stopPropagation();
+      const newType = e.target.value;
+      try {
+        await API.setDocumentType(doc.id, newType, 'user');
+        doc.doc_type = newType;
+        doc.doc_type_source = 'user';
+        renderDocList();
+      } catch (err) { showToast('设置类型失败: ' + err.message, 'error'); }
     });
     list.appendChild(li);
   }
@@ -4981,12 +5032,18 @@ function updateWorkbenchResults(result, failedBatches = [], isFinal = false) {
     else prevUnchecked.add(cb.dataset.id);
   });
 
-  // Render entities
-  renderReviewEntities(classes, enums, assocs);
+  // V3.1: default-uncheck suspected M0 instances unless user previously chose otherwise
+  const suspectedM0 = new Set(result.suspected_m0_class_ids || []);
 
-  // Restore checkbox state (new entities default to checked)
+  // Render entities (suspectedM0 for visual marking + default-exclude)
+  renderReviewEntities(classes, enums, assocs, suspectedM0);
+
+  // Restore checkbox state (new entities default to checked; suspected M0 unchecked unless user re-checked)
   document.querySelectorAll('.review-entity-check').forEach(cb => {
     if (prevUnchecked.has(cb.dataset.id)) {
+      cb.checked = false;
+      cb.closest('.review-entity').classList.add('unchecked');
+    } else if (suspectedM0.has(cb.dataset.id) && !prevChecked.has(cb.dataset.id)) {
       cb.checked = false;
       cb.closest('.review-entity').classList.add('unchecked');
     }
@@ -5065,30 +5122,49 @@ function renderFailedBatches(failedBatches) {
   });
 }
 
-function renderReviewEntities(classes, enums, assocs) {
+function renderReviewEntities(classes, enums, assocs, suspectedM0 = new Set()) {
   const container = document.getElementById('review-entities');
   let html = '';
 
-  // Classes
-  if (classes.length) {
+  // V3.1: split classes into "true M1" and "suspected M0 instances"
+  const normalCls = classes.filter(c => !suspectedM0.has(c.id));
+  const suspectedCls = classes.filter(c => suspectedM0.has(c.id));
+
+  const renderClsRow = (cls, isSuspected) => {
+    const attrs = cls.attributes || [];
+    const attrLines = attrs.map(a =>
+      `<div class="review-attr-line"><span class="review-attr-name">${a.name} ${a.label || ''}</span><span class="review-attr-type">${a.data_type}${a.unit ? ' ('+a.unit+')' : ''}</span></div>`
+    ).join('');
+    const badge = isSuspected
+      ? `<span class="review-m0-badge" title="名称含编号/地名/年份等,疑似 M0 实例">⚠ 疑似 M0</span>`
+      : '';
+    const checked = isSuspected ? '' : 'checked';
+    return `
+      <div class="review-entity${isSuspected ? ' review-entity-suspected' : ''}" data-type="class" data-id="${cls.id}">
+        <div class="review-entity-header">
+          <input type="checkbox" class="review-entity-check" data-id="${cls.id}" data-type="class" ${checked}>
+          <span class="review-entity-badge badge-class">C</span>
+          <span class="review-entity-name">${cls.name} <span style="color:var(--text-dim);font-weight:400">${cls.label || ''}</span></span>
+          ${badge}
+          <span class="review-entity-meta">${attrs.length} 个属性</span>
+          <button class="review-entity-toggle" data-target="details-${cls.id}">${attrs.length > 0 ? '▶ 展开' : ''}</button>
+        </div>
+        <div class="review-entity-details" id="details-${cls.id}">${attrLines}</div>
+      </div>`;
+  };
+
+  // True M1 classes
+  if (normalCls.length) {
     html += '<div class="review-section-title">类 Classes</div>';
-    for (const cls of classes) {
-      const attrs = cls.attributes || [];
-      const attrLines = attrs.map(a =>
-        `<div class="review-attr-line"><span class="review-attr-name">${a.name} ${a.label || ''}</span><span class="review-attr-type">${a.data_type}${a.unit ? ' ('+a.unit+')' : ''}</span></div>`
-      ).join('');
-      html += `
-        <div class="review-entity" data-type="class" data-id="${cls.id}">
-          <div class="review-entity-header">
-            <input type="checkbox" class="review-entity-check" data-id="${cls.id}" data-type="class" checked>
-            <span class="review-entity-badge badge-class">C</span>
-            <span class="review-entity-name">${cls.name} <span style="color:var(--text-dim);font-weight:400">${cls.label || ''}</span></span>
-            <span class="review-entity-meta">${attrs.length} 个属性</span>
-            <button class="review-entity-toggle" data-target="details-${cls.id}">${attrs.length > 0 ? '▶ 展开' : ''}</button>
-          </div>
-          <div class="review-entity-details" id="details-${cls.id}">${attrLines}</div>
-        </div>`;
-    }
+    for (const cls of normalCls) html += renderClsRow(cls, false);
+  }
+
+  // Suspected M0 instances (default unchecked, folded)
+  if (suspectedCls.length) {
+    html += `<div class="review-section-title review-section-m0">
+      ⚠ 疑似 M0 实例 (${suspectedCls.length} 项, 默认不导入 — 点击复选框可恢复)
+    </div>`;
+    for (const cls of suspectedCls) html += renderClsRow(cls, true);
   }
 
   // Enumerations
