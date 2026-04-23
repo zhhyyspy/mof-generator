@@ -390,6 +390,9 @@ function setupToolbar() {
   wireSynonymModal();
   wirePatternEditorModal();
   wireAssocEditorModal();
+  wireAttrBuilderModal();
+  wireRelBuilderModal();
+  wireSafeDeleteModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -1288,6 +1291,596 @@ async function loadExistingModels() {
  * Fetches allowed transitions from backend, shows a small inline modal,
  * calls setPublishStatus, then refreshes the model.
  */
+// ============================================================================
+//                V3.3 Visual CRUD — logical types + builders + safe delete
+// ============================================================================
+
+// Business-friendly logical types → technical data types
+const LOGICAL_TYPES = {
+  text:     { icon: '📝', label: '文本',        dataType: 'String',  example: '名称/地址/描述' },
+  number:   { icon: '#',  label: '数字',        dataType: 'Integer', example: '数量/台数' },
+  quantity: { icon: '💰', label: '金额/物理量', dataType: 'Float',   example: '带单位,如 MW, °C, ¥', needsUnit: true },
+  date:     { icon: '📅', label: '日期',        dataType: 'Date',    example: '生日/到期日' },
+  boolean:  { icon: '✓',  label: '是/否',       dataType: 'Boolean', example: '启用/已审批' },
+  enum:     { icon: '🏷️', label: '选项列表',    dataType: 'Enum',    example: '状态/类型', needsEnum: true },
+};
+const COMMON_UNITS = ['MW', 'kW', 'kV', 'V', 'A', 'm', 'mm', 'cm', 'km', 'm²', 'm³',
+                      '°C', '%', 'Hz', 't', 'kg', 'L', '¥', 'USD', '年', '月', '日', '天'];
+
+/** Given a technical data_type (+ unit/enum) , guess the logical_type for display */
+function deriveLogicalType(attr) {
+  if (attr.logical_type) return attr.logical_type;
+  const dt = attr.data_type;
+  if (dt === 'String' || dt === 'Text') return 'text';
+  if (dt === 'Integer') return 'number';
+  if (dt === 'Float' || dt === 'Decimal') return attr.unit ? 'quantity' : 'number';
+  if (dt === 'Date' || dt === 'DateTime') return 'date';
+  if (dt === 'Boolean') return 'boolean';
+  if (dt === 'Enum' || attr.enum_ref) return 'enum';
+  return 'text';
+}
+
+/** PascalCase → camelCase conversion (for auto-generating English name from Chinese label) */
+function toCamelCase(s) {
+  if (!s) return '';
+  // Strip Chinese, keep alnum only, camelCase each word
+  return s.replace(/[^\w\s]/g, ' ')
+    .trim().split(/\s+/).filter(Boolean)
+    .map((w, i) => i === 0 ? w[0].toLowerCase() + w.slice(1) : w[0].toUpperCase() + w.slice(1))
+    .join('');
+}
+
+/** Attribute templates — one-click add a group */
+const ATTR_TEMPLATES = {
+  basic: {
+    title: '基础信息', icon: '📋',
+    attrs: [
+      { name: 'code',   label: '编号', logical_type: 'text' },
+      { name: 'name',   label: '名称', logical_type: 'text' },
+      { name: 'description', label: '描述', logical_type: 'text' },
+      { name: 'remark', label: '备注', logical_type: 'text' },
+    ],
+  },
+  device: {
+    title: '设备属性', icon: '⚙️',
+    attrs: [
+      { name: 'modelNo',      label: '型号', logical_type: 'text' },
+      { name: 'manufacturer', label: '生产厂家', logical_type: 'text' },
+      { name: 'serialNo',     label: '出厂编号', logical_type: 'text' },
+      { name: 'installedAt',  label: '投运日期', logical_type: 'date' },
+    ],
+  },
+  project: {
+    title: '工程项目', icon: '💼',
+    attrs: [
+      { name: 'investment',    label: '投资额', logical_type: 'quantity', unit: '万元' },
+      { name: 'startDate',     label: '开工日期', logical_type: 'date' },
+      { name: 'finishDate',    label: '完工日期', logical_type: 'date' },
+      { name: 'projectStatus', label: '项目状态', logical_type: 'text' },
+    ],
+  },
+};
+
+// ---- Attribute Builder state + helpers ----
+
+let _abState = {
+  modelId: null, classId: null,
+  attrId: null,     // set for edit mode
+  selectedLogicalType: null,
+  unit: '', enumName: '', enumLiterals: [],
+};
+
+function openAttrBuilder(modelId, classId, attrId = null) {
+  _abState = { modelId, classId, attrId,
+               selectedLogicalType: null, unit: '', enumName: '', enumLiterals: [] };
+  const modal = document.getElementById('attr-builder-modal');
+  const titleEl = document.getElementById('attr-builder-title');
+  const pkg = state[modelId === state.m1ModelId ? 'm1Model' : 'm2Model']?.versions?.slice(-1)[0]?.package;
+  if (!pkg) { showToast('模型未加载', 'error'); return; }
+  const cls = (pkg.classes || []).find(c => c.id === classId);
+  if (!cls) { showToast('类不存在', 'error'); return; }
+  const ctxEl = document.getElementById('ab-context');
+  ctxEl.innerHTML = `为类 <b>${escapeHtml(cls.label || cls.name)}</b> · <code>${escapeHtml(cls.name)}</code>`;
+
+  titleEl.textContent = attrId ? '✎ 编辑属性' : '➕ 添加属性';
+  document.getElementById('btn-ab-save').textContent = attrId ? '✓ 保存修改' : '✓ 添加属性';
+
+  // Reset form
+  document.getElementById('ab-label').value = '';
+  document.getElementById('ab-name').value = '';
+  document.getElementById('ab-default').value = '';
+  document.querySelectorAll('input[name="ab-mult"]').forEach(r => r.checked = r.value === 'one');
+  document.querySelectorAll('input[name="ab-required"]').forEach(r => r.checked = r.value === 'yes');
+  document.querySelectorAll('.ab-type-card').forEach(c => c.classList.remove('selected'));
+  document.getElementById('ab-dynamic').innerHTML = '';
+
+  // Pre-fill if editing
+  if (attrId) {
+    const attr = (cls.attributes || []).find(a => a.id === attrId);
+    if (attr) {
+      document.getElementById('ab-label').value = attr.label || '';
+      document.getElementById('ab-name').value = attr.name || '';
+      document.getElementById('ab-default').value = attr.default_value || '';
+      const lt = deriveLogicalType(attr);
+      selectLogicalType(lt);
+      if (attr.unit) {
+        _abState.unit = attr.unit;
+        const uInput = document.getElementById('ab-unit-input');
+        if (uInput) uInput.value = attr.unit;
+      }
+      if (attr.enum_ref) {
+        const enums = pkg.enumerations || [];
+        const en = enums.find(e => e.id === attr.enum_ref);
+        if (en) {
+          _abState.enumName = en.name;
+          _abState.enumLiterals = (en.literals || []).map(l => l.label || l.name);
+          renderAbDynamicEnum();
+        }
+      }
+      const mult = attr.multiplicity;
+      if (mult?.upper === -1 || mult?.upper > 1) {
+        document.querySelector('input[name="ab-mult"][value="many"]').checked = true;
+      }
+      if (mult?.lower === 0) {
+        document.querySelector('input[name="ab-required"][value="no"]').checked = true;
+      }
+    }
+  }
+
+  refreshAbPreview();
+  modal.classList.remove('hidden');
+}
+
+function selectLogicalType(lt) {
+  _abState.selectedLogicalType = lt;
+  document.querySelectorAll('.ab-type-card').forEach(c =>
+    c.classList.toggle('selected', c.dataset.ltype === lt));
+  renderAbDynamic();
+  refreshAbPreview();
+}
+
+function renderAbDynamic() {
+  const lt = _abState.selectedLogicalType;
+  const dyn = document.getElementById('ab-dynamic');
+  if (!lt) { dyn.innerHTML = ''; return; }
+  const spec = LOGICAL_TYPES[lt];
+  if (spec.needsUnit) {
+    dyn.innerHTML = `
+      <div class="ab-subfield">
+        <span>单位 (如 MW, °C, ¥):</span>
+        <input type="text" id="ab-unit-input" list="ab-units-datalist"
+               placeholder="选或输入" value="${escapeHtml(_abState.unit || '')}" />
+        <datalist id="ab-units-datalist">
+          ${COMMON_UNITS.map(u => `<option value="${u}"></option>`).join('')}
+        </datalist>
+      </div>`;
+    document.getElementById('ab-unit-input').addEventListener('input', e => {
+      _abState.unit = e.target.value; refreshAbPreview();
+    });
+  } else if (spec.needsEnum) {
+    renderAbDynamicEnum();
+  } else {
+    dyn.innerHTML = '';
+  }
+}
+
+function renderAbDynamicEnum() {
+  const dyn = document.getElementById('ab-dynamic');
+  const litsHtml = (_abState.enumLiterals || []).map((lit, i) =>
+    `<span class="ab-enum-lit">${escapeHtml(lit)}
+       <button type="button" data-idx="${i}" class="ab-enum-del">×</button></span>`
+  ).join('');
+  dyn.innerHTML = `
+    <div class="ab-subfield">
+      <span>选项列表 (逐个添加, 回车确认):</span>
+      <div class="ab-enum-lits">${litsHtml}</div>
+      <input type="text" id="ab-enum-input" placeholder="输入选项名, 按回车添加" />
+    </div>`;
+  const input = document.getElementById('ab-enum-input');
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const v = input.value.trim();
+      if (v && !_abState.enumLiterals.includes(v)) {
+        _abState.enumLiterals.push(v);
+        renderAbDynamicEnum();
+        setTimeout(() => document.getElementById('ab-enum-input')?.focus(), 10);
+        refreshAbPreview();
+      }
+      input.value = '';
+    }
+  });
+  dyn.querySelectorAll('.ab-enum-del').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = Number(btn.dataset.idx);
+      _abState.enumLiterals.splice(i, 1);
+      renderAbDynamicEnum();
+      refreshAbPreview();
+    });
+  });
+}
+
+function refreshAbPreview() {
+  const label = document.getElementById('ab-label').value.trim();
+  const lt = _abState.selectedLogicalType;
+  const preview = document.getElementById('ab-preview');
+  if (!label) { preview.textContent = '(请填属性名)'; return; }
+  if (!lt) { preview.textContent = `${label}: (请选数据类型)`; return; }
+  const spec = LOGICAL_TYPES[lt];
+  const mult = document.querySelector('input[name="ab-mult"]:checked')?.value || 'one';
+  const req = document.querySelector('input[name="ab-required"]:checked')?.value || 'yes';
+  let typeStr = spec.label;
+  if (lt === 'quantity' && _abState.unit) typeStr += ` (${_abState.unit})`;
+  if (lt === 'enum' && _abState.enumLiterals.length) {
+    typeStr += ` (${_abState.enumLiterals.slice(0,3).join(' / ')}${_abState.enumLiterals.length > 3 ? '...' : ''})`;
+  }
+  const multStr = mult === 'many' ? '多个' : '1 个';
+  const reqStr = req === 'no' ? '可选' : '必填';
+  preview.innerHTML = `<b>${escapeHtml(label)}</b>: ${escapeHtml(typeStr)} · ${multStr} · ${reqStr}`;
+
+  // Auto-fill English name if not customized
+  const nameInput = document.getElementById('ab-name');
+  if (!nameInput.dataset.userEdited) {
+    nameInput.value = toCamelCase(label) || 'attr';
+  }
+}
+
+async function abSave() {
+  const s = _abState;
+  const label = document.getElementById('ab-label').value.trim();
+  const lt = s.selectedLogicalType;
+  if (!label) { showToast('属性名不能为空', 'error'); return; }
+  if (!lt) { showToast('请选择数据类型', 'error'); return; }
+  const spec = LOGICAL_TYPES[lt];
+  if (spec.needsUnit && !s.unit) { showToast('带单位的类型必须填单位', 'error'); return; }
+  if (spec.needsEnum && !s.enumLiterals.length) { showToast('选项列表至少要 1 个值', 'error'); return; }
+
+  const name = document.getElementById('ab-name').value.trim() || toCamelCase(label) || 'attr';
+  const mult = document.querySelector('input[name="ab-mult"]:checked').value;
+  const req = document.querySelector('input[name="ab-required"]:checked').value;
+  const defaultVal = document.getElementById('ab-default').value.trim() || null;
+
+  const btn = document.getElementById('btn-ab-save');
+  const origText = btn.textContent; btn.disabled = true; btn.textContent = '保存中...';
+  try {
+    // Handle enum: create an Enumeration if needed
+    let enumRef = null;
+    if (spec.needsEnum) {
+      const pkgModel = state[s.modelId === state.m1ModelId ? 'm1Model' : 'm2Model'];
+      const pkg = pkgModel.versions.slice(-1)[0].package;
+      const enumName = label + 'Enum';
+      // Check existing enum
+      const existing = (pkg.enumerations || []).find(e =>
+        JSON.stringify((e.literals || []).map(l => l.name).sort())
+        === JSON.stringify(s.enumLiterals.map(l => toCamelCase(l)).sort())
+      );
+      if (existing) {
+        enumRef = existing.id;
+      } else {
+        const newEnum = await API.addEnumeration(s.modelId, {
+          name: toCamelCase(enumName) || 'enum',
+          label: label + ' 选项',
+          literals: s.enumLiterals.map(lit => ({ name: toCamelCase(lit) || lit, label: lit })),
+        });
+        enumRef = newEnum.id;
+      }
+    }
+
+    const payload = {
+      name,
+      label,
+      data_type: spec.dataType,
+      multiplicity_lower: req === 'no' ? 0 : 1,
+      multiplicity_upper: mult === 'many' ? -1 : 1,
+      default_value: defaultVal,
+      unit: spec.needsUnit ? s.unit : null,
+      enum_ref: enumRef,
+      logical_type: lt,
+    };
+
+    if (s.attrId) {
+      await API.updateAttribute(s.modelId, s.classId, s.attrId, payload);
+      showToast('属性已更新', 'success');
+    } else {
+      await API.addAttribute(s.modelId, s.classId, payload);
+      showToast(`已添加属性: ${label}`, 'success');
+    }
+    document.getElementById('attr-builder-modal').classList.add('hidden');
+    if (typeof loadModel === 'function') {
+      const layer = s.modelId === state.m1ModelId ? 'm1' : 'm2';
+      await loadModel(s.modelId, layer);
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '保存失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = origText;
+  }
+}
+
+async function abApplyTemplate(tplKey) {
+  const tpl = ATTR_TEMPLATES[tplKey];
+  if (!tpl) return;
+  const s = _abState;
+  if (!s.modelId || !s.classId) return;
+  if (!window.confirm(`一键添加「${tpl.title}」${tpl.attrs.length} 个属性?`)) return;
+  try {
+    for (const a of tpl.attrs) {
+      const spec = LOGICAL_TYPES[a.logical_type] || LOGICAL_TYPES.text;
+      await API.addAttribute(s.modelId, s.classId, {
+        name: a.name,
+        label: a.label,
+        data_type: spec.dataType,
+        multiplicity_lower: 1, multiplicity_upper: 1,
+        unit: a.unit || null,
+        logical_type: a.logical_type,
+      });
+    }
+    showToast(`${tpl.title}: 已添加 ${tpl.attrs.length} 个属性`, 'success');
+    document.getElementById('attr-builder-modal').classList.add('hidden');
+    if (typeof loadModel === 'function') {
+      const layer = s.modelId === state.m1ModelId ? 'm1' : 'm2';
+      await loadModel(s.modelId, layer);
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '模板应用失败', message: e.message });
+  }
+}
+
+function wireAttrBuilderModal() {
+  if (!document.getElementById('attr-builder-modal')) return;
+  document.querySelectorAll('.ab-type-card').forEach(btn => {
+    btn.addEventListener('click', () => selectLogicalType(btn.dataset.ltype));
+  });
+  document.getElementById('ab-label').addEventListener('input', refreshAbPreview);
+  const nameInput = document.getElementById('ab-name');
+  nameInput.addEventListener('input', () => { nameInput.dataset.userEdited = '1'; });
+  document.querySelectorAll('input[name="ab-mult"]').forEach(r => r.addEventListener('change', refreshAbPreview));
+  document.querySelectorAll('input[name="ab-required"]').forEach(r => r.addEventListener('change', refreshAbPreview));
+  document.getElementById('btn-ab-cancel').addEventListener('click',
+    () => document.getElementById('attr-builder-modal').classList.add('hidden'));
+  document.getElementById('btn-ab-save').addEventListener('click', abSave);
+  document.querySelectorAll('.ab-tpl').forEach(btn => {
+    btn.addEventListener('click', () => abApplyTemplate(btn.dataset.tpl));
+  });
+}
+
+// ---- Relationship builder ----
+
+let _rbState = { modelId: null, srcClassId: null, tgtClassId: null, relType: null };
+
+function openRelBuilder(modelId, preSrcClassId = null) {
+  _rbState = { modelId, srcClassId: preSrcClassId, tgtClassId: null, relType: null };
+  const modal = document.getElementById('rel-builder-modal');
+  const pkg = state[modelId === state.m1ModelId ? 'm1Model' : 'm2Model']?.versions?.slice(-1)[0]?.package;
+  if (!pkg) { showToast('模型未加载', 'error'); return; }
+  const classes = pkg.classes || [];
+  const options = classes.map(c =>
+    `<option value="${c.id}">${escapeHtml(c.label || c.name)} · ${escapeHtml(c.name)}</option>`
+  ).join('');
+  const srcSel = document.getElementById('rb-src-class');
+  const tgtSel = document.getElementById('rb-tgt-class');
+  srcSel.innerHTML = '<option value="">— 选择源类 —</option>' + options;
+  tgtSel.innerHTML = '<option value="">— 选择目标类 —</option>' + options;
+  if (preSrcClassId) srcSel.value = preSrcClassId;
+  document.querySelectorAll('.rb-type-card').forEach(c => c.classList.remove('selected'));
+  document.querySelectorAll('input[name="rb-tgt-qty"]').forEach(r => r.checked = r.value === 'many');
+  document.getElementById('rb-name').value = '';
+  document.getElementById('rb-label').value = '';
+  document.getElementById('rb-is-hier').checked = false;
+  refreshRbPreview();
+  modal.classList.remove('hidden');
+}
+
+function refreshRbPreview() {
+  const srcSel = document.getElementById('rb-src-class');
+  const tgtSel = document.getElementById('rb-tgt-class');
+  const srcLbl = srcSel.selectedOptions[0]?.textContent.split(' · ')[0].trim() || 'A';
+  const tgtLbl = tgtSel.selectedOptions[0]?.textContent.split(' · ')[0].trim() || 'B';
+  document.getElementById('rb-src-mult-lbl').textContent = srcLbl;
+  document.getElementById('rb-tgt-mult-lbl').textContent = tgtLbl;
+  const relType = _rbState.relType;
+  const qty = document.querySelector('input[name="rb-tgt-qty"]:checked')?.value || 'many';
+  const preview = document.getElementById('rb-preview-text');
+  if (!_rbState.relType || !srcSel.value || !tgtSel.value) {
+    preview.textContent = '(请完成上面三步)'; return;
+  }
+  const verbMap = { composition: '包含', aggregation: '拥有', association: '引用' };
+  preview.innerHTML = `<b>${escapeHtml(srcLbl)}</b> (1个) <b>${escapeHtml(verbMap[relType] || relType)}</b> <b>${escapeHtml(tgtLbl)}</b> (${qty === 'one' ? '1 个' : '多个'})`;
+}
+
+function selectRelType(rt) {
+  _rbState.relType = rt;
+  document.querySelectorAll('.rb-type-card').forEach(c =>
+    c.classList.toggle('selected', c.dataset.rtype === rt));
+  refreshRbPreview();
+}
+
+async function rbSave() {
+  const s = _rbState;
+  const srcId = document.getElementById('rb-src-class').value;
+  const tgtId = document.getElementById('rb-tgt-class').value;
+  if (!srcId || !tgtId) { showToast('请选源类和目标类', 'error'); return; }
+  if (srcId === tgtId) { showToast('源类和目标类不能相同', 'error'); return; }
+  if (!s.relType) { showToast('请选关系类型', 'error'); return; }
+  const qty = document.querySelector('input[name="rb-tgt-qty"]:checked').value;
+
+  const pkg = state[s.modelId === state.m1ModelId ? 'm1Model' : 'm2Model']?.versions?.slice(-1)[0]?.package;
+  const srcCls = (pkg.classes || []).find(c => c.id === srcId);
+  const tgtCls = (pkg.classes || []).find(c => c.id === tgtId);
+  let name = document.getElementById('rb-name').value.trim();
+  if (!name) {
+    // Auto-generate: {srcName}Has{TgtName} for composition/aggregation, {srcName}Refs{TgtName} for association
+    const verb = s.relType === 'association' ? 'Refs' : 'Has';
+    name = (srcCls?.name?.charAt(0).toLowerCase() + srcCls?.name?.slice(1) || 'src') + verb + (tgtCls?.name || 'Tgt');
+  }
+  const label = document.getElementById('rb-label').value.trim()
+    || ((srcCls?.label || srcCls?.name) + (s.relType === 'association' ? '引用' : '包含') + (tgtCls?.label || tgtCls?.name));
+
+  const btn = document.getElementById('btn-rb-save');
+  const origText = btn.textContent; btn.disabled = true; btn.textContent = '保存中...';
+  try {
+    const created = await API.addAssociation(s.modelId, {
+      name, label,
+      source_class_id: srcId, source_role: srcCls?.name?.charAt(0).toLowerCase() + srcCls?.name?.slice(1),
+      source_lower: 1, source_upper: 1,
+      target_class_id: tgtId, target_role: tgtCls?.name?.charAt(0).toLowerCase() + tgtCls?.name?.slice(1) + (qty === 'many' ? 's' : ''),
+      target_lower: 0, target_upper: qty === 'many' ? -1 : 1,
+      association_type: s.relType,
+    });
+    if (document.getElementById('rb-is-hier').checked) {
+      await API.updateAssociation(s.modelId, created.id, { is_hierarchy: true });
+    }
+    showToast(`关联已创建: ${label}`, 'success');
+    document.getElementById('rel-builder-modal').classList.add('hidden');
+    if (typeof loadModel === 'function') {
+      const layer = s.modelId === state.m1ModelId ? 'm1' : 'm2';
+      await loadModel(s.modelId, layer);
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '创建失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = origText;
+  }
+}
+
+function wireRelBuilderModal() {
+  if (!document.getElementById('rel-builder-modal')) return;
+  document.getElementById('rb-src-class').addEventListener('change', refreshRbPreview);
+  document.getElementById('rb-tgt-class').addEventListener('change', refreshRbPreview);
+  document.querySelectorAll('input[name="rb-tgt-qty"]').forEach(r => r.addEventListener('change', refreshRbPreview));
+  document.querySelectorAll('.rb-type-card').forEach(btn => {
+    btn.addEventListener('click', () => selectRelType(btn.dataset.rtype));
+  });
+  document.getElementById('btn-rb-cancel').addEventListener('click',
+    () => document.getElementById('rel-builder-modal').classList.add('hidden'));
+  document.getElementById('btn-rb-save').addEventListener('click', rbSave);
+}
+
+// ---- Safe delete dialog ----
+
+let _sdState = { modelId: null, classId: null };
+
+function openSafeDelete(modelId, classId) {
+  _sdState = { modelId, classId };
+  const pkg = state[modelId === state.m1ModelId ? 'm1Model' : 'm2Model']?.versions?.slice(-1)[0]?.package;
+  if (!pkg) return;
+  const cls = (pkg.classes || []).find(c => c.id === classId);
+  if (!cls) { showToast('类不存在', 'error'); return; }
+
+  // Analyze dependencies
+  const childClasses = (pkg.classes || []).filter(c => c.parent_class_name === cls.name);
+  const srcAssocs = (pkg.associations || []).filter(a => a.source?.class_ref === classId);
+  const tgtAssocs = (pkg.associations || []).filter(a => a.target?.class_ref === classId);
+
+  document.getElementById('sd-title').textContent = `🗑 删除 "${cls.label || cls.name}"?`;
+  const contentEl = document.getElementById('sd-content');
+  const classesById = Object.fromEntries((pkg.classes || []).map(c => [c.id, c]));
+  contentEl.innerHTML = `
+    <div class="sd-warning">⚠️ 删除后:</div>
+    <ul class="sd-impact">
+      <li>• 类 <b>${escapeHtml(cls.label || cls.name)}</b> 将从模型移除</li>
+      ${srcAssocs.length ? `<li>• ${srcAssocs.length} 条出向关联的源端将悬空:<br>
+        ${srcAssocs.slice(0,5).map(a => '　→ ' + escapeHtml(a.name || '(未命名)')).join('<br>')}</li>` : ''}
+      ${tgtAssocs.length ? `<li>• ${tgtAssocs.length} 条入向关联的目标端将悬空:<br>
+        ${tgtAssocs.slice(0,5).map(a => '　← ' + escapeHtml(a.name || '(未命名)')).join('<br>')}</li>` : ''}
+      ${childClasses.length ? `<li>• ${childClasses.length} 个子类失去父类: ${childClasses.slice(0,5).map(c => escapeHtml(c.label || c.name)).join(', ')}</li>` : ''}
+      ${!srcAssocs.length && !tgtAssocs.length && !childClasses.length ? '<li class="sd-ok">✓ 没有其他类依赖,可以安全删除</li>' : ''}
+    </ul>
+  `;
+
+  // Populate reparent dropdown (only M2 classes + other M1 classes as candidates)
+  const tgtSel = document.getElementById('sd-reparent-target');
+  const candidates = (pkg.classes || []).filter(c => c.id !== classId);
+  // Also include M2 classes if editing M1
+  if (modelId === state.m1ModelId && state.m2Model) {
+    const m2Pkg = state.m2Model.versions?.slice(-1)[0]?.package;
+    (m2Pkg?.classes || []).forEach(c => candidates.push(c));
+  }
+  tgtSel.innerHTML = candidates.map(c =>
+    `<option value="${c.id}" data-name="${escapeHtml(c.name)}">${escapeHtml(c.label || c.name)} · ${escapeHtml(c.name)}</option>`
+  ).join('');
+
+  // Hide reparent option if no children
+  const reparentWrap = document.getElementById('sd-reparent-wrap');
+  reparentWrap.style.display = childClasses.length ? '' : 'none';
+
+  document.querySelector('input[name="sd-strategy"][value="keep"]').checked = true;
+  document.getElementById('safe-delete-modal').classList.remove('hidden');
+}
+
+async function sdConfirm() {
+  const s = _sdState;
+  const strategy = document.querySelector('input[name="sd-strategy"]:checked').value;
+  const btn = document.getElementById('btn-sd-confirm');
+  const origText = btn.textContent; btn.disabled = true; btn.textContent = '处理中...';
+  try {
+    const pkg = state[s.modelId === state.m1ModelId ? 'm1Model' : 'm2Model']?.versions?.slice(-1)[0]?.package;
+    const cls = (pkg.classes || []).find(c => c.id === s.classId);
+    const clsName = cls?.name;
+    const childClasses = (pkg.classes || []).filter(c => c.parent_class_name === clsName);
+
+    if (strategy === 'cascade') {
+      // Delete dependent associations first
+      const assocs = (pkg.associations || []).filter(a =>
+        a.source?.class_ref === s.classId || a.target?.class_ref === s.classId);
+      for (const a of assocs) {
+        await API.deleteAssociation(s.modelId, a.id);
+      }
+      // Delete child classes recursively (one level for now)
+      for (const child of childClasses) {
+        await API.deleteClass(s.modelId, child.id);
+      }
+    } else if (strategy === 'reparent') {
+      const tgtSel = document.getElementById('sd-reparent-target');
+      const newParentId = tgtSel.value;
+      const newParentName = tgtSel.selectedOptions[0]?.dataset.name;
+      for (const child of childClasses) {
+        await API.updateClass(s.modelId, child.id, {
+          parent_class_ref: newParentId, parent_class_name: newParentName,
+        });
+      }
+    }
+    // Finally delete the target class itself
+    await API.deleteClass(s.modelId, s.classId);
+    showToast(`已删除 "${cls?.label || cls?.name}"`, 'success');
+    document.getElementById('safe-delete-modal').classList.add('hidden');
+    if (typeof loadModel === 'function') {
+      const layer = s.modelId === state.m1ModelId ? 'm1' : 'm2';
+      await loadModel(s.modelId, layer);
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '删除失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = origText;
+  }
+}
+
+function wireSafeDeleteModal() {
+  if (!document.getElementById('safe-delete-modal')) return;
+  document.getElementById('btn-sd-cancel').addEventListener('click',
+    () => document.getElementById('safe-delete-modal').classList.add('hidden'));
+  document.getElementById('btn-sd-confirm').addEventListener('click', sdConfirm);
+}
+
+// ---- Inline label rename (double-click) ----
+
+async function inlineRenameLabel(modelId, classId, oldLabel) {
+  const newLabel = window.prompt('修改中文标签:', oldLabel || '');
+  if (newLabel === null || newLabel.trim() === oldLabel) return;
+  const trimmed = newLabel.trim();
+  if (!trimmed) { showToast('标签不能为空', 'error'); return; }
+  try {
+    await API.updateClass(modelId, classId, { label: trimmed });
+    showToast('已改名', 'success');
+    if (typeof loadModel === 'function') {
+      const layer = modelId === state.m1ModelId ? 'm1' : 'm2';
+      await loadModel(modelId, layer);
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '改名失败', message: e.message });
+  }
+}
+
 // ============================================================================
 //                    V3.2 Structural Pattern Editor + Impact Preview
 // ============================================================================
@@ -4443,8 +5036,14 @@ function renderTree(layer) {
             <span class="tree-badge badge-class">C</span>
             <span class="tree-card-name">${escapeHtml(cls.name)}</span>
             ${_chipHtml}
+            <div class="tree-card-quick-actions">
+              <button class="tcq-btn" data-qaction="rename" title="重命名 (中文标签)">✎</button>
+              <button class="tcq-btn" data-qaction="add-attr" title="快速加属性">+📋</button>
+              <button class="tcq-btn" data-qaction="add-rel" title="快速加关联">+🔗</button>
+              <button class="tcq-btn tcq-del" data-qaction="delete" title="删除 (带依赖分析)">🗑</button>
+            </div>
           </div>
-          <div class="tree-card-label">${escapeHtml(cls.label || '')}${parentHint}</div>
+          <div class="tree-card-label" title="双击可修改标签">${escapeHtml(cls.label || '')}${parentHint}</div>
           ${descShort ? `<div class="tree-card-desc">${escapeHtml(descShort)}</div>` : ''}
           <div class="tree-card-stats-row">
             <span class="card-stat card-stat-attrs" title="自有/继承属性">📋 ${ownCount}<span class="card-stat-sub">/${inheritedCount}</span></span>
@@ -4520,6 +5119,34 @@ function renderTree(layer) {
           e.stopPropagation();
           openEntityDetailPage(cls, classes, enums, assocs, layer);
         });
+
+        // V3.3: hover quick-action buttons
+        card.querySelectorAll('.tcq-btn').forEach(btn => {
+          btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const action = btn.dataset.qaction;
+            const modelId = layer === 'm1' ? state.m1ModelId : state.m2ModelId;
+            if (!modelId) return;
+            if (action === 'rename') {
+              inlineRenameLabel(modelId, cls.id, cls.label);
+            } else if (action === 'add-attr') {
+              openAttrBuilder(modelId, cls.id, null);
+            } else if (action === 'add-rel') {
+              openRelBuilder(modelId, cls.id);
+            } else if (action === 'delete') {
+              openSafeDelete(modelId, cls.id);
+            }
+          });
+        });
+        // V3.3: double-click label to inline rename
+        const labelEl = card.querySelector('.tree-card-label');
+        if (labelEl) {
+          labelEl.addEventListener('dblclick', e => {
+            e.stopPropagation();
+            const modelId = layer === 'm1' ? state.m1ModelId : state.m2ModelId;
+            if (modelId) inlineRenameLabel(modelId, cls.id, cls.label);
+          });
+        }
       }
       // Grids were already attached to the section via groups above; just append section.
       root.appendChild(section);

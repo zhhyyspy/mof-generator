@@ -526,6 +526,209 @@
       </div>
     </div>
 
+    <!-- V3.3: Visual attribute builder (quick add/edit attribute on any class) -->
+    <div id="attr-builder-modal" class="overlay hidden">
+      <div class="modal-card attr-builder-card">
+        <h3 id="attr-builder-title">➕ 添加属性</h3>
+        <div class="ab-body">
+          <div class="ab-context" id="ab-context"></div>
+          <label class="ab-field">
+            <span>属性名 (中文) <em class="ab-req">*</em></span>
+            <input type="text" id="ab-label" placeholder="额定功率 / 投运日期 / 运行状态" />
+            <div class="ab-hint" id="ab-label-hint">示例: 额定功率、投运日期、运行状态</div>
+          </label>
+
+          <div class="ab-section-title">这个属性存什么数据? <em class="ab-req">*</em></div>
+          <div class="ab-types">
+            <button type="button" class="ab-type-card" data-ltype="text">
+              <span class="ab-type-icon">📝</span>
+              <span class="ab-type-name">文本</span>
+              <span class="ab-type-ex">名称/地址/描述</span>
+            </button>
+            <button type="button" class="ab-type-card" data-ltype="number">
+              <span class="ab-type-icon">#</span>
+              <span class="ab-type-name">数字</span>
+              <span class="ab-type-ex">数量/台数</span>
+            </button>
+            <button type="button" class="ab-type-card" data-ltype="quantity">
+              <span class="ab-type-icon">💰</span>
+              <span class="ab-type-name">金额/物理量</span>
+              <span class="ab-type-ex">带单位: MW, °C, ¥</span>
+            </button>
+            <button type="button" class="ab-type-card" data-ltype="date">
+              <span class="ab-type-icon">📅</span>
+              <span class="ab-type-name">日期</span>
+              <span class="ab-type-ex">生日/到期日</span>
+            </button>
+            <button type="button" class="ab-type-card" data-ltype="boolean">
+              <span class="ab-type-icon">✓</span>
+              <span class="ab-type-name">是/否</span>
+              <span class="ab-type-ex">启用/已审批</span>
+            </button>
+            <button type="button" class="ab-type-card" data-ltype="enum">
+              <span class="ab-type-icon">🏷️</span>
+              <span class="ab-type-name">选项列表</span>
+              <span class="ab-type-ex">状态/类型</span>
+            </button>
+          </div>
+
+          <!-- Dynamic section for the selected type -->
+          <div id="ab-dynamic" class="ab-dynamic"></div>
+
+          <!-- Preview -->
+          <div class="ab-preview-box">
+            <span class="ab-preview-label">👁 预览:</span>
+            <span id="ab-preview" class="ab-preview-text">(请先填名称和选类型)</span>
+          </div>
+
+          <!-- Templates shortcut -->
+          <details class="ab-templates">
+            <summary>📦 一键添加常见属性组</summary>
+            <div class="ab-tpl-list">
+              <button type="button" class="ab-tpl" data-tpl="basic">
+                📋 <b>基础信息</b> (编号 + 名称 + 描述 + 备注)
+              </button>
+              <button type="button" class="ab-tpl" data-tpl="device">
+                ⚙️ <b>设备属性</b> (型号 + 生产厂家 + 出厂编号 + 投运日期)
+              </button>
+              <button type="button" class="ab-tpl" data-tpl="project">
+                💼 <b>工程项目</b> (投资额 + 开工日期 + 完工日期 + 状态)
+              </button>
+            </div>
+          </details>
+
+          <!-- Advanced toggle -->
+          <details class="ab-advanced">
+            <summary>⚙ 进阶设置 (英文名 / 多重性 / 默认值)</summary>
+            <label class="ab-field"><span>英文名 (auto 生成,可覆盖)</span>
+              <input type="text" id="ab-name" placeholder="camelCase, e.g. ratedPower" /></label>
+            <div class="ab-mult-toggle">
+              <span>数量:</span>
+              <label><input type="radio" name="ab-mult" value="one" checked> 1 个值</label>
+              <label><input type="radio" name="ab-mult" value="many"> 多个值 (列表)</label>
+            </div>
+            <div class="ab-mult-toggle">
+              <span>是否必填:</span>
+              <label><input type="radio" name="ab-required" value="yes" checked> 必填</label>
+              <label><input type="radio" name="ab-required" value="no"> 可选</label>
+            </div>
+            <label class="ab-field"><span>默认值 (可选)</span>
+              <input type="text" id="ab-default" /></label>
+          </details>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-ab-cancel" class="btn">取消</button>
+          <button id="btn-ab-save" class="btn btn-primary">✓ 添加属性</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- V3.3: Visual relationship builder -->
+    <div id="rel-builder-modal" class="overlay hidden">
+      <div class="modal-card rel-builder-card">
+        <h3 id="rel-builder-title">🔗 创建类间关联</h3>
+        <div class="rb-body">
+          <div class="rb-step-title">步骤 1: 这两个类有什么关系?</div>
+          <div class="rb-endpoints">
+            <div class="rb-endpoint-picker">
+              <div class="rb-endpoint-label">📤 从这里</div>
+              <select id="rb-src-class"></select>
+            </div>
+            <div class="rb-endpoint-arrow">→</div>
+            <div class="rb-endpoint-picker">
+              <div class="rb-endpoint-label">📥 到这里</div>
+              <select id="rb-tgt-class"></select>
+            </div>
+          </div>
+
+          <div class="rb-step-title">步骤 2: 是哪种关系?</div>
+          <div class="rb-types">
+            <button type="button" class="rb-type-card" data-rtype="composition">
+              <div class="rb-type-head">📦 A 包含 B <span class="rb-type-tag">强包含</span></div>
+              <div class="rb-type-desc">B 是 A 的核心组成部分,离开 A 就不存在 (composition)</div>
+            </button>
+            <button type="button" class="rb-type-card" data-rtype="aggregation">
+              <div class="rb-type-head">🤝 A 拥有 B <span class="rb-type-tag">弱包含</span></div>
+              <div class="rb-type-desc">B 被 A 管理,但 B 可以独立存在 (aggregation)</div>
+            </button>
+            <button type="button" class="rb-type-card" data-rtype="association">
+              <div class="rb-type-head">↔ A 引用 B <span class="rb-type-tag">关联</span></div>
+              <div class="rb-type-desc">A 知道 B 的存在,但不管理 B (association)</div>
+            </button>
+          </div>
+
+          <div class="rb-step-title">步骤 3: 数量多少?</div>
+          <div class="rb-mult">
+            <span id="rb-src-mult-lbl" class="rb-mult-endpoint">A</span>
+            <span class="rb-mult-word">有</span>
+            <div class="rb-mult-choice">
+              <label><input type="radio" name="rb-tgt-qty" value="one"> 1 个</label>
+              <label><input type="radio" name="rb-tgt-qty" value="many" checked> 多个</label>
+            </div>
+            <span id="rb-tgt-mult-lbl" class="rb-mult-endpoint">B</span>
+          </div>
+
+          <div class="rb-preview">
+            <span class="rb-preview-label">👁 最终效果:</span>
+            <span id="rb-preview-text" class="rb-preview-text">(请完成上面三步)</span>
+          </div>
+
+          <details class="rb-advanced">
+            <summary>⚙ 进阶 (英文名 / 角色 / 是否层级边)</summary>
+            <label class="ab-field"><span>关联英文名</span>
+              <input type="text" id="rb-name" placeholder="unitHasTurbine" /></label>
+            <label class="ab-field"><span>标签 (中文)</span>
+              <input type="text" id="rb-label" placeholder="机组含水轮机" /></label>
+            <div class="ab-mult-toggle">
+              <label><input type="checkbox" id="rb-is-hier"> 作为元结构层级边 (is_hierarchy)</label>
+            </div>
+          </details>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-rb-cancel" class="btn">取消</button>
+          <button id="btn-rb-save" class="btn btn-primary">✓ 创建关联</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- V3.3: Safe delete dialog (dependency analysis + strategy) -->
+    <div id="safe-delete-modal" class="overlay hidden">
+      <div class="modal-card safe-delete-card">
+        <h3 id="sd-title">🗑 删除确认</h3>
+        <div class="sd-body">
+          <div id="sd-content"></div>
+          <div class="sd-strategy">
+            <div class="sd-strategy-title">处理方式:</div>
+            <label class="sd-strategy-opt">
+              <input type="radio" name="sd-strategy" value="keep" checked>
+              <div class="sd-strategy-box">
+                <b>🔓 仅删除,保留关联</b>
+                <div class="sd-strategy-desc">关联的端点会变"悬空",以后手动修</div>
+              </div>
+            </label>
+            <label class="sd-strategy-opt">
+              <input type="radio" name="sd-strategy" value="cascade">
+              <div class="sd-strategy-box">
+                <b>🔥 级联删除 (危险)</b>
+                <div class="sd-strategy-desc">同时删除相关的关联和子类</div>
+              </div>
+            </label>
+            <label class="sd-strategy-opt sd-strategy-reparent" id="sd-reparent-wrap">
+              <input type="radio" name="sd-strategy" value="reparent">
+              <div class="sd-strategy-box">
+                <b>🔀 重挂父类</b>
+                <div class="sd-strategy-desc">让子类改挂到: <select id="sd-reparent-target"></select></div>
+              </div>
+            </label>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-sd-cancel" class="btn">取消</button>
+          <button id="btn-sd-confirm" class="btn btn-danger">🗑 确认删除</button>
+        </div>
+      </div>
+    </div>
+
     <!-- V3.2 P5: M2 Association editor (create + edit) -->
     <div id="assoc-editor-modal" class="overlay hidden">
       <div class="modal-card assoc-editor-card">

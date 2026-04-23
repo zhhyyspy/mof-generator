@@ -113,6 +113,11 @@ class Attribute(BaseModel):
     unit: Optional[str] = None
     default_value: Optional[str] = None
     is_inherited: bool = False
+    # V3.3: logical type picked by user in the visual attribute builder.
+    # Retains business semantics ("金额/日期/是否/...") beyond the raw data_type.
+    # Values: "text" | "number" | "quantity" | "date" | "boolean" | "enum"
+    # Empty for legacy attributes — UI falls back to data_type for display.
+    logical_type: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

@@ -287,6 +287,7 @@ async def add_attribute(model_id: str, class_id: str, req: AttributeCreateReques
                 unit=req.unit,
                 multiplicity=Multiplicity(lower=req.multiplicity_lower, upper=req.multiplicity_upper),
                 default_value=req.default_value,
+                logical_type=req.logical_type,  # V3.3
             )
             cls.attributes.append(attr)
             store.save_model(model)
@@ -303,7 +304,7 @@ async def update_attribute(model_id: str, class_id: str, attr_id: str, data: dic
             for attr in cls.attributes:
                 if attr.id == attr_id:
                     for key in ("name", "label", "description", "data_type",
-                                "enum_ref", "unit", "default_value"):
+                                "enum_ref", "unit", "default_value", "logical_type"):
                         if key in data:
                             setattr(attr, key, data[key])
                     if "multiplicity" in data:

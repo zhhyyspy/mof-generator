@@ -83,6 +83,7 @@ class AttributeCreateRequest(BaseModel):
     multiplicity_lower: int = 1
     multiplicity_upper: int = 1
     default_value: Optional[str] = None
+    logical_type: Optional[str] = None  # V3.3 visual builder semantic tag
 
 
 class AssociationCreateRequest(BaseModel):
