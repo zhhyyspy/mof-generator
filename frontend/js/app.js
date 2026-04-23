@@ -1822,19 +1822,27 @@ function renderM1MetaStructurePanel(m1Pkg, m2Pkg) {
 
   const headerRects = [];
   for (const e of levelEntries) {
+    const m2Label = e.m2Class.label || e.m2Class.name;
+    // If level name equals the M2 MetaClass label (case-insensitive, common case),
+    // don't repeat it — just show the level name once. Avoids visual overlap.
+    const levelStr = (e.levelName || '').trim();
+    const sameAsClass = levelStr && m2Label && levelStr.toLowerCase() === m2Label.toLowerCase();
+    const classLineHtml = sameAsClass
+      ? `<div class="ms-tree-colhead-class ms-tree-colhead-class-compact"
+             title="M2 MetaClass: ${escapeAttr(e.m2Class.name)}">${escapeHtml(e.m2Class.name)}</div>`
+      : `<div class="ms-tree-colhead-class"
+             title="M2 MetaClass: ${escapeAttr(e.m2Class.name)}">${escapeHtml(m2Label)}</div>`;
     headerRects.push(`
       <div class="ms-tree-colhead" style="left:${colX(e.level)}px; width:${NODE_W}px;" data-level="${e.level}">
         <div class="ms-tree-colhead-level" style="color:${LEVEL_COLOR[e.level]}">${escapeHtml(e.levelName)}</div>
-        <div class="ms-tree-colhead-class" title="M2 MetaClass: ${escapeAttr(e.m2Class.name)}">
-          ${escapeHtml(e.m2Class.label || e.m2Class.name)}
-        </div>
+        ${classLineHtml}
       </div>`);
   }
   if (hasFloating) {
     headerRects.push(`
       <div class="ms-tree-colhead ms-tree-colhead-floating" style="left:${colX(0)}px; width:${NODE_W}px;">
-        <div class="ms-tree-colhead-level" style="color:${LEVEL_COLOR[0]}">游离</div>
-        <div class="ms-tree-colhead-class">未挂载 M2</div>
+        <div class="ms-tree-colhead-level" style="color:${LEVEL_COLOR[0]}">⚠ 游离</div>
+        <div class="ms-tree-colhead-class" title="未挂载到任何 M2 元结构 MetaClass">未挂载 M2</div>
       </div>`);
   }
 
@@ -1843,13 +1851,17 @@ function renderM1MetaStructurePanel(m1Pkg, m2Pkg) {
     const x = colX(p.col);
     const y = HEADER_H + p.y;
     const lvl = n.level || 0;
+    const chipText = lvl > 0 ? `L${lvl}` : '游离';
+    const tooltipExtra = lvl === 0
+      ? `(parent_class_name "${n.parentClassName || '(空)'}" 不属于任何元结构层级)`
+      : `元类: ${n.metaLabel}`;
     return `
       <div class="ms-tree-node" data-m1-id="${n.id}" data-level="${lvl}"
            style="left:${x}px; top:${y}px; width:${NODE_W}px; height:${NODE_H}px;"
-           title="${escapeAttr(n.label + ' · ' + n.name + '\n元类: ' + n.metaLabel + (n.description ? '\n\n' + n.description.slice(0, 100) : ''))}">
+           title="${escapeAttr(n.label + ' · ' + n.name + '\n' + tooltipExtra + (n.description ? '\n\n' + n.description.slice(0, 100) : ''))}">
         <div class="ms-tree-node-head">
           <span class="ms-tree-node-label">${escapeHtml(n.label)}</span>
-          <span class="ms-tree-node-chip" style="background:${LEVEL_COLOR[lvl]}">L${lvl || '?'}</span>
+          <span class="ms-tree-node-chip" style="background:${LEVEL_COLOR[lvl]}">${chipText}</span>
         </div>
         <div class="ms-tree-node-code">${escapeHtml(n.name)}</div>
       </div>`;

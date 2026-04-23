@@ -2224,28 +2224,44 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
 .ms-tree-colhead {
   position: absolute;
   top: 0;
-  height: 38px;
-  padding: 4px 8px;
+  /* Must match HEADER_H in app.js (46). Two-line content needs ≥44px + border. */
+  height: 46px;
+  padding: 4px 8px 5px;
   background: rgba(255,255,255,0.02);
   border-bottom: 2px solid var(--border, #333);
   display: flex;
   flex-direction: column;
   justify-content: center;
+  gap: 2px;
   box-sizing: border-box;
+  overflow: hidden;
 }
 .ms-tree-colhead-level {
   font-size: 10px;
+  line-height: 1.2;
   font-family: monospace;
   font-weight: 600;
   letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .ms-tree-colhead-class {
   font-size: 13px;
+  line-height: 1.25;
   font-weight: 600;
   color: var(--text, #e5e7eb);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* When level name === class label, collapse the second line to a subtle code hint */
+.ms-tree-colhead-class-compact {
+  font-size: 10px;
+  font-weight: 400;
+  font-family: monospace;
+  color: var(--text-dim, #888);
+  opacity: 0.75;
 }
 .ms-tree-colhead-floating {
   border-bottom-style: dashed;
