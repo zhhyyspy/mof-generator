@@ -615,3 +615,92 @@ async def get_publish_status(model_id: str):
             getattr(pkg, "publish_status", None) or "draft", ()
         )),
     }
+
+
+# ============================================================================
+#                       V3.1 Synonym detection + merge
+# ============================================================================
+
+@router.post("/{model_id}/detect-synonyms")
+async def detect_synonyms(model_id: str, use_llm: bool = False):
+    """V3.1: find groups of M1 classes that look like synonyms (same concept).
+
+    Layer 1 (rule) always runs: strips prefixes/suffixes + Levenshtein ≤ 2.
+    Layer 2 (LLM) optional: one LLM call for semantic equivalence.
+    Returns groups + per-class snapshot for UI rendering.
+    """
+    from backend.services.synonym_detector import (
+        detect_synonyms_rule, detect_synonyms_llm, merge_groups,
+    )
+    model = _get_model_or_404(model_id)
+    pkg = _current_package(model)
+    # Snapshot classes as dicts (id/name/label/attrs count) for detector
+    cls_dicts = [
+        {"id": c.id, "name": c.name, "label": c.label,
+         "attr_count": len(c.attributes or [])}
+        for c in pkg.classes
+    ]
+
+    rule_groups = detect_synonyms_rule(cls_dicts)
+    llm_groups = []
+    if use_llm:
+        try:
+            llm_groups = await detect_synonyms_llm(cls_dicts)
+        except Exception as e:
+            llm_groups = []
+    final_groups = merge_groups(rule_groups, llm_groups)
+
+    # Attach class details for UI
+    by_id = {c["id"]: c for c in cls_dicts}
+    groups_rich = []
+    for g in final_groups:
+        items = [by_id[cid] for cid in g if cid in by_id]
+        groups_rich.append({
+            "class_ids": g,
+            "classes": items,
+            # Suggest keeping the class with the most attributes as default
+            "suggest_keep_id": max(items, key=lambda x: x.get("attr_count", 0))["id"]
+                if items else (g[0] if g else None),
+        })
+
+    return {
+        "total_classes": len(cls_dicts),
+        "rule_groups": len(rule_groups),
+        "llm_groups": len(llm_groups),
+        "groups": groups_rich,
+        "used_llm": use_llm,
+    }
+
+
+@router.get("/{model_id}/quality-check")
+async def quality_check(model_id: str):
+    """V3.1 Phase D: run quality sanity checks on the model's current package."""
+    from backend.services.quality_checker import check_m1_package, summarize
+    model = _get_model_or_404(model_id)
+    pkg = _current_package(model)
+    pkg_dump = pkg.model_dump() if hasattr(pkg, "model_dump") else pkg
+    # Estimate total doc chars from sources
+    total_chars = 0
+    for did in (model.source_document_ids or []):
+        m = store.get_document_meta(did)
+        if m:
+            total_chars += m.get("char_count", 0)
+    findings = check_m1_package(pkg_dump, total_doc_chars=total_chars)
+    return {"findings": findings, "summary": summarize(findings)}
+
+
+@router.post("/{model_id}/merge-classes")
+async def merge_classes(model_id: str, req: dict):
+    """V3.1: apply merges. req = {"merges": [{"keep": id, "drop": [id, ...]}]}
+    Returns summary with kept/dropped ids + refs_rewritten count.
+    """
+    from backend.services.synonym_detector import merge_classes_in_package
+    model = _get_model_or_404(model_id)
+    pkg = _current_package(model)
+    merges = req.get("merges") or []
+    if not merges:
+        raise HTTPException(400, "merges array is required")
+
+    summary = merge_classes_in_package(pkg, merges)
+    store.save_model(model)
+    return summary

@@ -387,6 +387,7 @@ function setupToolbar() {
   });
   // Wire complete-package Import modal (V3.0 .mofpkg.zip)
   wireImportPackageModal();
+  wireSynonymModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -424,6 +425,8 @@ function updateToolbarState() {
   // 导出按钮不再依赖当前激活 tab — 审查包是跨层导出, 原始数据也可以在 modal 里选择层
   document.getElementById('btn-export').disabled = !hasAnyModel;
   document.getElementById('btn-version').disabled = !hasActive;
+  const synBtn = document.getElementById('btn-synonyms');
+  if (synBtn) synBtn.disabled = !hasM1;
   const delBtn = document.getElementById('btn-model-delete');
   if (delBtn) delBtn.disabled = !hasM1;
   document.getElementById('btn-add-class').disabled = !hasActive;
@@ -1372,6 +1375,60 @@ async function openPublishStatusDialog(layer, modelId, currentStatus) {
  * hierarchy associations. Supports in-place rename of pattern label and level names,
  * persists via PUT /models/{id} with the updated package.
  */
+/**
+ * V3.1 Phase D: fetch + render a quality-check banner on top of a tree dashboard.
+ * Appears only if there are warnings/errors; silently hidden when all green.
+ * Non-blocking: dashboard renders first, banner slots in async.
+ */
+async function loadQualityBanner(dashboardEl, modelId, layer) {
+  if (!modelId) return;
+  try {
+    const res = await API.qualityCheck(modelId);
+    const findings = res.findings || [];
+    // Only show if any non-info finding exists
+    const actionable = findings.filter(f => f.severity !== 'info');
+    if (!actionable.length) return;
+    const banner = document.createElement('div');
+    banner.className = 'quality-banner';
+    const sev = findings.some(f => f.severity === 'error') ? 'error'
+              : findings.some(f => f.severity === 'warn') ? 'warn' : 'info';
+    banner.classList.add(`quality-banner-${sev}`);
+    const icon = sev === 'error' ? '❌' : sev === 'warn' ? '⚠️' : 'ℹ️';
+    const itemsHtml = findings.slice(0, 5).map(f => `
+      <div class="quality-item quality-item-${f.severity}">
+        <div class="quality-item-head">
+          <span class="quality-metric">${escapeHtml(f.metric)}</span>
+          <span class="quality-value">${escapeHtml(f.value)}</span>
+          <span class="quality-expected">期望 ${escapeHtml(f.expected_range)}</span>
+        </div>
+        <div class="quality-hint">${escapeHtml(f.hint)}</div>
+        ${f.hint_action ? `<div class="quality-action">💡 ${escapeHtml(f.hint_action)}</div>` : ''}
+      </div>
+    `).join('');
+    banner.innerHTML = `
+      <div class="quality-banner-head">
+        <span class="quality-banner-icon">${icon}</span>
+        <span class="quality-banner-title">抽取质量体检 · ${actionable.length} 项提示</span>
+        <button class="quality-banner-toggle" data-action="toggle-quality">展开 ▼</button>
+      </div>
+      <div class="quality-banner-body hidden">${itemsHtml}</div>
+    `;
+    // Insert after dashboard header, before search
+    const searchRow = dashboardEl.querySelector('.tree-dashboard-search');
+    if (searchRow) searchRow.before(banner);
+    else dashboardEl.appendChild(banner);
+    const toggle = banner.querySelector('[data-action="toggle-quality"]');
+    toggle.addEventListener('click', () => {
+      const body = banner.querySelector('.quality-banner-body');
+      const hidden = body.classList.toggle('hidden');
+      toggle.textContent = hidden ? '展开 ▼' : '收起 ▲';
+    });
+  } catch (e) {
+    // Silent — quality check is best-effort
+    console.warn('Quality check failed:', e.message);
+  }
+}
+
 function renderMetaStructurePanel(modelId, pkg, patterns) {
   const panel = document.createElement('div');
   panel.className = 'meta-structure-panel';
@@ -3392,6 +3449,9 @@ function renderTree(layer) {
     filterTreeEntities(container, q);
   });
 
+  // V3.1 Quality check banner (async, appears if issues found)
+  loadQualityBanner(dashboard, modelId, layer);
+
   // Wire publish-status button
   const statusBtn = dashboard.querySelector('[data-action="change-publish"]');
   if (statusBtn) {
@@ -4625,6 +4685,120 @@ function wireImportPackageModal() {
     e.preventDefault(); zone.classList.remove('dragover');
     const f = e.dataTransfer?.files?.[0]; if (f) handleImportPackageFile(f);
   });
+}
+
+
+// ============================================================================
+//                      V3.1 Synonym class detect + merge
+// ============================================================================
+
+let _synonymDetection = null;     // last detect() response
+let _synonymGroupChoices = {};    // {groupIdx: keepId} user selection
+
+function wireSynonymModal() {
+  const btnOpen = document.getElementById('btn-synonyms');
+  if (!btnOpen) return;
+  btnOpen.addEventListener('click', openSynonymModal);
+  document.getElementById('btn-synonym-cancel').addEventListener('click',
+    () => document.getElementById('synonym-modal').classList.add('hidden'));
+  document.getElementById('btn-synonym-detect').addEventListener('click', () => runSynonymDetection());
+  document.getElementById('btn-synonym-merge').addEventListener('click', doSynonymMerge);
+}
+
+async function openSynonymModal() {
+  if (!state.m1ModelId) {
+    showToast('未选择 M1 模型', 'error'); return;
+  }
+  document.getElementById('synonym-modal').classList.remove('hidden');
+  document.getElementById('synonym-groups').innerHTML = '';
+  document.getElementById('btn-synonym-merge').disabled = true;
+  document.getElementById('synonym-use-llm').checked = false;
+  await runSynonymDetection();
+}
+
+async function runSynonymDetection() {
+  const statusEl = document.getElementById('synonym-status');
+  const groupsEl = document.getElementById('synonym-groups');
+  const mergeBtn = document.getElementById('btn-synonym-merge');
+  const useLLM = !!document.getElementById('synonym-use-llm')?.checked;
+  statusEl.textContent = useLLM ? '检测中 (包含 AI 语义分析,预计 3~5 秒)...' : '检测中...';
+  groupsEl.innerHTML = '';
+  mergeBtn.disabled = true;
+  _synonymDetection = null;
+  _synonymGroupChoices = {};
+  try {
+    const res = await API.detectSynonyms(state.m1ModelId, useLLM);
+    _synonymDetection = res;
+    const groups = res.groups || [];
+    statusEl.textContent = `共扫描 ${res.total_classes} 个类 · 规则层发现 ${res.rule_groups} 组`
+      + (useLLM ? ` · AI 层发现 ${res.llm_groups} 组` : '')
+      + ` · 最终 ${groups.length} 组疑似同义`;
+    if (groups.length === 0) {
+      groupsEl.innerHTML = '<div class="synonym-empty">✓ 未发现同义类,无需合并</div>';
+      return;
+    }
+    // Render each group with radio buttons for "keep"
+    groupsEl.innerHTML = groups.map((g, gi) => {
+      const rows = g.classes.map(c => `
+        <label class="synonym-choice">
+          <input type="radio" name="syn-keep-${gi}" value="${c.id}"
+            ${c.id === g.suggest_keep_id ? 'checked' : ''}
+            data-group="${gi}">
+          <span class="synonym-cls-name">${escapeHtml(c.name)}</span>
+          <span class="synonym-cls-label">${escapeHtml(c.label || '')}</span>
+          <span class="synonym-cls-attrs">${c.attr_count || 0} 属性</span>
+        </label>
+      `).join('');
+      return `
+        <div class="synonym-group" data-group-idx="${gi}">
+          <div class="synonym-group-title">组 ${gi + 1} · ${g.classes.length} 个类</div>
+          <div class="synonym-group-hint">保留哪一个? (默认选属性最多的)</div>
+          ${rows}
+        </div>
+      `;
+    }).join('');
+    // Initialize choices
+    groups.forEach((g, gi) => { _synonymGroupChoices[gi] = g.suggest_keep_id; });
+    // Wire radio changes
+    groupsEl.querySelectorAll('input[type="radio"]').forEach(r => {
+      r.addEventListener('change', e => {
+        _synonymGroupChoices[Number(e.target.dataset.group)] = e.target.value;
+      });
+    });
+    mergeBtn.disabled = false;
+  } catch (e) {
+    statusEl.textContent = '检测失败: ' + e.message;
+  }
+}
+
+async function doSynonymMerge() {
+  if (!_synonymDetection || !(_synonymDetection.groups || []).length) return;
+  const merges = _synonymDetection.groups.map((g, gi) => {
+    const keep = _synonymGroupChoices[gi] || g.suggest_keep_id;
+    const drop = g.class_ids.filter(id => id !== keep);
+    return { keep, drop };
+  }).filter(m => m.drop.length > 0);
+
+  if (!merges.length) { showToast('没有可合并的类', 'info'); return; }
+
+  const btn = document.getElementById('btn-synonym-merge');
+  const origText = btn.textContent;
+  btn.disabled = true; btn.textContent = '合并中...';
+  try {
+    const result = await API.mergeClasses(state.m1ModelId, merges);
+    const droppedN = (result.dropped_class_ids || []).length;
+    const refsN = result.refs_rewritten || 0;
+    showToast(`已合并 ${droppedN} 个重复类,重写 ${refsN} 处引用`, 'success');
+    document.getElementById('synonym-modal').classList.add('hidden');
+    // Refresh the M1 model view
+    if (typeof loadModel === 'function') {
+      await loadModel(state.m1ModelId, 'm1');
+    }
+  } catch (e) {
+    showDialog({ type: 'error', title: '合并失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = origText;
+  }
 }
 
 async function doExportRaw() {

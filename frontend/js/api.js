@@ -183,6 +183,22 @@ export const API = {
     return (await request(`/models/${modelId}/versions/${version}/activate`, { method: 'POST' })).json();
   },
 
+  // V3.1: quality sanity checks
+  async qualityCheck(modelId) {
+    return (await request(`/models/${modelId}/quality-check`)).json();
+  },
+  // V3.1: synonym class detection + merge
+  async detectSynonyms(modelId, useLLM = false) {
+    return (await request(`/models/${modelId}/detect-synonyms?use_llm=${useLLM ? 'true' : 'false'}`, {
+      method: 'POST',
+    })).json();
+  },
+  async mergeClasses(modelId, merges) {
+    return (await request(`/models/${modelId}/merge-classes`, {
+      method: 'POST', body: JSON.stringify({ merges }),
+    })).json();
+  },
+
   // Publish lifecycle (V3.0 methodology § 2.4)
   async getPublishStatus(modelId) {
     return (await request(`/models/${modelId}/publish-status`)).json();

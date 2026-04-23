@@ -969,6 +969,57 @@ class AIExtractor:
                 association_type=ad.get("association_type", "composition"),
             ))
 
+        # ====================================================================
+        # Phase 1.5 (V3.1): dedicated composition 补边
+        # ====================================================================
+        # Existing Phase 2 assoc extraction often misses cross-batch composition
+        # (it only sees per-batch text). A consolidation call over FULL class
+        # inventory catches explicit containment the per-batch prompts missed.
+        # Runs as one extra call at end of pipeline — cheap relative to phase 1.
+        if progress_callback:
+            await progress_callback("extracting_associations", 0.87,
+                f"Phase 1.5 补边: 扫描 {len(mof_classes)} 类的组合关系...")
+        try:
+            supplement = await self._extract_compositions_supplement(
+                mof_classes, associations, doc_batch_texts,
+            )
+            for comp in supplement:
+                # Skip duplicates (by source+target+type)
+                src_name = comp.get("source_class", "")
+                tgt_name = comp.get("target_class", "")
+                if not src_name or not tgt_name:
+                    continue
+                dup = any(
+                    (a.source.class_name == src_name and a.target.class_name == tgt_name
+                     and a.association_type in ("composition", "aggregation"))
+                    for a in associations
+                )
+                if dup:
+                    continue
+                src_mult = comp.get("source_multiplicity", {})
+                tgt_mult = comp.get("target_multiplicity", {})
+                associations.append(Association(
+                    id=str(uuid.uuid4()),
+                    name=comp.get("name") or f"{src_name}_contains_{tgt_name}",
+                    label=comp.get("label", ""),
+                    description=(comp.get("description") or "") + " [Phase1.5补边]",
+                    source=AssociationEnd(
+                        class_ref=class_id_map.get(src_name, src_name),
+                        class_name=src_name,
+                        role_name=comp.get("source_role"),
+                        multiplicity=Multiplicity(lower=src_mult.get("lower", 1), upper=src_mult.get("upper", 1)),
+                    ),
+                    target=AssociationEnd(
+                        class_ref=class_id_map.get(tgt_name, tgt_name),
+                        class_name=tgt_name,
+                        role_name=comp.get("target_role"),
+                        multiplicity=Multiplicity(lower=tgt_mult.get("lower", 0), upper=tgt_mult.get("upper", -1)),
+                    ),
+                    association_type=comp.get("association_type", "composition"),
+                ))
+        except Exception as e:
+            confidence_notes.append(f"Phase 1.5 补边失败 (已忽略): {str(e)[:150]}")
+
         # Emit partial: complete classes + enumerations + associations
         await _emit_partial(mof_cls_list=mof_classes, enum_list=enumerations, assocs_list=associations)
 
@@ -2695,3 +2746,98 @@ DOCUMENTS:
 ---"""
 
         return await self._ask(prompt, max_tokens=16384)
+
+    async def _extract_compositions_supplement(
+        self,
+        classes: list[MOFClass],
+        existing_assocs: list,
+        doc_batch_texts: list[str],
+    ) -> list[dict]:
+        """V3.1 Phase 1.5: a dedicated pass to补边 M1-to-M1 composition.
+
+        Per-batch association extraction (Phase 2) often misses composition edges
+        that span batches — e.g. "电站 contains 机组区域" where 电站 is mentioned
+        in one doc and 机组区域 in another. This call looks at the FULL class
+        inventory + a concatenated digest of all doc batches, and asks the LLM
+        to infer containment relationships it can justify from the text.
+
+        Returns a list of composition/aggregation edges (same shape as
+        _extract_assocs_from_docs output items).
+        """
+        if len(classes) < 2:
+            return []
+        class_list = "\n".join(
+            f"- {c.name} ({c.label}): {(c.description or '')[:80]}" for c in classes
+        )
+        # Summary of existing edges so LLM doesn't duplicate
+        existing_pairs = set()
+        for a in existing_assocs:
+            src = getattr(a.source, "class_name", None)
+            tgt = getattr(a.target, "class_name", None)
+            if src and tgt:
+                existing_pairs.add(f"{src}→{tgt}")
+        existing_hint = ""
+        if existing_pairs:
+            sample = ", ".join(list(existing_pairs)[:50])
+            existing_hint = f"""
+The following composition/aggregation/association edges are ALREADY captured;
+do NOT repeat them (in any direction):
+  {sample}
+"""
+
+        # Concatenate doc batches (cap total length to keep prompt bounded)
+        MAX_TEXT = 20000
+        combined = "\n\n---BATCH---\n\n".join(doc_batch_texts)
+        if len(combined) > MAX_TEXT:
+            combined = combined[:MAX_TEXT] + "\n\n[... truncated]"
+
+        prompt = f"""You are doing a SUPPLEMENTARY pass to补边 M1 class composition.
+从上面已抽取的 {len(classes)} 个类中找出**类间组合/归属关系** (composition / aggregation),
+重点是那些跨文档批次可能被漏掉的层级包含关系。
+
+判定要点:
+- composition: B is a physical part of A (A contains B permanently)
+  · 典型文字线索:"...由...组成"、"...包括"、"X 属于 Y"、"Y 包含 X"
+- aggregation: A aggregates B but B is independent (A has B)
+  · 典型:"...下辖"、"...负责管理..."、"...下属"
+- 仅抽取**明显在文档中体现**的组合关系;不要臆断
+- 如果一个类是 root (无父),不要强行给它加父类
+
+输出约束:
+- 仅输出 composition 或 aggregation (不输出普通 association/reference)
+- source_class 是"容器",target_class 是"被包含者"
+- target_multiplicity 默认 {{0, -1}} (0 或多个),composition 则 source 是 {{1,1}}
+
+已知 M1 类:
+{class_list}
+{existing_hint}
+合并后的文档摘录 (可能被截断):
+---
+{combined}
+---
+
+Return valid JSON ONLY:
+{{
+  "compositions": [
+    {{
+      "name": "plantHasGenUnit",
+      "label": "电站包含机组",
+      "source_class": "PumpedStoragePlant",
+      "source_role": "plant",
+      "source_multiplicity": {{"lower": 1, "upper": 1}},
+      "target_class": "PumpedStorageUnit",
+      "target_role": "units",
+      "target_multiplicity": {{"lower": 0, "upper": -1}},
+      "association_type": "composition",
+      "confidence": "high"
+    }}
+  ]
+}}
+
+若没发现新的组合关系,返回 {{"compositions": []}}。"""
+
+        try:
+            result = await self._ask(prompt, max_tokens=4000)
+            return result.get("compositions", []) or []
+        except Exception:
+            return []

@@ -32,6 +32,7 @@
         <button id="btn-validate" class="btn" disabled>&#10003; 验证</button>
         <button id="btn-export" class="btn" disabled>&#8615; 导出</button>
         <button id="btn-import-package" class="btn" title="从 .mofpkg.zip 完整包导入">&#128229; 导入包</button>
+        <button id="btn-synonyms" class="btn" disabled title="检测并合并当前 M1 模型中的同义类">&#128257; 同义类</button>
         <button id="btn-version" class="btn" disabled>&#128196; 版本</button>
       </div>
       <div class="toolbar-right">
@@ -521,6 +522,23 @@
         <div class="modal-actions">
           <button id="btn-import-pkg-confirm" class="btn btn-primary" disabled>确认导入</button>
           <button id="btn-import-pkg-cancel" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- V3.1: Synonym class detection + merge modal -->
+    <div id="synonym-modal" class="overlay hidden">
+      <div class="modal-card">
+        <h3>🔀 同义类检测与合并</h3>
+        <div id="synonym-status" class="synonym-status">准备检测...</div>
+        <div class="synonym-options">
+          <label><input type="checkbox" id="synonym-use-llm"> 同时用 AI 语义分析 (额外 1 次调用,更准确但慢 3~5 秒)</label>
+        </div>
+        <div id="synonym-groups" class="synonym-groups"></div>
+        <div class="modal-actions">
+          <button id="btn-synonym-detect" class="btn">🔍 重新检测</button>
+          <button id="btn-synonym-merge" class="btn btn-primary" disabled>✓ 应用合并</button>
+          <button id="btn-synonym-cancel" class="btn">取消</button>
         </div>
       </div>
     </div>
