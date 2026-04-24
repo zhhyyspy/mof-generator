@@ -110,6 +110,70 @@ async def excel_preview(doc_id: str):
         raise HTTPException(500, f"表格解析失败: {e}")
 
 
+@router.post("/{doc_id}/excel-classify")
+async def excel_classify_sheets(doc_id: str):
+    """V3.4: Phase 1 only — classify each sheet as data-table vs metadata.
+    Returns [{sheet_name, is_data, confidence, reason}] for progress display.
+    """
+    from backend.services.excel_reader import read_structured_file, is_structured_file
+    from backend.services.excel_to_m1 import analyze_workbook
+
+    meta = store.get_document_meta(doc_id)
+    if meta is None:
+        raise HTTPException(404, f"Document {doc_id} not found")
+    if not is_structured_file(meta.get("filename", "")):
+        raise HTTPException(400, "仅支持 .xlsx/.xls/.csv 文件")
+    path = Path(meta["original_path"])
+    if not path.exists():
+        raise HTTPException(404, "原始文件已丢失")
+
+    try:
+        raw = read_structured_file(path, max_rows=50)
+    except Exception as e:
+        raise HTTPException(500, f"表格解析失败: {e}")
+
+    classified = await analyze_workbook(raw)
+    return {
+        "sheets_classified": classified,
+        "sheets_total": len(raw.get("sheets", {})),
+    }
+
+
+@router.post("/{doc_id}/excel-analyze-sheet")
+async def excel_analyze_single_sheet(doc_id: str, body: dict):
+    """V3.4: Phase 2 for ONE sheet. Body: {sheet_name: str}
+    Returns the table_spec for that sheet.
+    Split from /excel-analyze so frontend can show per-sheet progress.
+    """
+    from backend.services.excel_reader import read_structured_file, is_structured_file
+    from backend.services.excel_to_m1 import analyze_table_structure
+
+    sheet_name = body.get("sheet_name")
+    if not sheet_name:
+        raise HTTPException(400, "sheet_name required")
+    meta = store.get_document_meta(doc_id)
+    if meta is None:
+        raise HTTPException(404, f"Document {doc_id} not found")
+    if not is_structured_file(meta.get("filename", "")):
+        raise HTTPException(400, "仅支持 .xlsx/.xls/.csv 文件")
+    path = Path(meta["original_path"])
+    if not path.exists():
+        raise HTTPException(404, "原始文件已丢失")
+
+    try:
+        raw = read_structured_file(path, max_rows=50)
+    except Exception as e:
+        raise HTTPException(500, f"表格解析失败: {e}")
+    if sheet_name not in raw["sheets"]:
+        raise HTTPException(404, f"Sheet '{sheet_name}' not found")
+
+    try:
+        spec = await analyze_table_structure(raw["sheets"][sheet_name], sheet_name)
+        return spec
+    except Exception as e:
+        raise HTTPException(500, f"结构分析失败: {e}")
+
+
 @router.post("/{doc_id}/excel-analyze")
 async def excel_analyze(doc_id: str):
     """AI-analyze an Excel workbook: classify each sheet + analyze structure of data sheets.

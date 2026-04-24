@@ -4694,10 +4694,12 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
    ============================================================ */
 
 .excel-review-card {
-  width: min(1400px, 97vw);
-  height: 90vh;
+  width: min(1800px, 99vw);
+  max-width: min(1800px, 99vw);   /* override .modal-card default max-width: 600px */
+  height: 92vh;
   display: flex;
   flex-direction: column;
+  padding: 16px 20px;              /* slimmer padding than default to give table more room */
 }
 .er-header { margin-bottom: 8px; }
 .er-header h3 { margin: 0 0 2px; font-size: 16px; }
@@ -4705,7 +4707,7 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
 .er-body {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 2.5fr) minmax(380px, 1fr);
   gap: 12px;
   overflow: hidden;
 }
@@ -4935,6 +4937,111 @@ button.tree-dashboard-status:hover .status-edit-icon { opacity: 1; }
   font-style: italic;
 }
 .er-err { color: #ef4444; }
+
+/* V3.4.1: AI progress log panel */
+.er-progress-log {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.55;
+  font-family: var(--mono, monospace);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.er-progress-log:empty::before {
+  content: '(等待开始...)';
+  color: var(--text-dim);
+  font-style: italic;
+  font-family: inherit;
+}
+.er-log-line {
+  padding: 3px 5px;
+  border-radius: 3px;
+  border-left: 2px solid transparent;
+}
+.er-log-line.er-log-pending {
+  background: rgba(74,158,255,0.06);
+  border-left-color: var(--accent);
+  animation: er-pulse 1.6s ease-in-out infinite;
+}
+.er-log-line.er-log-done {
+  background: rgba(74,222,128,0.04);
+  border-left-color: var(--green);
+}
+.er-log-line.er-log-error {
+  background: rgba(239,68,68,0.06);
+  border-left-color: #ef4444;
+  color: #ef4444;
+}
+.er-log-line.er-log-warn {
+  background: rgba(251,146,60,0.06);
+  border-left-color: #ea580c;
+  color: #ea580c;
+}
+.er-log-line.er-log-info {
+  background: transparent;
+  border-left-color: var(--text-dim);
+}
+@keyframes er-pulse {
+  0%, 100% { background: rgba(74,158,255,0.06); }
+  50%      { background: rgba(74,158,255,0.15); }
+}
+.er-log-time {
+  color: var(--text-dim);
+  font-size: 9px;
+  margin-right: 4px;
+}
+.er-log-icon {
+  display: inline-block;
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+}
+.er-log-text {
+  color: var(--text);
+}
+.er-log-text code {
+  background: rgba(255,255,255,0.05);
+  padding: 0 4px;
+  border-radius: 2px;
+  font-size: 10px;
+}
+.er-log-extra {
+  margin-top: 4px;
+  padding-left: 22px;
+  font-family: inherit;
+}
+.er-log-verdict {
+  padding: 2px 0;
+  font-size: 11px;
+}
+.er-log-reason {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-left: 18px;
+  margin-top: 1px;
+  line-height: 1.5;
+}
+.er-log-spec-summary {
+  color: var(--text);
+  font-size: 11px;
+  padding: 4px 6px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 3px;
+  line-height: 1.7;
+}
+.er-log-spec-summary code {
+  background: rgba(255,255,255,0.06);
+  padding: 0 4px;
+  border-radius: 2px;
+  font-size: 10px;
+  color: var(--accent);
+}
 
 /* Doc card Excel extract button */
 .doc-excel-btn {

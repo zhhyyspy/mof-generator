@@ -1714,6 +1714,8 @@ async function openExcelReview(docId) {
   document.getElementById('er-table-container').innerHTML = '';
   document.getElementById('er-class-info').innerHTML = '';
   document.getElementById('er-columns').innerHTML = '';
+  const logEl = document.getElementById('er-progress-log');
+  if (logEl) logEl.innerHTML = '';
   const targetSel = document.getElementById('er-target-model');
   targetSel.innerHTML = '<option value="__new__">-- 新建 M1 模型 --</option>';
   (state.allModels || []).filter(m => !m.id.startsWith('m2_')).forEach(m => {
@@ -1724,31 +1726,141 @@ async function openExcelReview(docId) {
   if (state.m1ModelId) targetSel.value = state.m1ModelId;
   modal.classList.remove('hidden');
 
+  // Orchestrated analysis with progress logging
+  await runExcelAnalysisWithLog(docId);
+}
+
+/** V3.4.1: log a progress line with ✓/⏳/⚠/❌ icon. `status` chooses color. */
+function erLog(status, text, extra) {
+  const logEl = document.getElementById('er-progress-log');
+  if (!logEl) return;
+  const icon = { done: '✓', pending: '⏳', warn: '⚠', error: '❌', info: '•' }[status] || '•';
+  const ts = new Date().toLocaleTimeString('zh-CN', {hour12: false, minute: '2-digit', second: '2-digit'});
+  const line = document.createElement('div');
+  line.className = `er-log-line er-log-${status}`;
+  line.innerHTML = `<span class="er-log-time">${ts}</span> <span class="er-log-icon">${icon}</span> <span class="er-log-text">${text}</span>${extra ? `<div class="er-log-extra">${extra}</div>` : ''}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+  return line;
+}
+
+function erReplaceLastLog(line, status, text, extra) {
+  if (!line) return;
+  const icon = { done: '✓', pending: '⏳', warn: '⚠', error: '❌', info: '•' }[status] || '•';
+  line.className = `er-log-line er-log-${status}`;
+  const iconEl = line.querySelector('.er-log-icon');
+  const textEl = line.querySelector('.er-log-text');
+  if (iconEl) iconEl.textContent = icon;
+  if (textEl) textEl.innerHTML = text;
+  // Replace extra
+  const oldExtra = line.querySelector('.er-log-extra');
+  if (oldExtra) oldExtra.remove();
+  if (extra) {
+    const e = document.createElement('div');
+    e.className = 'er-log-extra';
+    e.innerHTML = extra;
+    line.appendChild(e);
+  }
+  const logEl = document.getElementById('er-progress-log');
+  if (logEl) logEl.scrollTop = logEl.scrollHeight;
+}
+
+async function runExcelAnalysisWithLog(docId) {
+  const doc = state.documents.find(d => d.id === docId);
+  // Step 1: load raw
+  const step1 = erLog('pending', `读取 Excel 原始单元格: <b>${escapeHtml(doc?.filename || docId)}</b>...`);
   try {
     _erState.rawWorkbook = await API.previewExcel(docId);
+    const n = _erState.rawWorkbook.workbook.sheets.length;
+    erReplaceLastLog(step1, 'done',
+      `读取完成 · 共 ${n} 个 sheet: ${_erState.rawWorkbook.workbook.sheets.map(s => escapeHtml(s)).join(', ')}`);
     document.getElementById('er-subtitle').textContent =
-      `文件: ${state.documents.find(d => d.id === docId)?.filename || docId} · ${_erState.rawWorkbook.workbook.sheets.length} sheet`;
+      `文件: ${escapeHtml(doc?.filename || docId)} · ${n} sheet`;
     renderSheetTabs();
-    // Trigger AI analysis
-    document.getElementById('er-class-info').innerHTML = '<div class="er-loading">⏳ AI 正在分析表格结构...</div>';
-    try {
-      _erState.analysis = await API.analyzeExcel(docId);
-      const firstDataSheet = _erState.analysis.sheets_classified.find(s => s.is_data);
-      if (firstDataSheet) {
-        selectSheet(firstDataSheet.sheet_name);
-      } else {
-        document.getElementById('er-class-info').innerHTML =
-          '<div class="er-err">⚠ AI 没识别出任何"数据表" sheet, 请手工切换到数据 sheet 并确认结构</div>';
-        selectSheet(_erState.rawWorkbook.workbook.sheets[0]);
-      }
-    } catch (e) {
-      document.getElementById('er-class-info').innerHTML =
-        `<div class="er-err">AI 分析失败: ${escapeHtml(e.message)}<br>请手工标记表头和数据范围</div>`;
+  } catch (e) {
+    erReplaceLastLog(step1, 'error', `读取失败: ${escapeHtml(e.message)}`);
+    document.getElementById('er-subtitle').textContent = `❌ 读取失败: ${e.message}`;
+    return;
+  }
+
+  // Step 2: sheet classification (1 LLM call)
+  const step2 = erLog('pending',
+    `🧠 AI 正在分析 <b>${_erState.rawWorkbook.workbook.sheets.length}</b> 个 sheet,判断哪些是数据表、哪些是目录/说明 (1 次 LLM 调用)...`);
+  let classified;
+  try {
+    const r = await API.classifyExcelSheets(docId);
+    classified = r.sheets_classified || [];
+    _erState.analysis = { sheets_classified: classified, table_specs: {} };
+    const summary = classified.map(c => {
+      const icon = c.is_data ? '📊' : '📋';
+      const confBadge = { high: '🟢', medium: '🟡', low: '🔴' }[c.confidence] || '';
+      return `<div class="er-log-verdict">
+        ${icon} <b>${escapeHtml(c.sheet_name)}</b> → ${c.is_data ? '数据表' : '非数据(将跳过)'} ${confBadge}
+        <div class="er-log-reason">理由: ${escapeHtml(c.reason || '')}</div>
+      </div>`;
+    }).join('');
+    erReplaceLastLog(step2, 'done',
+      `✓ sheet 分类完成 · ${classified.filter(c => c.is_data).length}/${classified.length} 个数据表`,
+      summary);
+    renderSheetTabs();
+  } catch (e) {
+    erReplaceLastLog(step2, 'error', `AI 分类失败: ${escapeHtml(e.message)}`);
+    // Fallback: all sheets treated as data
+    classified = _erState.rawWorkbook.workbook.sheets.map(s => ({
+      sheet_name: s, is_data: true, confidence: 'low', reason: 'AI 失败, 默认视为数据表',
+    }));
+    _erState.analysis = { sheets_classified: classified, table_specs: {} };
+  }
+
+  // Step 3: per-sheet structure analysis (parallel, but log per-completion)
+  const dataSheets = classified.filter(c => c.is_data).map(c => c.sheet_name);
+  if (!dataSheets.length) {
+    erLog('warn', 'AI 没识别出任何数据表 sheet,请手工选择要抽取的 sheet 并标记表头/数据范围');
+    if (_erState.rawWorkbook.workbook.sheets.length > 0) {
       selectSheet(_erState.rawWorkbook.workbook.sheets[0]);
     }
-  } catch (e) {
-    document.getElementById('er-subtitle').textContent = `❌ 读取失败: ${e.message}`;
+    return;
   }
+
+  const step3header = erLog('info',
+    `🧠 AI 正在并行解读 <b>${dataSheets.length}</b> 个数据表的结构 (每个 1 次 LLM 调用)...`);
+  // Create a pending line per sheet
+  const sheetLines = {};
+  for (const sn of dataSheets) {
+    sheetLines[sn] = erLog('pending', `  └─ 正在解读: <b>${escapeHtml(sn)}</b>`);
+  }
+
+  // Fire off per-sheet analyses; log each as it completes
+  const tasks = dataSheets.map(async (sn) => {
+    try {
+      const spec = await API.analyzeExcelSheet(docId, sn);
+      _erState.analysis.table_specs[sn] = spec;
+      const confBadge = { high: '🟢 高置信', medium: '🟡 中置信', low: '🔴 低置信' }[spec.confidence] || '';
+      const summary = `
+        <div class="er-log-spec-summary">
+          类: <b>${escapeHtml(spec.row_semantic || '?')}</b> ·
+          <code>${escapeHtml(spec.english_class_name || '?')}</code> ·
+          ${confBadge}<br>
+          表头行 [${(spec.header_rows || []).join(', ')}] ·
+          数据 ${spec.data_start || '?'}~${spec.data_end || '?'} ·
+          汇总 [${(spec.summary_rows || []).join(', ') || '无'}] ·
+          忽略列 [${(spec.ignored_cols || []).join(', ') || '无'}]<br>
+          识别到 ${(spec.columns || []).length} 列${spec.ai_error ? ` <span style="color:#ef4444">⚠ ${escapeHtml(spec.ai_error)}</span>` : ''}
+        </div>
+      `;
+      erReplaceLastLog(sheetLines[sn], 'done',
+        `  └─ <b>${escapeHtml(sn)}</b> · 解读完成`,
+        summary);
+      // If this is first sheet to finish, activate it
+      if (!_erState.activeSheet) selectSheet(sn);
+      else renderSheetTabs();   // refresh sheet tab labels since AI verdicts may change
+    } catch (e) {
+      erReplaceLastLog(sheetLines[sn], 'error',
+        `  └─ <b>${escapeHtml(sn)}</b> · 解读失败: ${escapeHtml(e.message)}`);
+    }
+  });
+  await Promise.all(tasks);
+  erLog('done', `✅ 全部解析完成 · 您可在右侧调整列类型, 或点击左侧行号重新标记范围`);
 }
 
 function renderSheetTabs() {
@@ -1998,14 +2110,12 @@ function renderDetectedSpec() {
 async function erReanalyze() {
   const btn = document.getElementById('btn-er-reanalyze');
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳ 分析中...';
+  // Clear previous edits + rerun orchestrated flow
+  _erState.editedSpecs = {};
+  _erState.analysis = null;
+  _erState.activeSheet = null;
   try {
-    _erState.analysis = await API.analyzeExcel(_erState.docId);
-    _erState.editedSpecs = {};
-    const firstData = _erState.analysis.sheets_classified.find(s => s.is_data);
-    if (firstData) selectSheet(firstData.sheet_name);
-    showToast('AI 重新分析完成', 'success');
-  } catch (e) {
-    showDialog({ type: 'error', title: 'AI 分析失败', message: e.message });
+    await runExcelAnalysisWithLog(_erState.docId);
   } finally {
     btn.disabled = false; btn.textContent = orig;
   }

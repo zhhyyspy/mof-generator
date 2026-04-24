@@ -43,6 +43,15 @@ export const API = {
   async analyzeExcel(docId) {
     return (await request(`/documents/${docId}/excel-analyze`, { method: 'POST' })).json();
   },
+  // V3.4.1: split endpoints for progress visualization
+  async classifyExcelSheets(docId) {
+    return (await request(`/documents/${docId}/excel-classify`, { method: 'POST' })).json();
+  },
+  async analyzeExcelSheet(docId, sheetName) {
+    return (await request(`/documents/${docId}/excel-analyze-sheet`, {
+      method: 'POST', body: JSON.stringify({ sheet_name: sheetName }),
+    })).json();
+  },
   async analyzeStatsTable(docId, sheetName) {
     return (await request(`/documents/${docId}/analyze-stats-table`, {
       method: 'POST', body: JSON.stringify({ sheet_name: sheetName }),
