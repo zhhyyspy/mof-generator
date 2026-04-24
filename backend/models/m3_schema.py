@@ -197,6 +197,11 @@ class MOFClass(BaseModel):
     meta_structure_id: Optional[str] = None
     meta_structure_role: Optional[str] = None
     meta_structure_level: Optional[int] = None
+    # V3.4: Optional M0 sample data attached to this class. Populated when user
+    # imports from an Excel table and chooses to keep the first N rows as
+    # example instances. Display-only; does not participate in validation.
+    # Each dict's keys are attribute names; values are raw cell content.
+    sample_instances: Optional[list[dict]] = None
 
 
 # ---------------------------------------------------------------------------

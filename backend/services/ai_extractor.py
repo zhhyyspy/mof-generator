@@ -96,7 +96,10 @@ async def classify_document_type(text_excerpt: str, filename: str = "") -> str:
 
 仅返回一个标签 (spec/manual/ledger/process),不要任何其他文字。"""
     try:
-        resp = await client.chat(prompt, max_tokens=20)
+        resp = await client.chat(
+            system="你是一个业务文档分类助手。仅返回要求的单一标签,不要任何解释。",
+            user=prompt, max_tokens=20, temperature=0,
+        )
         answer = (resp or "").strip().lower()
         for t in ("spec", "manual", "ledger", "process"):
             if t in answer:

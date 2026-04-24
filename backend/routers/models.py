@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -730,6 +731,153 @@ async def detect_synonyms(model_id: str, use_llm: bool = False):
         "groups": groups_rich,
         "used_llm": use_llm,
     }
+
+
+# ============================================================================
+#                V3.4: Create M1 from confirmed Excel table specs
+# ============================================================================
+
+@router.post("/create-from-excel")
+async def create_m1_from_excel(body: dict):
+    """Given a document's confirmed Excel table specs, create an M1 Package.
+
+    body = {
+      "doc_id": "...",
+      "target_model_id": "<existing M1 id>" or null (creates new),
+      "target_model_label": "...(used when creating new)",
+      "specs": [
+        {
+          "sheet_name": "Sheet1",
+          "title_row": 1, "header_rows": [3, 4],
+          "data_start": 5, "data_end": 124,
+          "summary_rows": [125, 126], "ignored_cols": [1],
+          "english_class_name": "Generator",
+          "row_semantic": "一台发电机设备",
+          "columns": [...],
+          "include_samples": true,  # save first 5 rows as sample_instances
+          "sample_count": 5
+        }
+      ]
+    }
+
+    Returns: {model_id, created_class_ids, created_classes: [{id, name, label, attr_count}]}
+    """
+    from pathlib import Path
+    from backend.services.excel_reader import extract_table_data
+    from backend.services.excel_to_m1 import build_m1_class_from_spec
+
+    doc_id = body.get("doc_id")
+    specs = body.get("specs") or []
+    if not doc_id:
+        raise HTTPException(400, "doc_id required")
+    if not specs:
+        raise HTTPException(400, "specs required")
+
+    meta = store.get_document_meta(doc_id)
+    if meta is None:
+        raise HTTPException(404, f"Document {doc_id} not found")
+    doc_path = Path(meta["original_path"])
+    if not doc_path.exists():
+        raise HTTPException(404, "原始文件已丢失")
+
+    target_model_id = body.get("target_model_id")
+    target_label = body.get("target_model_label") or meta.get("filename", "Excel M1")
+
+    if target_model_id:
+        model = _get_model_or_404(target_model_id)
+        pkg = _current_package(model)
+    else:
+        # Create new M1 model
+        model_id = str(uuid.uuid4())[:8]
+        pkg = Package(name="M1Package", label=target_label, description=f"源自 {meta.get('filename')}")
+        version = M1ModelVersion(
+            version="1.0", created_at=datetime.now(), changelog=f"从 Excel 导入 {meta.get('filename')}",
+            package=pkg,
+        )
+        model = M1Model(
+            id=model_id,
+            name="M1Package",
+            label=target_label,
+            description=f"从 Excel 表格抽取生成: {meta.get('filename')}",
+            m2_template_id="",      # Will be set when user runs 反推M2
+            source_document_ids=[doc_id],
+            versions=[version],
+        )
+        target_model_id = model_id
+
+    created_classes = []
+    for spec in specs:
+        try:
+            new_cls, _ = build_m1_class_from_spec(
+                spec,
+                description=f"源自 Excel (sheet: {spec.get('sheet_name')})",
+            )
+            # Optionally attach sample instances
+            if spec.get("include_samples") and spec.get("sheet_name"):
+                sample_count = min(int(spec.get("sample_count", 5)), 20)
+                try:
+                    cols = spec.get("columns") or []
+                    selected = [c["col"] for c in cols if not c.get("skip") and c.get("col") is not None]
+                    rows = extract_table_data(
+                        doc_path,
+                        sheet_name=spec["sheet_name"],
+                        header_rows=spec.get("header_rows") or [1],
+                        data_start=spec.get("data_start") or 2,
+                        data_end=spec.get("data_end") or 2,
+                        summary_rows=spec.get("summary_rows"),
+                        ignored_cols=spec.get("ignored_cols"),
+                        selected_cols=selected,
+                        max_sample=sample_count,
+                    )
+                    # Map column-name → attribute-name so sample keys match attr names
+                    col_by_idx = {c["col"]: c for c in cols if c.get("col") is not None}
+                    mapped_rows = []
+                    for row in rows:
+                        mapped = {}
+                        for col_name, value in row.items():
+                            # Find the column's english_name from its chinese_label concatenation
+                            eng_name = _find_english_for_display_name(col_name, col_by_idx)
+                            if eng_name:
+                                mapped[eng_name] = value
+                            else:
+                                mapped[col_name] = value
+                        mapped_rows.append(mapped)
+                    new_cls.sample_instances = mapped_rows
+                except Exception as sample_err:
+                    # Sample save is optional; log but don't fail
+                    pass
+
+            pkg.classes.append(new_cls)
+            created_classes.append({
+                "id": new_cls.id, "name": new_cls.name, "label": new_cls.label,
+                "attr_count": len(new_cls.attributes),
+                "sample_count": len(new_cls.sample_instances or []),
+            })
+        except Exception as e:
+            raise HTTPException(500, f"构建类 '{spec.get('english_class_name')}' 失败: {e}")
+
+    # Ensure doc_id tracked
+    if doc_id not in (model.source_document_ids or []):
+        model.source_document_ids = list(model.source_document_ids or []) + [doc_id]
+
+    store.save_model(model)
+
+    return {
+        "model_id": target_model_id,
+        "created_classes": created_classes,
+        "count": len(created_classes),
+    }
+
+
+def _find_english_for_display_name(display_name: str, col_by_idx: dict) -> Optional[str]:
+    """Given a display name like '设备基本信息 · 型号', find the matching english name."""
+    # display_name is the last segment of header concat (chinese_label)
+    # col_by_idx values have chinese_label + english_name
+    for col_spec in col_by_idx.values():
+        cn = col_spec.get("chinese_label", "")
+        if cn and cn in display_name:
+            return col_spec.get("english_name")
+    return None
 
 
 # ============================================================================

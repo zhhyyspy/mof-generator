@@ -291,6 +291,10 @@ function renderDocList() {
     const options = Object.entries(DOC_TYPE_META).map(([k, m]) =>
       `<option value="${k}"${k === dt ? ' selected' : ''}>${m.icon} ${m.label}</option>`
     ).join('');
+    const isExcel = /\.(xlsx|xlsm|xls|csv)$/i.test(doc.filename || '');
+    const excelBtn = isExcel
+      ? `<button class="doc-excel-btn" data-doc-id="${doc.id}" title="AI 解读表格结构并抽取为 M1 类">📊 从表格抽取 M1</button>`
+      : '';
     li.innerHTML = `
       <span class="doc-icon">${icons[ext] || '\u{1F4C4}'}</span>
       <div class="doc-info">
@@ -300,6 +304,7 @@ function renderDocList() {
           <select class="doc-type-select" data-doc-id="${doc.id}">${options}</select>
           <span class="doc-type-source">${sourceTag}</span>
         </div>
+        ${excelBtn}
       </div>
       <button class="btn-icon doc-delete btn-danger" title="删除">&times;</button>
     `;
@@ -320,6 +325,14 @@ function renderDocList() {
         renderDocList();
       } catch (err) { showToast('设置类型失败: ' + err.message, 'error'); }
     });
+    // V3.4: Excel extract button
+    const excelBtnEl = li.querySelector('.doc-excel-btn');
+    if (excelBtnEl) {
+      excelBtnEl.addEventListener('click', e => {
+        e.stopPropagation();
+        openExcelReview(doc.id);
+      });
+    }
     list.appendChild(li);
   }
 }
@@ -394,6 +407,7 @@ function setupToolbar() {
   wireRelBuilderModal();
   wireSafeDeleteModal();
   wireClassWizardModal();
+  wireExcelReviewModal();
   document.getElementById('btn-validation-close').addEventListener('click', () => {
     document.getElementById('validation-modal').classList.add('hidden');
   });
@@ -1675,6 +1689,383 @@ async function abApplyTemplate(tplKey) {
     showDialog({ type: 'error', title: '模板应用失败', message: e.message });
   }
 }
+
+// ============================================================================
+//          V3.4: Excel/CSV structured table extraction (AI-assisted)
+// ============================================================================
+
+let _erState = {
+  docId: null,
+  rawWorkbook: null,     // result of excel-preview
+  analysis: null,        // result of excel-analyze (classified + specs)
+  activeSheet: null,     // currently displayed sheet name
+  editedSpecs: {},       // user edits per sheet, keyed by sheet_name
+};
+
+function isExcelFile(filename) {
+  return /\.(xlsx|xlsm|xls|csv)$/i.test(filename || '');
+}
+
+async function openExcelReview(docId) {
+  _erState = { docId, rawWorkbook: null, analysis: null, activeSheet: null, editedSpecs: {} };
+  const modal = document.getElementById('excel-review-modal');
+  document.getElementById('er-subtitle').textContent = '⏳ 读取原始表格...';
+  document.getElementById('er-sheets-bar').innerHTML = '';
+  document.getElementById('er-table-container').innerHTML = '';
+  document.getElementById('er-class-info').innerHTML = '';
+  document.getElementById('er-columns').innerHTML = '';
+  const targetSel = document.getElementById('er-target-model');
+  targetSel.innerHTML = '<option value="__new__">-- 新建 M1 模型 --</option>';
+  (state.allModels || []).filter(m => !m.id.startsWith('m2_')).forEach(m => {
+    const o = document.createElement('option');
+    o.value = m.id; o.textContent = `${m.label || m.name} [${m.id}]`;
+    targetSel.appendChild(o);
+  });
+  if (state.m1ModelId) targetSel.value = state.m1ModelId;
+  modal.classList.remove('hidden');
+
+  try {
+    _erState.rawWorkbook = await API.previewExcel(docId);
+    document.getElementById('er-subtitle').textContent =
+      `文件: ${state.documents.find(d => d.id === docId)?.filename || docId} · ${_erState.rawWorkbook.workbook.sheets.length} sheet`;
+    renderSheetTabs();
+    // Trigger AI analysis
+    document.getElementById('er-class-info').innerHTML = '<div class="er-loading">⏳ AI 正在分析表格结构...</div>';
+    try {
+      _erState.analysis = await API.analyzeExcel(docId);
+      const firstDataSheet = _erState.analysis.sheets_classified.find(s => s.is_data);
+      if (firstDataSheet) {
+        selectSheet(firstDataSheet.sheet_name);
+      } else {
+        document.getElementById('er-class-info').innerHTML =
+          '<div class="er-err">⚠ AI 没识别出任何"数据表" sheet, 请手工切换到数据 sheet 并确认结构</div>';
+        selectSheet(_erState.rawWorkbook.workbook.sheets[0]);
+      }
+    } catch (e) {
+      document.getElementById('er-class-info').innerHTML =
+        `<div class="er-err">AI 分析失败: ${escapeHtml(e.message)}<br>请手工标记表头和数据范围</div>`;
+      selectSheet(_erState.rawWorkbook.workbook.sheets[0]);
+    }
+  } catch (e) {
+    document.getElementById('er-subtitle').textContent = `❌ 读取失败: ${e.message}`;
+  }
+}
+
+function renderSheetTabs() {
+  const bar = document.getElementById('er-sheets-bar');
+  const sheets = _erState.rawWorkbook.workbook.sheets;
+  const classified = _erState.analysis?.sheets_classified || [];
+  const classifyMap = Object.fromEntries(classified.map(c => [c.sheet_name, c]));
+  bar.innerHTML = sheets.map(s => {
+    const cls = classifyMap[s];
+    const tag = cls ? (cls.is_data ? '📊 数据表' : '📋 非数据') : '';
+    const active = s === _erState.activeSheet ? ' active' : '';
+    const disabled = cls && !cls.is_data ? ' disabled' : '';
+    return `<button class="er-sheet-tab${active}${disabled}" data-sheet="${escapeHtml(s)}" title="${escapeHtml(cls?.reason || '')}">
+      ${escapeHtml(s)} ${tag ? `<em class="er-sheet-tag">${tag}</em>` : ''}
+    </button>`;
+  }).join('');
+  bar.querySelectorAll('.er-sheet-tab').forEach(btn => {
+    btn.addEventListener('click', () => selectSheet(btn.dataset.sheet));
+  });
+}
+
+function selectSheet(sheetName) {
+  _erState.activeSheet = sheetName;
+  renderSheetTabs();
+  renderExcelTable();
+  renderDetectedSpec();
+}
+
+function getCurrentSpec() {
+  const sn = _erState.activeSheet;
+  if (!sn) return null;
+  // User edits override AI detection
+  if (_erState.editedSpecs[sn]) return _erState.editedSpecs[sn];
+  const ai = _erState.analysis?.table_specs?.[sn];
+  if (ai) {
+    _erState.editedSpecs[sn] = JSON.parse(JSON.stringify(ai));
+    return _erState.editedSpecs[sn];
+  }
+  // Fallback: assume row 1 header, rest data
+  const sd = _erState.rawWorkbook.sheets[sn];
+  const fallback = {
+    sheet_name: sn,
+    title_row: null,
+    header_rows: [1],
+    data_start: 2,
+    data_end: sd?.max_row || 2,
+    summary_rows: [],
+    ignored_cols: [],
+    english_class_name: 'TableClass',
+    row_semantic: '一行数据',
+    columns: [],
+    confidence: 'low',
+  };
+  _erState.editedSpecs[sn] = fallback;
+  return fallback;
+}
+
+function renderExcelTable() {
+  const container = document.getElementById('er-table-container');
+  const sn = _erState.activeSheet;
+  const sd = _erState.rawWorkbook.sheets[sn];
+  if (!sd) { container.innerHTML = '<div class="er-err">Sheet 数据缺失</div>'; return; }
+  const spec = getCurrentSpec();
+  const headerSet = new Set(spec.header_rows || []);
+  const summarySet = new Set(spec.summary_rows || []);
+  const ignoredColSet = new Set(spec.ignored_cols || []);
+  const dataStart = spec.data_start;
+  const dataEnd = spec.data_end;
+
+  const rows = sd.cells;
+  const maxCol = sd.max_col;
+
+  // Build merged lookup: (row, col) → {span info} for TOP-LEFT only
+  const mergedByTL = {};
+  for (const m of sd.merged_ranges) {
+    mergedByTL[`${m.min_row},${m.min_col}`] = m;
+  }
+
+  let html = '<table class="er-table"><thead><tr><th class="er-row-head">#</th>';
+  for (let c = 1; c <= maxCol; c++) {
+    const ignored = ignoredColSet.has(c);
+    html += `<th class="er-col-head${ignored ? ' er-col-ignored' : ''}" data-col="${c}" title="点击切换: 跳过/使用此列">${c}</th>`;
+  }
+  html += '</tr></thead><tbody>';
+
+  for (let r = 1; r <= rows.length; r++) {
+    const rowClass = headerSet.has(r) ? 'er-row-header'
+      : r === spec.title_row ? 'er-row-title'
+      : summarySet.has(r) ? 'er-row-summary'
+      : (dataStart && dataEnd && r >= dataStart && r <= dataEnd) ? 'er-row-data'
+      : 'er-row-other';
+    html += `<tr class="${rowClass}" data-row="${r}">`;
+    html += `<td class="er-row-head" data-row="${r}" title="点击标记此行">${r}</td>`;
+    const row = rows[r - 1] || [];
+    for (let c = 1; c <= maxCol; c++) {
+      const cell = row[c - 1];
+      if (cell && cell.m) continue;   // part of merge, skip (top-left occupies)
+      const tl = mergedByTL[`${r},${c}`];
+      const colspan = tl ? (tl.max_col - tl.min_col + 1) : 1;
+      const rowspan = tl ? (tl.max_row - tl.min_row + 1) : 1;
+      const ignored = ignoredColSet.has(c);
+      const cls = `er-cell${ignored ? ' er-cell-ignored' : ''}${cell?.b ? ' er-cell-bold' : ''}`;
+      const value = cell?.v !== null && cell?.v !== undefined ? String(cell.v) : '';
+      const attrs = (colspan > 1 ? ` colspan="${colspan}"` : '') + (rowspan > 1 ? ` rowspan="${rowspan}"` : '');
+      html += `<td class="${cls}"${attrs}>${escapeHtml(value)}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+
+  // Wire row-header clicks → cycle through states
+  container.querySelectorAll('td.er-row-head').forEach(td => {
+    td.addEventListener('click', () => cycleRowMark(Number(td.dataset.row)));
+  });
+  container.querySelectorAll('th.er-col-head').forEach(th => {
+    th.addEventListener('click', () => toggleColIgnored(Number(th.dataset.col)));
+  });
+}
+
+function cycleRowMark(rowNum) {
+  const spec = getCurrentSpec();
+  const headers = new Set(spec.header_rows || []);
+  const summaries = new Set(spec.summary_rows || []);
+  const isHeader = headers.has(rowNum);
+  const isSummary = summaries.has(rowNum);
+  const isTitle = spec.title_row === rowNum;
+  const isDataStart = spec.data_start === rowNum;
+  const isDataEnd = spec.data_end === rowNum;
+
+  // Cycle: data → header → data_start → data_end → summary → title → (clear) → data
+  if (isTitle) {
+    spec.title_row = null;
+  } else if (isSummary) {
+    summaries.delete(rowNum);
+    spec.title_row = rowNum;
+  } else if (isDataEnd) {
+    spec.data_end = null;
+    summaries.add(rowNum);
+  } else if (isDataStart) {
+    spec.data_start = null;
+    spec.data_end = rowNum;
+  } else if (isHeader) {
+    headers.delete(rowNum);
+    spec.data_start = rowNum;
+  } else {
+    headers.add(rowNum);
+  }
+  spec.header_rows = Array.from(headers).sort((a, b) => a - b);
+  spec.summary_rows = Array.from(summaries).sort((a, b) => a - b);
+  renderExcelTable();
+  renderDetectedSpec();
+}
+
+function toggleColIgnored(colNum) {
+  const spec = getCurrentSpec();
+  const ignored = new Set(spec.ignored_cols || []);
+  if (ignored.has(colNum)) ignored.delete(colNum);
+  else ignored.add(colNum);
+  spec.ignored_cols = Array.from(ignored).sort((a, b) => a - b);
+  // Also mark the column in columns[] as skip if it was listed
+  if (spec.columns) {
+    for (const col of spec.columns) {
+      if (col.col === colNum) col.skip = ignored.has(colNum);
+    }
+  }
+  renderExcelTable();
+  renderDetectedSpec();
+}
+
+function renderDetectedSpec() {
+  const info = document.getElementById('er-class-info');
+  const colsEl = document.getElementById('er-columns');
+  const spec = getCurrentSpec();
+  if (!spec) { info.innerHTML = ''; colsEl.innerHTML = ''; return; }
+
+  const conf = spec.confidence || 'low';
+  const confBadge = { high: '🟢 高置信', medium: '🟡 中置信', low: '🔴 低置信' }[conf] || '';
+  info.innerHTML = `
+    <label class="er-form-row">
+      <span>类中文名:</span>
+      <input type="text" id="er-cls-label" value="${escapeHtml(spec.row_semantic || '')}" />
+    </label>
+    <label class="er-form-row">
+      <span>英文类名 (PascalCase):</span>
+      <input type="text" id="er-cls-name" value="${escapeHtml(spec.english_class_name || '')}" />
+    </label>
+    <div class="er-form-meta">
+      ${confBadge} · 表头行 ${(spec.header_rows || []).join(', ') || '(未定义)'} ·
+      数据 ${spec.data_start || '?'}~${spec.data_end || '?'}
+      · 忽略列 ${(spec.ignored_cols || []).join(', ') || '无'}
+      · 汇总行 ${(spec.summary_rows || []).join(', ') || '无'}
+    </div>
+    ${spec.ai_error ? `<div class="er-err">AI 错误: ${escapeHtml(spec.ai_error)}</div>` : ''}
+  `;
+  document.getElementById('er-cls-label').addEventListener('input', e => { spec.row_semantic = e.target.value; });
+  document.getElementById('er-cls-name').addEventListener('input', e => { spec.english_class_name = e.target.value; });
+
+  const cols = (spec.columns || []).filter(c => !(spec.ignored_cols || []).includes(c.col));
+  if (cols.length === 0) {
+    colsEl.innerHTML = '<div class="er-empty">(AI 没识别到有效列, 请检查表头范围)</div>';
+    return;
+  }
+  colsEl.innerHTML = cols.map((col, idx) => {
+    const skipped = col.skip ? ' er-col-skipped' : '';
+    return `
+    <div class="er-col-row${skipped}" data-idx="${idx}">
+      <label class="er-col-skip">
+        <input type="checkbox" class="er-col-skip-cb" ${col.skip ? '' : 'checked'} />
+        <span>列 ${col.col}</span>
+      </label>
+      <input type="text" class="er-col-label" placeholder="中文名" value="${escapeHtml(col.chinese_label || '')}" />
+      <input type="text" class="er-col-name" placeholder="英文名" value="${escapeHtml(col.english_name || '')}" />
+      <select class="er-col-type">
+        ${['text','number','quantity','date','boolean','enum'].map(t => {
+          const label = { text:'📝 文本', number:'# 数字', quantity:'💰 带单位',
+                          date:'📅 日期', boolean:'✓ 是否', enum:'🏷️ 选项' }[t];
+          return `<option value="${t}"${col.logical_type === t ? ' selected' : ''}>${label}</option>`;
+        }).join('')}
+      </select>
+      <input type="text" class="er-col-unit" placeholder="单位" value="${escapeHtml(col.unit || '')}" ${col.logical_type === 'quantity' ? '' : 'style="display:none"'} />
+      <label class="er-col-id" title="标识符 (主键候选)">
+        <input type="checkbox" class="er-col-id-cb" ${col.is_identifier ? 'checked' : ''} /> 🔑
+      </label>
+    </div>`;
+  }).join('');
+
+  colsEl.querySelectorAll('.er-col-row').forEach(row => {
+    const idx = Number(row.dataset.idx);
+    const col = cols[idx];
+    row.querySelector('.er-col-skip-cb').addEventListener('change', e => {
+      col.skip = !e.target.checked;
+      row.classList.toggle('er-col-skipped', col.skip);
+    });
+    row.querySelector('.er-col-label').addEventListener('input', e => { col.chinese_label = e.target.value; });
+    row.querySelector('.er-col-name').addEventListener('input', e => { col.english_name = e.target.value; });
+    row.querySelector('.er-col-type').addEventListener('change', e => {
+      col.logical_type = e.target.value;
+      const unitInput = row.querySelector('.er-col-unit');
+      unitInput.style.display = col.logical_type === 'quantity' ? '' : 'none';
+    });
+    row.querySelector('.er-col-unit').addEventListener('input', e => { col.unit = e.target.value; });
+    row.querySelector('.er-col-id-cb').addEventListener('change', e => { col.is_identifier = e.target.checked; });
+  });
+}
+
+async function erReanalyze() {
+  const btn = document.getElementById('btn-er-reanalyze');
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳ 分析中...';
+  try {
+    _erState.analysis = await API.analyzeExcel(_erState.docId);
+    _erState.editedSpecs = {};
+    const firstData = _erState.analysis.sheets_classified.find(s => s.is_data);
+    if (firstData) selectSheet(firstData.sheet_name);
+    showToast('AI 重新分析完成', 'success');
+  } catch (e) {
+    showDialog({ type: 'error', title: 'AI 分析失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+async function erConfirm() {
+  // Collect specs from all edited sheets OR only ones that are data
+  const classified = _erState.analysis?.sheets_classified || [];
+  const dataSheets = classified.filter(s => s.is_data).map(s => s.sheet_name);
+  const sheetsToSend = dataSheets.length ? dataSheets : [_erState.activeSheet];
+
+  const includeSamples = document.getElementById('er-include-samples').checked;
+  const sampleCount = Number(document.getElementById('er-sample-count').value) || 5;
+  const targetSel = document.getElementById('er-target-model');
+  const targetId = targetSel.value === '__new__' ? null : targetSel.value;
+
+  const specs = [];
+  for (const sn of sheetsToSend) {
+    const spec = _erState.editedSpecs[sn] || _erState.analysis?.table_specs?.[sn];
+    if (!spec) continue;
+    const specCopy = JSON.parse(JSON.stringify(spec));
+    specCopy.include_samples = includeSamples;
+    specCopy.sample_count = sampleCount;
+    specs.push(specCopy);
+  }
+
+  if (!specs.length) { showToast('没有可导入的 sheet', 'error'); return; }
+
+  const btn = document.getElementById('btn-er-confirm');
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳ 生成中...';
+  try {
+    const result = await API.createM1FromExcel({
+      doc_id: _erState.docId,
+      target_model_id: targetId,
+      target_model_label: null,
+      specs,
+    });
+    const createdLabels = (result.created_classes || []).map(c => c.label).join(', ');
+    showToast(`已生成 ${result.count} 个 M1 类: ${createdLabels}`, 'success');
+    document.getElementById('excel-review-modal').classList.add('hidden');
+    // Refresh models list + switch to the target
+    if (typeof loadExistingModels === 'function') await loadExistingModels();
+    if (typeof loadModel === 'function') await loadModel(result.model_id, 'm1');
+    const picker = document.getElementById('model-picker');
+    if (picker) picker.value = result.model_id;
+  } catch (e) {
+    showDialog({ type: 'error', title: '生成失败', message: e.message });
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+function wireExcelReviewModal() {
+  if (!document.getElementById('excel-review-modal')) return;
+  document.getElementById('btn-er-cancel').addEventListener('click',
+    () => document.getElementById('excel-review-modal').classList.add('hidden'));
+  document.getElementById('btn-er-reanalyze').addEventListener('click', erReanalyze);
+  document.getElementById('btn-er-confirm').addEventListener('click', erConfirm);
+}
+
 
 // ============================================================================
 //                  V3.3 Phase 2: Class Creation Wizard (5 steps)

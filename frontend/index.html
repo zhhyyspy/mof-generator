@@ -526,6 +526,54 @@
       </div>
     </div>
 
+    <!-- V3.4: Excel table structure review modal -->
+    <div id="excel-review-modal" class="overlay hidden">
+      <div class="modal-card excel-review-card">
+        <div class="er-header">
+          <h3 id="er-title">📊 表格结构识别</h3>
+          <div class="er-subtitle" id="er-subtitle"></div>
+        </div>
+        <div class="er-body">
+          <div class="er-left">
+            <div class="er-sheets-bar" id="er-sheets-bar"></div>
+            <div class="er-table-wrap">
+              <div class="er-marker-bar">
+                <span class="er-legend">
+                  <span class="er-legend-item er-legend-header">表头</span>
+                  <span class="er-legend-item er-legend-data">数据</span>
+                  <span class="er-legend-item er-legend-summary">汇总(跳过)</span>
+                  <span class="er-legend-item er-legend-title">标题(跳过)</span>
+                </span>
+                <span class="er-mode-hint">💡 点击行号设置: 表头 / 数据起始 / 数据结束 / 汇总行</span>
+              </div>
+              <div id="er-table-container" class="er-table-container"></div>
+            </div>
+          </div>
+          <div class="er-right">
+            <div class="er-section-title">🏷️ AI 识别到的类</div>
+            <div id="er-class-info" class="er-class-info"></div>
+            <div class="er-section-title">📋 识别到的列</div>
+            <div id="er-columns" class="er-columns"></div>
+            <div class="er-section-title">⚙ 选项</div>
+            <div class="er-options">
+              <label><input type="checkbox" id="er-include-samples"> 将前 <input type="number" id="er-sample-count" value="5" min="1" max="20" style="width:48px"> 行作为示例数据 (sample_instances) 保存</label>
+              <label class="er-option-row">
+                目标模型:
+                <select id="er-target-model">
+                  <option value="__new__">-- 新建 M1 模型 --</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-er-cancel" class="btn">取消</button>
+          <button id="btn-er-reanalyze" class="btn">🔄 让 AI 重新分析</button>
+          <button id="btn-er-confirm" class="btn btn-primary">✓ 确认生成 M1 类</button>
+        </div>
+      </div>
+    </div>
+
     <!-- V3.3 Phase 2: Class creation wizard (5 steps) -->
     <div id="class-wizard-modal" class="overlay hidden">
       <div class="modal-card class-wizard-card">

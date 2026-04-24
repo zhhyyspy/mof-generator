@@ -36,6 +36,24 @@ export const API = {
   },
   async listDocuments() { return (await request('/documents/')).json(); },
   async deleteDocument(id) { return (await request(`/documents/${id}`, { method: 'DELETE' })).json(); },
+  // V3.4: Excel table extraction
+  async previewExcel(docId) {
+    return (await request(`/documents/${docId}/excel-preview`)).json();
+  },
+  async analyzeExcel(docId) {
+    return (await request(`/documents/${docId}/excel-analyze`, { method: 'POST' })).json();
+  },
+  async analyzeStatsTable(docId, sheetName) {
+    return (await request(`/documents/${docId}/analyze-stats-table`, {
+      method: 'POST', body: JSON.stringify({ sheet_name: sheetName }),
+    })).json();
+  },
+  async createM1FromExcel(body) {
+    return (await request('/models/create-from-excel', {
+      method: 'POST', body: JSON.stringify(body),
+    })).json();
+  },
+
   // V3.1: document type tagging
   async setDocumentType(id, docType, source = 'user') {
     return (await request(`/documents/${id}/type`, {
